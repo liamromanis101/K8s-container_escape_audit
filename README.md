@@ -15,10 +15,10 @@ A bash script for detecting container escape vectors from within a running Docke
 
 Each finding produces a structured report entry covering:
 
-- **What it is** — the misconfiguration or exposure
-- **Impact** — worst-case outcome if exploited
-- **Exploitability** — difficulty, required tooling, real-world precedent
-- **Recommendation** — specific remediation steps
+- **What it is**: the misconfiguration or exposure
+- **Impact**: worst-case outcome if exploited
+- **Exploitability**: difficulty, required tooling, real-world precedent
+- **Recommendation**: specific remediation steps
 
 ---
 
@@ -271,21 +271,21 @@ The script requires only standard POSIX utilities present in virtually all conta
 
 The script covers the following well-known container escape primitives:
 
-- **Docker socket escape** — create privileged containers via the daemon API
-- **Privileged container mount** — mount raw host block devices
-- **cgroup v1 release_agent** — kernel executes payload on the host when a cgroup empties
-- **core_pattern pipe handler** — kernel executes payload as root on any process crash
-- **Shocker / CAP_DAC_READ_SEARCH** — read host files by inode via `open_by_handle_at(2)`
-- **CAP_SYS_ADMIN + unshare/nsenter** — re-enter host namespaces
-- **Kernel module loading** — load malicious `.ko` for unrestricted kernel code execution
-- **DirtyPipe (CVE-2022-0847)** — overwrite read-only files on host mounts without privileges
-- **DirtyCOW (CVE-2016-5195)** — race condition write to read-only memory mappings
-- **Kubernetes service account abuse** — API server access with over-privileged RBAC
-- **Kubelet unauthenticated exec** — remote code execution in any pod on the node
-- **Cloud IMDS credential theft** — steal IAM credentials for cloud control plane access
-- **Host namespace escape** — `nsenter` into host PID/net/mount namespaces
-- **ld.so.preload injection** — load malicious library into SUID binary execution
-- **/dev/mem access** — read/write physical host memory
+- **Docker socket escape**: create privileged containers via the daemon API
+- **Privileged container mount**: mount raw host block devices
+- **cgroup v1 release_agent**: kernel executes payload on the host when a cgroup empties
+- **core_pattern pipe handler**: kernel executes payload as root on any process crash
+- **Shocker / CAP_DAC_READ_SEARCH**: read host files by inode via `open_by_handle_at(2)`
+- **CAP_SYS_ADMIN + unshare/nsenter**: re-enter host namespaces
+- **Kernel module loading**: load malicious `.ko` for unrestricted kernel code execution
+- **DirtyPipe (CVE-2022-0847)**: overwrite read-only files on host mounts without privileges
+- **DirtyCOW (CVE-2016-5195)**: race condition write to read-only memory mappings
+- **Kubernetes service account abuse**: API server access with over-privileged RBAC
+- **Kubelet unauthenticated exec**: remote code execution in any pod on the node
+- **Cloud IMDS credential theft**: steal IAM credentials for cloud control plane access
+- **Host namespace escape**: `nsenter` into host PID/net/mount namespaces
+- **ld.so.preload injection**: load malicious library into SUID binary execution
+- **/dev/mem access**: read/write physical host memory
 
 ---
 
@@ -347,6 +347,8 @@ Pull requests are welcome. When adding a new check, please follow the existing p
 2. Call `add_finding` with all seven fields: id, severity, title, what, impact, exploitability, recommendation
 3. Register the function call in the MAIN section
 4. Update this README's checks table
+
+Send me a request if you want to join the project...
 
 ---
 
