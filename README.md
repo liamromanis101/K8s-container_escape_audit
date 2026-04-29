@@ -78,7 +78,7 @@ Each finding produces a structured report entry covering:
 
 ```bash
 # Download and run
-curl -O https://raw.githubusercontent.com/<your-org>/container-escape-audit/main/container_escape_audit.sh
+curl -O https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/main/container_escape_audit.sh
 chmod +x container_escape_audit.sh
 ./container_escape_audit.sh
 ```
