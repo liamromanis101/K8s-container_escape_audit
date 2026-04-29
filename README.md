@@ -144,14 +144,14 @@ spec:
             - -c
             - |
               apk add --no-cache bash curl && \
-              curl -sO https://raw.githubusercontent.com/<your-org>/container-escape-audit/main/container_escape_audit.sh && \
+              curl -sO https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/blob/main/container_escape_audit.sh && \
               chmod +x container_escape_audit.sh && \
               ./container_escape_audit.sh --json
 ```
 
 **1. Save the file**
 
-Save the above as `audit-job.yaml`, replacing `<your-org>` with your GitHub organisation or username.
+Save the above as `audit-job.yaml`.
 
 **2. Apply the Job**
 
@@ -797,7 +797,7 @@ This script performs point-in-time assessment. For continuous runtime detection 
 - Access to `/var/run/docker.sock`
 - Unexpected outbound connections to `169.254.169.254`
 
-### CI/CD integration
+### CI/CD integration (example)
 
 ```bash
 # Fail pipeline if any CRITICAL findings are present
@@ -808,7 +808,7 @@ if [ "$CRITICAL_COUNT" -gt 0 ]; then
 fi
 ```
 
-### SIEM / log ingestion
+### SIEM / log ingestion (example)
 
 ```bash
 ./container_escape_audit.sh --json --no-report | \
@@ -825,6 +825,8 @@ fi
 ## Legal
 
 This tool is provided for **authorised security testing only**. Running it against systems without explicit written permission from the system owner may be illegal in your jurisdiction. The authors accept no liability for misuse.
+
+There is no license attached to this project, meaning that Liam Romanis retains full rights over this project. 
 
 ---
 
