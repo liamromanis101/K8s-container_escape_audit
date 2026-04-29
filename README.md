@@ -78,7 +78,7 @@ Each finding produces a structured report entry covering:
 
 ```bash
 # Download and run
-curl -O https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/main/container_escape_audit.sh
+curl -O https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/blob/main/container_escape_audit.sh
 chmod +x container_escape_audit.sh
 ./container_escape_audit.sh
 ```
@@ -148,6 +148,42 @@ spec:
               chmod +x container_escape_audit.sh && \
               ./container_escape_audit.sh --json
 ```
+
+**1. Save the file**
+
+Save the above as `audit-job.yaml`, replacing `<your-org>` with your GitHub organisation or username.
+
+**2. Apply the Job**
+
+```bash
+kubectl apply -f audit-job.yaml
+```
+
+**3. Wait for completion**
+
+```bash
+kubectl wait --for=condition=complete job/container-escape-audit --timeout=120s
+```
+
+**4. Retrieve the output**
+
+```bash
+# Get the name of the pod that was created by the Job
+kubectl get pods --selector=job-name=container-escape-audit
+
+# Stream the audit results
+kubectl logs job/container-escape-audit
+```
+
+**5. Clean up**
+
+The Job and its pod are not automatically deleted. Remove them once you have retrieved the output:
+
+```bash
+kubectl delete job container-escape-audit
+```
+
+> **Note:** By default this Job runs with whatever the cluster's default security context is, which is intentional — the audit is designed to reflect the real permissions available to an unprivileged workload. If you want to test a specific security context (e.g. with a particular service account or capability set), add the relevant `securityContext` or `serviceAccountName` fields to the pod spec before applying.
 
 ---
 
