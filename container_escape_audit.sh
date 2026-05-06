@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # container_escape_audit.sh  —  v2.0
+# Liam Romanis 20/04/2026
 #
 # Detects potential container escape vectors from within a running container.
 # Intended for AUTHORISED security assessments only.
