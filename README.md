@@ -6,7 +6,7 @@ A bash script for detecting container escape vectors from within a running Docke
 
 ## Overview
 
-`container_escape_audit.sh` runs inside a container and performs 23 checks across the primary categories of container escape — privileged configuration, dangerous Linux capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, and cloud metadata access.
+`container_escape_audit.sh` runs inside a container and performs 23 checks across the primary categories of container escape: privileged configuration, dangerous Linux capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, and cloud metadata access.
 
 Each finding produces a structured report entry covering:
 
