@@ -880,7 +880,7 @@ When adding a new check:
 
 For authorised security testing only. Running this against systems without explicit written permission from the system owner may be illegal in your jurisdiction. No liability is accepted for misuse.
 
-Copyright Liam Romanis. All rights reserved. Source-available for review and non-commercial use. Commercial use requires explicit written permission. See LICENSE for full terms.
+Copyright Liam Romanis. Licensed under CC BY-NC 4.0 -- free for non-commercial use with attribution. Commercial use requires explicit written permission. See LICENSE for full terms.
 
 ## References
 
