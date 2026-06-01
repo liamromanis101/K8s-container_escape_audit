@@ -1,0 +1,66 @@
+name: SLSA provenance
+
+on:
+  workflow_dispatch:
+  release:
+    types: [created]
+
+permissions: read-all
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Build job
+  # Hashes the two release artifacts (the script and the CVE database) so
+  # the provenance generator can attest to exactly what was released.
+  # No compilation step is needed — the files are the artifacts.
+  # -------------------------------------------------------------------------
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      digests: ${{ steps.hash.outputs.digests }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Hash release artifacts
+        id: hash
+        run: |
+          set -euo pipefail
+          # The two files that constitute a release of this tool.
+          # Update this list if additional files are added to the release.
+          files="container_escape_audit.sh cve_checks.conf"
+          echo "hashes=$(sha256sum $files | base64 -w0)" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            container_escape_audit.sh
+            cve_checks.conf
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Provenance job
+  # Uses the SLSA generic generator (reusable workflow) to produce a signed
+  # provenance attestation meeting SLSA Build Level 3.
+  #
+  # The signed .intoto.jsonl file is uploaded as a release asset alongside
+  # the script and config, allowing users to verify the provenance with
+  # slsa-verifier:
+  #
+  #   slsa-verifier verify-artifact container_escape_audit.sh \
+  #     --provenance-path container_escape_audit.sh.intoto.jsonl \
+  #     --source-uri github.com/liamromanis101/K8s-container_escape_audit
+  # -------------------------------------------------------------------------
+  provenance:
+    needs: [build]
+    permissions:
+      actions: read    # To read the workflow path.
+      id-token: write  # To sign the provenance via Sigstore/OIDC.
+      contents: write  # To upload the provenance file to the release.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs.build.outputs.digests }}"
+      upload-assets: true
