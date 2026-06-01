@@ -6,7 +6,7 @@ A bash script that runs inside a Docker or Kubernetes container and checks for e
 
 ## What it does
 
-`container_escape_audit.sh` performs 35 checks covering the main container escape categories: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, and recent CVEs.
+`container_escape_audit.sh` v4.0 performs **47 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture, and an updateable database of recent kernel CVEs. All checks are strictly read-only — the script makes no changes to the system.
 
 Each finding comes with a structured report entry:
 
@@ -14,6 +14,13 @@ Each finding comes with a structured report entry:
 - **Impact**: worst-case if exploited
 - **Exploitability**: difficulty, tooling, real-world precedent
 - **Recommendation**: specific remediation steps
+
+The tool ships as two files that must sit in the same directory:
+
+```
+container_escape_audit.sh   # main script
+cve_checks.conf             # CVE database (update this independently of the script)
+```
 
 One note on running as root: checks 1, 2, and 27 (privileged mode, dangerous capabilities, UID 0 mapping) will always produce findings when you run the script as root inside the container. That's expected and correct. Running as root without user namespace remapping is itself a meaningful finding, not a false positive.
 
@@ -48,7 +55,7 @@ One note on running as root: checks 1, 2, and 27 (privileged mode, dangerous cap
 |---|---|---|
 | 10 | `/dev/mem` access and ptrace scope | CRITICAL |
 | 12 | cgroup v1 `release_agent` escape path | CRITICAL |
-| 14 | Kernel version and CVE checks (DirtyPipe CVE-2022-0847, DirtyCOW CVE-2016-5195) | HIGH |
+| 14 | Kernel version (informational; CVE checks handled by the engine) | INFO |
 | 19 | cgroup v2 writability | MEDIUM |
 | 22 | Kernel module loading status (`modules_disabled`) | INFO |
 | 28 | eBPF exposure (CAP_BPF + bpf syscall availability) | CRITICAL |
@@ -76,21 +83,60 @@ One note on running as root: checks 1, 2, and 27 (privileged mode, dangerous cap
 | 21 | SSH private keys readable | HIGH |
 | 31 | Additional container runtime sockets (Podman, BuildKit, Kata) | CRITICAL |
 
-### Recent CVEs
+### Runtime and namespace (new checks 24-35)
 
 | # | Check | Severity |
 |---|---|---|
-| 24 | Copy Fail (CVE-2026-31431) -- AF_ALG algif_aead page cache write | CRITICAL |
-| 25 | NVIDIAScape (CVE-2025-23266) -- NVIDIA Container Toolkit OCI hook LD_PRELOAD | CRITICAL |
-| 26 | runc masked path race (CVE-2025-31133 / CVE-2025-52565 / CVE-2025-52881) | CRITICAL |
+| 24 | NVIDIAScape (CVE-2025-23266) — NVIDIA Container Toolkit OCI hook LD_PRELOAD injection | CRITICAL |
+| 25 | runc masked path race (CVE-2025-31133 / CVE-2025-52565 / CVE-2025-52881) | CRITICAL |
+| 26 | User namespace UID mapping (root-in-container = root-on-host without remapping) | HIGH |
+
+### Kernel hardening posture (new checks 36-47)
+
+These checks read sysctl values from `/proc/sys` and compare them against the recommended hardening baseline. All are read-only. Values reflect the host kernel configuration.
+
+| # | Parameter | Recommended | Risk |
+|---|-----------|-------------|------|
+| 36 | `kernel.kptr_restrict` | 2 | KASLR bypass |
+| 37 | `kernel.dmesg_restrict` | 1 | Kernel address/register leakage |
+| 38 | `kernel.randomize_va_space` | 2 | ASLR partial or disabled |
+| 39 | `fs.protected_symlinks` / `fs.protected_hardlinks` | 1 | /tmp symlink and hardlink attacks |
+| 40 | `fs.protected_fifos` / `fs.protected_regular` | 2 | FIFO stalling and O_CREAT confusion |
+| 41 | `net.ipv4.tcp_syncookies` | 1 | SYN flood DoS |
+| 42 | ICMP redirects / source routing / rp_filter | 0 / 0 / 1 | MitM on pod network |
+| 43 | `net.ipv4.ip_forward` / IPv6 forwarding | informational | Expected on K8s nodes |
+| 44 | `kernel.unprivileged_userns_clone` | 0 | User namespace prerequisite for most container escape CVEs |
+| 45 | `kernel.perf_event_paranoid` | ≥ 2 | Spectre-class side-channel attacks |
+| 46 | esp4 / esp6 / rxrpc modules | not loaded / blacklisted | Dirty Frag (CVE-2026-43284/43500) |
+| 47 | Dangerous loaded modules audit | — | 14 modules checked incl. algif_aead, nf_tables, dccp, sctp, bluetooth |
+
+### Config-driven CVE checks
+
+CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with ten entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
+
+| CVE | Name | CVSS | ITW | CISA KEV |
+|-----|------|------|-----|----------|
+| CVE-2026-31431 | Copy Fail | 7.8 | ✓ | ✓ |
+| CVE-2026-43284 | Dirty Frag ESP | 8.8 | ✓ | |
+| CVE-2026-43500 | Dirty Frag RxRPC | 7.8 | ✓ | |
+| CVE-2024-1086 | Flipping Pages | 7.8 | ✓ | ✓ |
+| CVE-2025-21756 | Attack of the Vsock | 7.8 | | |
+| CVE-2025-38352 | Chronomaly | 7.0 | ✓ | |
+| CVE-2025-38617 | Packet Socket Race | 7.8 | | |
+| CVE-2025-38352 | OverlayFS SetUID Copy | 7.8 | ✓ | ✓ |
+| CVE-2022-0847 | DirtyPipe | 7.8 | | |
+| CVE-2016-5195 | DirtyCOW | 7.8 | ✓ | ✓ |
 
 ## Usage
 
 ```bash
 curl -O https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/main/container_escape_audit.sh
+curl -O https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/main/cve_checks.conf
 chmod +x container_escape_audit.sh
 ./container_escape_audit.sh
 ```
+
+Both files must be in the same directory. The script looks for `cve_checks.conf` alongside itself by default.
 
 ### Options
 
@@ -100,6 +146,8 @@ chmod +x container_escape_audit.sh
 --json             Emit JSON summary to stdout
 --quiet            Suppress info lines, print only WARN/CRITICAL to terminal
 --no-report        Skip writing the report file
+--cve-conf <file>  Path to CVE database file
+                   Default: cve_checks.conf in the same directory as the script
 ```
 
 ### Examples
@@ -116,6 +164,9 @@ chmod +x container_escape_audit.sh
 
 # Quiet terminal output with report
 ./container_escape_audit.sh --quiet --report ./report.txt
+
+# Use a centralised or updated CVE database
+./container_escape_audit.sh --cve-conf /etc/audit/cve_checks.conf
 ```
 
 ### Running inside a Kubernetes pod
@@ -146,6 +197,7 @@ spec:
             - |
               apk add --no-cache bash curl && \
               curl -sO https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/main/container_escape_audit.sh && \
+              curl -sO https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/main/cve_checks.conf && \
               chmod +x container_escape_audit.sh && \
               ./container_escape_audit.sh --json
 ```
@@ -867,20 +919,83 @@ fi
   done
 ```
 
+## CVE engine
+
+CVE checks are driven by `cve_checks.conf` — a plain-text key=value database that lives alongside the script. The engine parses it at runtime and runs the appropriate test for each entry. The script does not need to be modified to add, update, or disable a CVE.
+
+### Adding a new CVE
+
+Append a block to `cve_checks.conf`:
+
+```ini
+cve_id=CVE-2025-XXXXX
+name=Short name
+cvss=8.1
+severity=HIGH
+check_type=compound
+introduced=6.1
+fixed_versions=6.6:6.6.50 6.12:6.12.5
+itw=no
+poc_public=yes
+cisa_kev=no
+subsystem=fs/btrfs
+module_names=btrfs
+mitigation=none
+socket_af=none
+socket_type=none
+socket_proto=none
+what=What the vulnerability is...
+impact=What an attacker can do...
+exploit=How hard it is to exploit...
+rec=How to fix it...
+```
+
+To disable an entry without removing it, prefix its `cve_id` line with `#`.
+
+### Check types
+
+| Type | What it does |
+|------|-------------|
+| `kernel_version` | Compares `uname -r` against `introduced` and `fixed_versions` |
+| `module_loaded` | Checks `/proc/modules` for the listed `module_names` |
+| `socket_family` | Attempts to open a socket with the given `socket_af` / `socket_type` / `socket_proto` |
+| `compound` | Runs all three and synthesises a combined severity |
+
+### Keeping the database current
+
+Version `cve_checks.conf` separately from the script. When a distribution ships a patch for a listed CVE, add the version to `fixed_versions` for that entry. When in-the-wild status changes, update `itw=`. A suggested workflow:
+
+```bash
+# Pull the latest database from the repo
+curl -sO https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/main/cve_checks.conf
+```
+
 ## Contributing
 
-When adding a new check:
+When adding a new check function:
 
-1. Add a `check_<name>()` function
+1. Add a `check_<name>()` function to the script
 2. Call `add_finding` with all seven fields: id, severity, title, what, impact, exploitability, recommendation
-3. Register the function call in the MAIN section
+3. Register the function call in the relevant MAIN section
 4. Update the checks table in this README
+
+To add or update a CVE, edit `cve_checks.conf` only — no script changes needed.
 
 ## Legal
 
 For authorised security testing only. Running this against systems without explicit written permission from the system owner may be illegal in your jurisdiction. No liability is accepted for misuse.
 
-Copyright Liam Romanis. Licensed under CC BY-NC 4.0 -- free for non-commercial use with attribution. Commercial use requires explicit written permission. See LICENSE for full terms.
+Copyright (c) 2026 Liam Romanis. Licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — free for non-commercial use with attribution. See [LICENSE](LICENSE) for full terms.
+
+### Commercial use
+
+This tool is free for personal use, internal security assessments, open-source projects, and non-profit work. If you are using it as part of a commercial engagement — for example as a consultant billing a client, or as a component of a paid product or service — commercial use terms apply under CC BY-NC 4.0.
+
+We are happy to discuss sponsorship arrangements for commercial users. Sponsorship helps fund continued development, CVE database maintenance, and new check coverage. If you or your organisation would like to support the project in exchange for commercial use rights, please reach out:
+
+**GitHub Sponsors:** [github.com/sponsors/liamromanis101](https://github.com/sponsors/liamromanis101)
+
+Sponsorship does not grant exclusivity or any change to the open licence for non-commercial users.
 
 ## References
 
@@ -889,6 +1004,8 @@ Copyright Liam Romanis. Licensed under CC BY-NC 4.0 -- free for non-commercial u
 - [Kubernetes Pod Security Admission](https://kubernetes.io/docs/concepts/security/pod-security-admission/)
 - [CIS Kubernetes Benchmark](https://www.cisecurity.org/benchmark/kubernetes)
 - [CVE-2026-31431 Copy Fail](https://en.wikipedia.org/wiki/Copy_Fail)
+- [CVE-2026-43284 / CVE-2026-43500 Dirty Frag](https://www.openwall.com/lists/oss-security/2026/05/)
+- [CVE-2024-1086 Flipping Pages](https://github.com/Notselwyn/CVE-2024-1086)
 - [CVE-2025-23266 NVIDIAScape](https://www.wiz.io/blog/nvidia-ai-vulnerability-cve-2025-23266-nvidiascape)
 - [CVE-2025-31133 runc masked path](https://www.cncf.io/blog/2025/11/28/runc-container-breakout-vulnerabilities-a-technical-overview/)
 - [CVE-2022-0847 DirtyPipe](https://dirtypipe.cm4all.com/)
@@ -896,4 +1013,4 @@ Copyright Liam Romanis. Licensed under CC BY-NC 4.0 -- free for non-commercial u
 - [Felix Wilhelm's cgroup release_agent PoC](https://twitter.com/_fel1x/status/1151487051986087936)
 - [deepce](https://github.com/stealthcopter/deepce)
 - [CDK](https://github.com/cdk-team/CDK)
-- [Trail of Bits -- Understanding and Hardening Linux Containers](https://github.com/trailofbits/publications/blob/master/papers/understanding_hardening_linux_containers.pdf)
+- [Trail of Bits — Understanding and Hardening Linux Containers](https://github.com/trailofbits/publications/blob/master/papers/understanding_hardening_linux_containers.pdf)

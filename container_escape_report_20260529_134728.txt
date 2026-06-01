@@ -1,0 +1,1484 @@
+============================================================
+ CONTAINER ESCAPE AUDIT REPORT
+ Generated  : Fri May 29 01:47:37 PM IST 2026
+ Hostname   : lemmy-Inspiron-7591-2n1
+ Kernel     : 6.17.0-29-generic
+ UID / GID  : uid=1001(liam) gid=1001(liam) groups=1001(liam),4(adm),27(sudo),100(users)
+ CGroup     : 0::/init.scope
+============================================================
+
+EXECUTIVE SUMMARY
+------------------------------------------------------------
+  CRITICAL:    4
+  HIGH:        3
+  MEDIUM:      41
+  INFO:        14
+  TOTAL:       62
+
+============================================================
+ CRITICAL FINDINGS
+============================================================
+
+  ID           : runtime_socket__var_run_docker.sock
+  Severity     : CRITICAL
+  Title        : Container runtime socket accessible: /var/run/docker.sock
+
+  WHAT IT IS
+    The container runtime's UNIX domain socket is bind-mounted into the 
+    container. This socket is the administrative API for the container 
+    daemon, which runs as root on the host.
+
+  IMPACT
+    Full host node compromise. An attacker uses the 
+    Docker/containerd/CRI-O API to create a new privileged container with 
+    the host root filesystem mounted, exec into it, and obtain a root 
+    shell on the host.
+
+  EXPLOITABILITY
+    Trivial. 'docker run -v /:/host --privileged alpine chroot /host' is 
+    a single command. CDK and deepce perform this automatically on socket 
+    detection.
+
+  RECOMMENDATION
+    Never mount the runtime socket into application containers. For CI/CD 
+    image building use rootless Docker, Kaniko, or Buildah.
+
+  ------------------------------------------------------------
+
+  ID           : runtime_socket__run_docker.sock
+  Severity     : CRITICAL
+  Title        : Container runtime socket accessible: /run/docker.sock
+
+  WHAT IT IS
+    The container runtime's UNIX domain socket is bind-mounted into the 
+    container. This socket is the administrative API for the container 
+    daemon, which runs as root on the host.
+
+  IMPACT
+    Full host node compromise. An attacker uses the 
+    Docker/containerd/CRI-O API to create a new privileged container with 
+    the host root filesystem mounted, exec into it, and obtain a root 
+    shell on the host.
+
+  EXPLOITABILITY
+    Trivial. 'docker run -v /:/host --privileged alpine chroot /host' is 
+    a single command. CDK and deepce perform this automatically on socket 
+    detection.
+
+  RECOMMENDATION
+    Never mount the runtime socket into application containers. For CI/CD 
+    image building use rootless Docker, Kaniko, or Buildah.
+
+  ------------------------------------------------------------
+
+  ID           : runtime_socket__run_containerd_containerd.sock
+  Severity     : CRITICAL
+  Title        : Container runtime socket accessible: /run/containerd/containerd.sock
+
+  WHAT IT IS
+    The container runtime's UNIX domain socket is bind-mounted into the 
+    container. This socket is the administrative API for the container 
+    daemon, which runs as root on the host.
+
+  IMPACT
+    Full host node compromise. An attacker uses the 
+    Docker/containerd/CRI-O API to create a new privileged container with 
+    the host root filesystem mounted, exec into it, and obtain a root 
+    shell on the host.
+
+  EXPLOITABILITY
+    Trivial. 'docker run -v /:/host --privileged alpine chroot /host' is 
+    a single command. CDK and deepce perform this automatically on socket 
+    detection.
+
+  RECOMMENDATION
+    Never mount the runtime socket into application containers. For CI/CD 
+    image building use rootless Docker, Kaniko, or Buildah.
+
+  ------------------------------------------------------------
+
+  ID           : runtime_socket__var_run_containerd_containerd.sock
+  Severity     : CRITICAL
+  Title        : Container runtime socket accessible: /var/run/containerd/containerd.sock
+
+  WHAT IT IS
+    The container runtime's UNIX domain socket is bind-mounted into the 
+    container. This socket is the administrative API for the container 
+    daemon, which runs as root on the host.
+
+  IMPACT
+    Full host node compromise. An attacker uses the 
+    Docker/containerd/CRI-O API to create a new privileged container with 
+    the host root filesystem mounted, exec into it, and obtain a root 
+    shell on the host.
+
+  EXPLOITABILITY
+    Trivial. 'docker run -v /:/host --privileged alpine chroot /host' is 
+    a single command. CDK and deepce perform this automatically on socket 
+    detection.
+
+  RECOMMENDATION
+    Never mount the runtime socket into application containers. For CI/CD 
+    image building use rootless Docker, Kaniko, or Buildah.
+
+  ------------------------------------------------------------
+============================================================
+ HIGH FINDINGS
+============================================================
+
+  ID           : kh_unprivileged_userns
+  Severity     : HIGH
+  Title        : Unprivileged user namespace creation is enabled — exposes significant kernel attack surface
+
+  WHAT IT IS
+    Kernel parameter: kernel.unprivileged_userns_clone=1. Unprivileged 
+    user namespace creation is enabled. Any unprivileged user can call 
+    unshare(CLONE_NEWUSER) to create a new user namespace with their own 
+    UID mappings, gaining access to capabilities within that namespace 
+    and the ability to create further namespaces.
+
+  IMPACT
+    User namespaces dramatically expand the kernel attack surface 
+    accessible to unprivileged users. The following attack classes are 
+    only possible with user namespace access: (1) The majority of 
+    container escape CVEs since 2019, including cgroup release_agent 
+    escapes, overlayfs vulnerabilities, and namespace confusion attacks. 
+    (2) Copy Fail (CVE-2026-31431) is significantly easier to exploit 
+    with user namespace access. (3) Dirty Frag 
+    (CVE-2026-43284/CVE-2026-43500) uses standard sockets that are more 
+    accessible within user namespaces. (4) eBPF unprivileged access 
+    (check 28) is most dangerous when combined with user namespace 
+    creation. (5) The runc trilogy (CVE-2025-31133/-52565/-52881, check 
+    26) is exploitable by anyone who can spawn containers — user 
+    namespaces make self-hosting containers feasible without root. 
+    Google, Red Hat, and Canonical all restrict or disable unprivileged 
+    user namespaces in hardened deployments.
+
+  EXPLOITABILITY
+    High. An unprivileged container user with network access can use user 
+    namespaces to access capabilities (CAP_NET_RAW, CAP_NET_BIND_SERVICE) 
+    within the namespace, enabling a wide range of subsequent attacks. 
+    Many published container escape PoCs begin with an 
+    unshare(CLONE_NEWUSER) call.
+
+  RECOMMENDATION
+    1) On Debian/Ubuntu: set kernel.unprivileged_userns_clone=0 in 
+    /etc/sysctl.d/ if rootless containers are not required. 2) On 
+    RHEL/Fedora: set user.max_user_namespaces=0. 3) If rootless 
+    containers are required, restrict user namespace creation to specific 
+    users/groups via AppArmor or seccomp. 4) Ubuntu 24.04+ (Noble) and 
+    Debian 12+ support restricting user namespace creation per-process 
+    via AppArmor's 'userns' rule — use this as a middle ground.
+
+  ------------------------------------------------------------
+
+  ID           : kh_mod_binfmt_misc
+  Severity     : HIGH
+  Title        : Dangerous kernel module loaded: binfmt_misc
+
+  WHAT IT IS
+    Kernel module 'binfmt_misc' is currently loaded (visible in 
+    /proc/modules). Reason: Registers additional binary format 
+    interpreters via a filesystem interface; if writable from a 
+    container, allows registering a handler that runs as root on the host 
+    when a container binary is executed. Associated CVE(s): none.
+
+  IMPACT
+    Module-specific attack surface is active and exploitable. See the 
+    reason field above. For modules with active ITW CVEs (algif_aead, 
+    esp4, esp6, rxrpc), the host is exposed to current in-the-wild 
+    exploits providing local privilege escalation and container escape.
+
+  EXPLOITABILITY
+    Module is already loaded — no auto-load trigger needed. Exploit 
+    primitives (sockets, syscalls) are immediately accessible. Attack 
+    complexity depends on the specific module — see reasons above.
+
+  RECOMMENDATION
+    Ensure /proc/sys/fs/binfmt_misc is mounted read-only or not at all in 
+    container contexts.
+
+  ------------------------------------------------------------
+
+  ID           : kh_mod_nf_conntrack_netlink
+  Severity     : HIGH
+  Title        : Dangerous kernel module loaded: nf_conntrack_netlink
+
+  WHAT IT IS
+    Kernel module 'nf_conntrack_netlink' is currently loaded (visible in 
+    /proc/modules). Reason: Provides a Netlink interface for querying and 
+    modifying connection tracking state; exploited in multiple container 
+    network escape scenarios. Associated CVE(s): none.
+
+  IMPACT
+    Module-specific attack surface is active and exploitable. See the 
+    reason field above. For modules with active ITW CVEs (algif_aead, 
+    esp4, esp6, rxrpc), the host is exposed to current in-the-wild 
+    exploits providing local privilege escalation and container escape.
+
+  EXPLOITABILITY
+    Module is already loaded — no auto-load trigger needed. Exploit 
+    primitives (sockets, syscalls) are immediately accessible. Attack 
+    complexity depends on the specific module — see reasons above.
+
+  RECOMMENDATION
+    Blacklist if not required for NAT/firewall functionality: 'install 
+    nf_conntrack_netlink /bin/false'.
+
+  ------------------------------------------------------------
+============================================================
+ MEDIUM FINDINGS
+============================================================
+
+  ID           : apparmor_unconfined
+  Severity     : MEDIUM
+  Title        : AppArmor profile is not applied (unconfined)
+
+  WHAT IT IS
+    AppArmor applies mandatory access control based on profiles 
+    restricting file access, capabilities, and network operations.
+
+  IMPACT
+    The Docker default AppArmor profile blocks writes to /proc/sys and 
+    restricts mount operations. Without it, these path-based restrictions 
+    are absent.
+
+  EXPLOITABILITY
+    Not a direct escape, but removes protection against file-based attack 
+    paths.
+
+  RECOMMENDATION
+    Ensure the runtime applies an AppArmor profile. Apply profiles via 
+    securityContext.appArmorProfile in Kubernetes.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_libexec_camel-lock-helper-1.2
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/libexec/camel-lock-helper-1.2
+
+  WHAT IT IS
+    /usr/libexec/camel-lock-helper-1.2 has the setuid or setgid bit set 
+    and executes with the permissions of its owner regardless of who runs 
+    it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for 
+    /usr/libexec/camel-lock-helper-1.2. Many common binaries (find, vim, 
+    python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_sbin_postdrop
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/sbin/postdrop
+
+  WHAT IT IS
+    /usr/sbin/postdrop has the setuid or setgid bit set and executes with 
+    the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/sbin/postdrop. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_sbin_unix_chkpwd
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/sbin/unix_chkpwd
+
+  WHAT IT IS
+    /usr/sbin/unix_chkpwd has the setuid or setgid bit set and executes 
+    with the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/sbin/unix_chkpwd. Many 
+    common binaries (find, vim, python, cp, bash) have documented 
+    one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_sbin_postqueue
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/sbin/postqueue
+
+  WHAT IT IS
+    /usr/sbin/postqueue has the setuid or setgid bit set and executes 
+    with the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/sbin/postqueue. Many 
+    common binaries (find, vim, python, cp, bash) have documented 
+    one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_sbin_pam_extrausers_chkpwd
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/sbin/pam_extrausers_chkpwd
+
+  WHAT IT IS
+    /usr/sbin/pam_extrausers_chkpwd has the setuid or setgid bit set and 
+    executes with the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for 
+    /usr/sbin/pam_extrausers_chkpwd. Many common binaries (find, vim, 
+    python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_sbin_pppd
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/sbin/pppd
+
+  WHAT IT IS
+    /usr/sbin/pppd has the setuid or setgid bit set and executes with the 
+    permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/sbin/pppd. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_dotlockfile
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/dotlockfile
+
+  WHAT IT IS
+    /usr/bin/dotlockfile has the setuid or setgid bit set and executes 
+    with the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/dotlockfile. Many 
+    common binaries (find, vim, python, cp, bash) have documented 
+    one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_su
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/su
+
+  WHAT IT IS
+    /usr/bin/su has the setuid or setgid bit set and executes with the 
+    permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/su. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_mount
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/mount
+
+  WHAT IT IS
+    /usr/bin/mount has the setuid or setgid bit set and executes with the 
+    permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/mount. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_ssh-agent
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/ssh-agent
+
+  WHAT IT IS
+    /usr/bin/ssh-agent has the setuid or setgid bit set and executes with 
+    the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/ssh-agent. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_chfn
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/chfn
+
+  WHAT IT IS
+    /usr/bin/chfn has the setuid or setgid bit set and executes with the 
+    permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/chfn. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_crontab
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/crontab
+
+  WHAT IT IS
+    /usr/bin/crontab has the setuid or setgid bit set and executes with 
+    the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/crontab. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_newgrp
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/newgrp
+
+  WHAT IT IS
+    /usr/bin/newgrp has the setuid or setgid bit set and executes with 
+    the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/newgrp. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_gpasswd
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/gpasswd
+
+  WHAT IT IS
+    /usr/bin/gpasswd has the setuid or setgid bit set and executes with 
+    the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/gpasswd. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_umount
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/umount
+
+  WHAT IT IS
+    /usr/bin/umount has the setuid or setgid bit set and executes with 
+    the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/umount. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_chsh
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/chsh
+
+  WHAT IT IS
+    /usr/bin/chsh has the setuid or setgid bit set and executes with the 
+    permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/chsh. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_chage
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/chage
+
+  WHAT IT IS
+    /usr/bin/chage has the setuid or setgid bit set and executes with the 
+    permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/chage. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_expiry
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/expiry
+
+  WHAT IT IS
+    /usr/bin/expiry has the setuid or setgid bit set and executes with 
+    the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/expiry. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_fusermount3
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/fusermount3
+
+  WHAT IT IS
+    /usr/bin/fusermount3 has the setuid or setgid bit set and executes 
+    with the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/fusermount3. Many 
+    common binaries (find, vim, python, cp, bash) have documented 
+    one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_dotlock.mailutils
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/dotlock.mailutils
+
+  WHAT IT IS
+    /usr/bin/dotlock.mailutils has the setuid or setgid bit set and 
+    executes with the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/dotlock.mailutils. 
+    Many common binaries (find, vim, python, cp, bash) have documented 
+    one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_sudo
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/sudo
+
+  WHAT IT IS
+    /usr/bin/sudo has the setuid or setgid bit set and executes with the 
+    permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/sudo. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_passwd
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/passwd
+
+  WHAT IT IS
+    /usr/bin/passwd has the setuid or setgid bit set and executes with 
+    the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/passwd. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_bin_pkexec
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/bin/pkexec
+
+  WHAT IT IS
+    /usr/bin/pkexec has the setuid or setgid bit set and executes with 
+    the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/bin/pkexec. Many common 
+    binaries (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_lib_polkit-1_polkit-agent-helper-1
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/lib/polkit-1/polkit-agent-helper-1
+
+  WHAT IT IS
+    /usr/lib/polkit-1/polkit-agent-helper-1 has the setuid or setgid bit 
+    set and executes with the permissions of its owner regardless of who 
+    runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for 
+    /usr/lib/polkit-1/polkit-agent-helper-1. Many common binaries (find, 
+    vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_lib_xorg_Xorg.wrap
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/lib/xorg/Xorg.wrap
+
+  WHAT IT IS
+    /usr/lib/xorg/Xorg.wrap has the setuid or setgid bit set and executes 
+    with the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/lib/xorg/Xorg.wrap. Many 
+    common binaries (find, vim, python, cp, bash) have documented 
+    one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_lib_dbus-1.0_dbus-daemon-launch-helper
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/lib/dbus-1.0/dbus-daemon-launch-helper
+
+  WHAT IT IS
+    /usr/lib/dbus-1.0/dbus-daemon-launch-helper has the setuid or setgid 
+    bit set and executes with the permissions of its owner regardless of 
+    who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for 
+    /usr/lib/dbus-1.0/dbus-daemon-launch-helper. Many common binaries 
+    (find, vim, python, cp, bash) have documented one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : suid__usr_lib_openssh_ssh-keysign
+  Severity     : MEDIUM
+  Title        : SUID/SGID binary present: /usr/lib/openssh/ssh-keysign
+
+  WHAT IT IS
+    /usr/lib/openssh/ssh-keysign has the setuid or setgid bit set and 
+    executes with the permissions of its owner regardless of who runs it.
+
+  IMPACT
+    If exploitable via GTFOBins technique, command injection, or library 
+    loading flaw, an attacker gains a root shell.
+
+  EXPLOITABILITY
+    Check https://gtfobins.github.io/ for /usr/lib/openssh/ssh-keysign. 
+    Many common binaries (find, vim, python, cp, bash) have documented 
+    one-liners.
+
+  RECOMMENDATION
+    Remove unnecessary SUID/SGID bits. Set no-new-privileges: true. Use 
+    readOnlyRootFilesystem. Integrate SUID scanning into CI/CD.
+
+  ------------------------------------------------------------
+
+  ID           : escape_tool_nsenter
+  Severity     : MEDIUM
+  Title        : Namespace/runtime escape tool present: nsenter
+
+  WHAT IT IS
+    nsenter is a Linux utility for namespace manipulation, container 
+    runtime interaction, or filesystem pivoting.
+
+  IMPACT
+    'nsenter -t 1 -m -u -i -n -p -- /bin/bash' enters the host's 
+    namespaces directly when run with appropriate capabilities.
+
+  EXPLOITABILITY
+    Low standalone, High when combined with relevant capabilities.
+
+  RECOMMENDATION
+    Use minimal base images (distroless, scratch). Remove all tools not 
+    required by the application.
+
+  ------------------------------------------------------------
+
+  ID           : escape_tool_unshare
+  Severity     : MEDIUM
+  Title        : Namespace/runtime escape tool present: unshare
+
+  WHAT IT IS
+    unshare is a Linux utility for namespace manipulation, container 
+    runtime interaction, or filesystem pivoting.
+
+  IMPACT
+    'nsenter -t 1 -m -u -i -n -p -- /bin/bash' enters the host's 
+    namespaces directly when run with appropriate capabilities.
+
+  EXPLOITABILITY
+    Low standalone, High when combined with relevant capabilities.
+
+  RECOMMENDATION
+    Use minimal base images (distroless, scratch). Remove all tools not 
+    required by the application.
+
+  ------------------------------------------------------------
+
+  ID           : escape_tool_runc
+  Severity     : MEDIUM
+  Title        : Namespace/runtime escape tool present: runc
+
+  WHAT IT IS
+    runc is a Linux utility for namespace manipulation, container runtime 
+    interaction, or filesystem pivoting.
+
+  IMPACT
+    'nsenter -t 1 -m -u -i -n -p -- /bin/bash' enters the host's 
+    namespaces directly when run with appropriate capabilities.
+
+  EXPLOITABILITY
+    Low standalone, High when combined with relevant capabilities.
+
+  RECOMMENDATION
+    Use minimal base images (distroless, scratch). Remove all tools not 
+    required by the application.
+
+  ------------------------------------------------------------
+
+  ID           : escape_tool_ctr
+  Severity     : MEDIUM
+  Title        : Namespace/runtime escape tool present: ctr
+
+  WHAT IT IS
+    ctr is a Linux utility for namespace manipulation, container runtime 
+    interaction, or filesystem pivoting.
+
+  IMPACT
+    'nsenter -t 1 -m -u -i -n -p -- /bin/bash' enters the host's 
+    namespaces directly when run with appropriate capabilities.
+
+  EXPLOITABILITY
+    Low standalone, High when combined with relevant capabilities.
+
+  RECOMMENDATION
+    Use minimal base images (distroless, scratch). Remove all tools not 
+    required by the application.
+
+  ------------------------------------------------------------
+
+  ID           : escape_tool_chroot
+  Severity     : MEDIUM
+  Title        : Namespace/runtime escape tool present: chroot
+
+  WHAT IT IS
+    chroot is a Linux utility for namespace manipulation, container 
+    runtime interaction, or filesystem pivoting.
+
+  IMPACT
+    'nsenter -t 1 -m -u -i -n -p -- /bin/bash' enters the host's 
+    namespaces directly when run with appropriate capabilities.
+
+  EXPLOITABILITY
+    Low standalone, High when combined with relevant capabilities.
+
+  RECOMMENDATION
+    Use minimal base images (distroless, scratch). Remove all tools not 
+    required by the application.
+
+  ------------------------------------------------------------
+
+  ID           : escape_tool_pivot_root
+  Severity     : MEDIUM
+  Title        : Namespace/runtime escape tool present: pivot_root
+
+  WHAT IT IS
+    pivot_root is a Linux utility for namespace manipulation, container 
+    runtime interaction, or filesystem pivoting.
+
+  IMPACT
+    'nsenter -t 1 -m -u -i -n -p -- /bin/bash' enters the host's 
+    namespaces directly when run with appropriate capabilities.
+
+  EXPLOITABILITY
+    Low standalone, High when combined with relevant capabilities.
+
+  RECOMMENDATION
+    Use minimal base images (distroless, scratch). Remove all tools not 
+    required by the application.
+
+  ------------------------------------------------------------
+
+  ID           : debugfs_exposed
+  Severity     : MEDIUM
+  Title        : debugfs mounted and readable (/sys/kernel/debug)
+
+  WHAT IT IS
+    The Linux kernel debug filesystem (debugfs) is mounted and accessible 
+    at /sys/kernel/debug. Access mode: readable. tracefs also mounted: 
+    true.
+
+  IMPACT
+    Accessible debugfs provides: (1) Kernel tracing via ftrace — 
+    capture arguments including memory contents and cryptographic 
+    material from all host processes. (2) x86/pat_memtype_list exposes 
+    memory type information. (3) Driver-specific debug interfaces may 
+    expose hardware state or DMA buffers.
+
+  EXPLOITABILITY
+    Moderate. Simply reading ftrace ring buffer content can passively 
+    capture sensitive data from host processes. Risk increases 
+    significantly with write access.
+
+  RECOMMENDATION
+    Do not mount debugfs in production containers. If required, mount 
+    read-only. Ensure /sys/kernel/debug is not included in any volume 
+    mounts.
+
+  ------------------------------------------------------------
+
+  ID           : kernel_keyring_visible
+  Severity     : MEDIUM
+  Title        : Kernel keys visible in /proc/keys (4 keys)
+
+  WHAT IT IS
+    /proc/keys is readable and shows 4 keys. Without CAP_SYS_ADMIN the 
+    keys themselves cannot generally be read, but metadata is visible.
+
+  IMPACT
+    Key metadata may reveal what encryption or authentication material is 
+    stored, informing further attack planning.
+
+  EXPLOITABILITY
+    Low — metadata only without elevated capabilities.
+
+  RECOMMENDATION
+    Audit key permissions with keyctl show. Apply seccomp to block 
+    keyctl(2) if not required.
+
+  ------------------------------------------------------------
+
+  ID           : kh_kptr_restrict_1
+  Severity     : MEDIUM
+  Title        : kptr_restrict=1: kernel pointers visible to root (recommend 2)
+
+  WHAT IT IS
+    kernel.kptr_restrict=1. Kernel symbol addresses are hidden from 
+    unprivileged users but still visible to root-level processes (UID 0 
+    or CAP_SYSLOG). Current value: 1. Recommended: 2.
+
+  IMPACT
+    Kernel Virtual Address Space Layout Randomisation (KASLR) is a 
+    primary exploit mitigation. kptr_restrict=1 means that any 
+    root-equivalent process — including processes in a privileged 
+    container — can read kernel pointer values from /proc/kallsyms, 
+    /proc/modules, and sysfs. This provides the KASLR bypass that is step 
+    one of almost every modern kernel exploitation chain. An attacker who 
+    has achieved UID 0 inside a container (e.g. via setuid binary, 
+    capability escalation, or this script's check 7) can immediately 
+    proceed to dereferencing kernel symbols.
+
+  EXPLOITABILITY
+    Low-moderate standalone. Combined with any kernel bug, the kernel 
+    pointer leak removes the address-space randomisation barrier. This is 
+    consistently the most valuable piece of information in a kernel 
+    exploitation attempt.
+
+  RECOMMENDATION
+    Set kernel.kptr_restrict=2 in /etc/sysctl.d/99-hardening.conf on the 
+    host. This is non-breaking for all standard workloads and is included 
+    in the CIS Benchmark for Linux, DISA STIG, and ANSSI hardening guides.
+
+  ------------------------------------------------------------
+
+  ID           : kh_ipv4_all_send_redirects
+  Severity     : MEDIUM
+  Title        : ipv4/conf/all/send_redirects=1: host emitting ICMP redirects
+
+  WHAT IT IS
+    Kernel parameter: net.ipv4.conf.all.send_redirects. Current value: 1. 
+    Recommended: 0. The host will generate and send ICMP redirect 
+    messages to clients, informing them of better routes. This behaviour 
+    can be abused to redirect traffic from legitimate clients.
+
+  IMPACT
+    An attacker who achieves code execution on the host can leverage 
+    send_redirects to poison the routing caches of connected clients, 
+    redirecting their traffic through an attacker-controlled host. In 
+    shared network segments this affects all pods on the same subnet.
+
+  EXPLOITABILITY
+    Low standalone. Relevant as a post-exploitation tool to facilitate 
+    lateral movement.
+
+  RECOMMENDATION
+    Set net.ipv4.conf.all.send_redirects=0 in /etc/sysctl.d/.
+
+  ------------------------------------------------------------
+
+  ID           : kh_ipv4_default_send_redirects
+  Severity     : MEDIUM
+  Title        : ipv4/conf/default/send_redirects=1: host emitting ICMP redirects
+
+  WHAT IT IS
+    Kernel parameter: net.ipv4.conf.default.send_redirects. Current 
+    value: 1. Recommended: 0. The host will generate and send ICMP 
+    redirect messages to clients, informing them of better routes. This 
+    behaviour can be abused to redirect traffic from legitimate clients.
+
+  IMPACT
+    An attacker who achieves code execution on the host can leverage 
+    send_redirects to poison the routing caches of connected clients, 
+    redirecting their traffic through an attacker-controlled host. In 
+    shared network segments this affects all pods on the same subnet.
+
+  EXPLOITABILITY
+    Low standalone. Relevant as a post-exploitation tool to facilitate 
+    lateral movement.
+
+  RECOMMENDATION
+    Set net.ipv4.conf.all.send_redirects=0 in /etc/sysctl.d/.
+
+  ------------------------------------------------------------
+
+  ID           : kh_ipv4_default_source_route
+  Severity     : MEDIUM
+  Title        : ipv4/conf/default/accept_source_route=1: source routing accepted
+
+  WHAT IT IS
+    Kernel parameter: net.ipv4.conf.default.accept_source_route. Current 
+    value: 1. Recommended: 0. The host honours IP source routing options 
+    in packet headers, allowing senders to specify the exact route their 
+    packets take through the network.
+
+  IMPACT
+    Source routing bypasses network-level access controls and firewalls 
+    by specifying a path that avoids filtering devices. An attacker can 
+    route packets through intermediaries that would normally be 
+    unreachable, enabling access to services protected by network 
+    topology.
+
+  EXPLOITABILITY
+    Low standalone. Primarily a pivot and evasion technique in 
+    post-exploitation.
+
+  RECOMMENDATION
+    Set net.ipv4.conf.all.accept_source_route=0 in /etc/sysctl.d/.
+
+  ------------------------------------------------------------
+
+  ID           : kh_mod_bluetooth
+  Severity     : MEDIUM
+  Title        : Dangerous kernel module loaded: bluetooth
+
+  WHAT IT IS
+    Kernel module 'bluetooth' is currently loaded (visible in 
+    /proc/modules). Reason: Bluetooth subsystem — large attack surface 
+    (BlueFrag, BIAS, KNOB class attacks); almost never legitimate in 
+    server/container workloads. Associated CVE(s): none.
+
+  IMPACT
+    Module-specific attack surface is active and exploitable. See the 
+    reason field above. For modules with active ITW CVEs (algif_aead, 
+    esp4, esp6, rxrpc), the host is exposed to current in-the-wild 
+    exploits providing local privilege escalation and container escape.
+
+  EXPLOITABILITY
+    Module is already loaded — no auto-load trigger needed. Exploit 
+    primitives (sockets, syscalls) are immediately accessible. Attack 
+    complexity depends on the specific module — see reasons above.
+
+  RECOMMENDATION
+    Blacklist: 'install bluetooth /bin/false; install btusb /bin/false'. 
+    Server workloads have no legitimate use for Bluetooth.
+
+  ------------------------------------------------------------
+============================================================
+ INFO FINDINGS
+============================================================
+
+  ID           : kernel_version
+  Severity     : INFO
+  Title        : Kernel version: 6.17.0-29-generic
+
+  WHAT IT IS
+    The host kernel version is 6.17.0-29-generic. Detailed CVE version 
+    checks are performed by the config-driven CVE engine (see CVE check 
+    section below).
+
+  IMPACT
+    Outdated kernels may be vulnerable to container escape CVEs 
+    exploitable by unprivileged users inside containers.
+
+  EXPLOITABILITY
+    uname -r is available to any user. Version information is sufficient 
+    to identify applicable CVEs.
+
+  RECOMMENDATION
+    Keep the host kernel patched. Use a container-optimised OS with 
+    automated security updates. See CVE check findings for specific 
+    vulnerabilities.
+
+  ------------------------------------------------------------
+
+  ID           : modules_loading_enabled
+  Severity     : INFO
+  Title        : Kernel module loading is enabled (modules_disabled=0)
+
+  WHAT IT IS
+    modules_disabled=0 means kernel modules can be loaded at runtime. 
+    Combined with CAP_SYS_MODULE, this permits loading arbitrary kernel 
+    code.
+
+  IMPACT
+    If CAP_SYS_MODULE is also present, a malicious .ko module can be 
+    loaded to establish persistence, spawn reverse shells, or disable 
+    audit logging.
+
+  EXPLOITABILITY
+    High if CAP_SYS_MODULE is present; informational otherwise.
+
+  RECOMMENDATION
+    Set kernel.modules_disabled=1 via sysctl after all necessary modules 
+    are loaded at boot.
+
+  ------------------------------------------------------------
+
+  ID           : cve_2025_31133_runc_masked
+  Severity     : INFO
+  Title        : runc masked path CVEs — version 1.3.5 appears patched
+
+  WHAT IT IS
+    runc 1.3.5 is present and appears to be >= 1.2.8/1.3.3 (patched). 
+    core_pattern writable: false.
+
+  IMPACT
+    N/A — runc version appears patched.
+
+  EXPLOITABILITY
+    N/A
+
+  RECOMMENDATION
+    Verify with 'runc --version'. Ensure containerd/Docker are also 
+    updated to use the patched runc.
+
+  ------------------------------------------------------------
+
+  ID           : kh_ipv4_forwarding_enabled
+  Severity     : INFO
+  Title        : net.ipv4.ip_forward=1 — IPv4 forwarding enabled on host
+
+  WHAT IT IS
+    The host kernel is configured to forward IPv4 packets between network 
+    interfaces (net.ipv4.ip_forward=1). This is required and expected on 
+    Kubernetes worker nodes for CNI overlay networking. However, the 
+    presence of IP forwarding means the node will route packets between 
+    container and host networks.
+
+  IMPACT
+    If a container has CAP_NET_ADMIN (see check 2) or access to the host 
+    network namespace, IP forwarding can be used to route traffic through 
+    the host node, bypassing NetworkPolicy controls and enabling 
+    man-in-the-middle positioning on the pod network. Even without extra 
+    capabilities, overly permissive CNI configuration combined with 
+    forwarding can allow containers to reach node-internal services.
+
+  EXPLOITABILITY
+    Low standalone. Meaningful when combined with CAP_NET_ADMIN or host 
+    network namespace access (see checks 2 and 3).
+
+  RECOMMENDATION
+    Verify CNI NetworkPolicy is enforced and that inter-pod traffic is 
+    filtered at the CNI level. Ensure iptables/nftables rules on the node 
+    restrict unexpected forwarding paths. This parameter should not be 
+    changed on Kubernetes nodes.
+
+  ------------------------------------------------------------
+
+  ID           : cve_cve_2026_31431_crypto_af_alg
+  Severity     : INFO
+  Title        : Copy Fail (CVE-2026-31431) — kernel 6.17.0-29-generic appears outside affected range
+
+  WHAT IT IS
+    CVE: CVE-2026-31431. Compound check: kernel version check passed (not 
+    in affected range or at/above fixed version). Module status: 
+    loaded=none, not-blacklisted=none. Socket accessible: true.
+
+  IMPACT
+    N/A — kernel version check passed.
+
+  EXPLOITABILITY
+    N/A
+
+  RECOMMENDATION
+    Verify with distribution advisory. Continue applying kernel updates.
+
+  ------------------------------------------------------------
+
+  ID           : cve_cve_2026_43284_net_xfrm_esp
+  Severity     : INFO
+  Title        : Dirty Frag ESP (CVE-2026-43284) — kernel 6.17.0-29-generic appears outside affected range
+
+  WHAT IT IS
+    CVE: CVE-2026-43284. Compound check: kernel version check passed (not 
+    in affected range or at/above fixed version). Module status: 
+    loaded=none, not-blacklisted=esp4 esp6. Socket accessible: true.
+
+  IMPACT
+    N/A — kernel version check passed.
+
+  EXPLOITABILITY
+    N/A
+
+  RECOMMENDATION
+    Verify with distribution advisory. Continue applying kernel updates.
+
+  ------------------------------------------------------------
+
+  ID           : cve_cve_2026_43500_net_rxrpc
+  Severity     : INFO
+  Title        : Dirty Frag RxRPC (CVE-2026-43500) — kernel 6.17.0-29-generic appears outside affected range
+
+  WHAT IT IS
+    CVE: CVE-2026-43500. Compound check: kernel version check passed (not 
+    in affected range or at/above fixed version). Module status: 
+    loaded=none, not-blacklisted=rxrpc. Socket accessible: true.
+
+  IMPACT
+    N/A — kernel version check passed.
+
+  EXPLOITABILITY
+    N/A
+
+  RECOMMENDATION
+    Verify with distribution advisory. Continue applying kernel updates.
+
+  ------------------------------------------------------------
+
+  ID           : cve_cve_2024_1086_net_netfilter_nf_tables
+  Severity     : INFO
+  Title        : Flipping Pages (CVE-2024-1086) — kernel 6.17.0-29-generic appears outside affected range
+
+  WHAT IT IS
+    CVE: CVE-2024-1086. Compound check: kernel version check passed (not 
+    in affected range or at/above fixed version). Module status: 
+    loaded=nf_tables, not-blacklisted=nf_tables. Socket accessible: false.
+
+  IMPACT
+    N/A — kernel version check passed.
+
+  EXPLOITABILITY
+    N/A
+
+  RECOMMENDATION
+    Verify with distribution advisory. Continue applying kernel updates.
+
+  ------------------------------------------------------------
+
+  ID           : cve_cve_2025_21756_net_vmw_vsock
+  Severity     : INFO
+  Title        : Attack of the Vsock (CVE-2025-21756) — kernel 6.17.0-29-generic appears outside affected range
+
+  WHAT IT IS
+    CVE: CVE-2025-21756. Compound check: kernel version check passed (not 
+    in affected range or at/above fixed version). Module status: 
+    loaded=none, not-blacklisted=vmw_vsock_vmci_transport vsock. Socket 
+    accessible: true.
+
+  IMPACT
+    N/A — kernel version check passed.
+
+  EXPLOITABILITY
+    N/A
+
+  RECOMMENDATION
+    Verify with distribution advisory. Continue applying kernel updates.
+
+  ------------------------------------------------------------
+
+  ID           : cve_cve_2025_38352_kernel_time_posix-cpu-timers
+  Severity     : INFO
+  Title        : Chronomaly (CVE-2025-38352) — kernel 6.17.0-29-generic appears patched
+
+  WHAT IT IS
+    CVE: CVE-2025-38352. Kernel 6.17.0-29-generic is at or above the 
+    fixed version for this series, or below the introduced version. 
+    fixed_versions: 5.15:5.15.190 6.1:6.1.144 6.6:6.6.97 6.12:6.12.34 
+    mainline:6.16.0.
+
+  IMPACT
+    N/A — kernel version check passed.
+
+  EXPLOITABILITY
+    N/A
+
+  RECOMMENDATION
+    Continue to apply kernel updates. Verify with your distribution's 
+    security advisory.
+
+  ------------------------------------------------------------
+
+  ID           : cve_cve_2025_38617_net_packet
+  Severity     : INFO
+  Title        : Packet Socket Race (CVE-2025-38617) — kernel 6.17.0-29-generic appears outside affected range
+
+  WHAT IT IS
+    CVE: CVE-2025-38617. Compound check: kernel version check passed (not 
+    in affected range or at/above fixed version). Module status: 
+    loaded=none, not-blacklisted=none. Socket accessible: true.
+
+  IMPACT
+    N/A — kernel version check passed.
+
+  EXPLOITABILITY
+    N/A
+
+  RECOMMENDATION
+    Verify with distribution advisory. Continue applying kernel updates.
+
+  ------------------------------------------------------------
+
+  ID           : cve_cve_2025_38352_fs_overlayfs
+  Severity     : INFO
+  Title        : OverlayFS SetUID Copy (CVE-2025-38352) — kernel 6.17.0-29-generic appears patched
+
+  WHAT IT IS
+    CVE: CVE-2025-38352. Kernel 6.17.0-29-generic is at or above the 
+    fixed version for this series, or below the introduced version. 
+    fixed_versions: 5.15:5.15.182 6.1:6.1.135 6.6:6.6.89 6.12:6.12.26 
+    mainline:6.16-rc2.
+
+  IMPACT
+    N/A — kernel version check passed.
+
+  EXPLOITABILITY
+    N/A
+
+  RECOMMENDATION
+    Continue to apply kernel updates. Verify with your distribution's 
+    security advisory.
+
+  ------------------------------------------------------------
+
+  ID           : cve_cve_2022_0847_fs_pipe
+  Severity     : INFO
+  Title        : DirtyPipe (CVE-2022-0847) — kernel 6.17.0-29-generic appears patched
+
+  WHAT IT IS
+    CVE: CVE-2022-0847. Kernel 6.17.0-29-generic is at or above the fixed 
+    version for this series, or below the introduced version. 
+    fixed_versions: 5.15:5.15.25 5.16:5.16.11 5.10:5.10.102.
+
+  IMPACT
+    N/A — kernel version check passed.
+
+  EXPLOITABILITY
+    N/A
+
+  RECOMMENDATION
+    Continue to apply kernel updates. Verify with your distribution's 
+    security advisory.
+
+  ------------------------------------------------------------
+
+  ID           : cve_cve_2016_5195_mm_gup
+  Severity     : INFO
+  Title        : DirtyCOW (CVE-2016-5195) — kernel 6.17.0-29-generic appears patched
+
+  WHAT IT IS
+    CVE: CVE-2016-5195. Kernel 6.17.0-29-generic is at or above the fixed 
+    version for this series, or below the introduced version. 
+    fixed_versions: 4.8:4.8.3 4.7:4.7.9 4.4:4.4.26.
+
+  IMPACT
+    N/A — kernel version check passed.
+
+  EXPLOITABILITY
+    N/A
+
+  RECOMMENDATION
+    Continue to apply kernel updates. Verify with your distribution's 
+    security advisory.
+
+  ------------------------------------------------------------
+
+END OF REPORT
+This report was generated for authorised security assessment purposes only.

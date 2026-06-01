@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
 # container_escape_audit.sh  —  v4.0
-# Liam Romanis
+# Copyright (c) 2026 Liam Romanis
+#
+# Licence: Creative Commons Attribution-NonCommercial 4.0 International
+#          (CC BY-NC 4.0)
+#          https://creativecommons.org/licenses/by-nc/4.0/
+# SPDX-License-Identifier: CC-BY-NC-4.0
+#
+# You are free to use, share, and adapt this tool for non-commercial purposes,
+# provided you give appropriate credit and indicate any changes made.
+# Commercial use requires explicit written permission from the author.
 #
 # Detects potential container escape vectors from within a running container.
 # Intended for AUTHORISED security assessments only.
