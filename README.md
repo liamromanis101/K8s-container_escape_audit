@@ -107,16 +107,19 @@ These checks read sysctl values from `/proc/sys` and compare them against the re
 | 43 | `net.ipv4.ip_forward` / IPv6 forwarding | informational | Expected on K8s nodes |
 | 44 | `kernel.unprivileged_userns_clone` | 0 | User namespace prerequisite for most container escape CVEs |
 | 45 | `kernel.perf_event_paranoid` | ≥ 2 | Spectre-class side-channel attacks |
-| 46 | esp4 / esp6 / rxrpc modules | not loaded / blacklisted | Dirty Frag (CVE-2026-43284/43500) |
+| 46 | esp4 / esp6 / rxrpc modules | not loaded / blacklisted | Dirty Frag (CVE-2026-43284/43500), Fragnesia (CVE-2026-46300) |
 | 47 | Dangerous loaded modules audit | — | 14 modules checked incl. algif_aead, nf_tables, dccp, sctp, bluetooth |
 
 ### Config-driven CVE checks
 
-CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with ten entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
+CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with thirteen entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
 
 | CVE | Name | CVSS | ITW | CISA KEV |
 |-----|------|------|-----|----------|
 | CVE-2026-31431 | Copy Fail | 7.8 | ✓ | ✓ |
+| CVE-2026-46333 | Ptrace Credential Hijack | 7.8 | ✓ | |
+| CVE-2026-23111 | nf_tables Anonymous Set UAF | 7.8 | | |
+| CVE-2026-46300 | Fragnesia ESP | 7.8 | | |
 | CVE-2026-43284 | Dirty Frag ESP | 8.8 | ✓ | |
 | CVE-2026-43500 | Dirty Frag RxRPC | 7.8 | ✓ | |
 | CVE-2024-1086 | Flipping Pages | 7.8 | ✓ | ✓ |
@@ -126,6 +129,8 @@ CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The
 | CVE-2025-38352 | OverlayFS SetUID Copy | 7.8 | ✓ | ✓ |
 | CVE-2022-0847 | DirtyPipe | 7.8 | | |
 | CVE-2016-5195 | DirtyCOW | 7.8 | ✓ | ✓ |
+
+> The three newest entries (CVE-2026-46333, CVE-2026-23111, CVE-2026-46300) ship with their `fixed_versions` left to be confirmed per distribution — verify against your distro's security tracker before relying on a "patched" verdict, since backports vary by vendor. Their ITW / CISA KEV flags should likewise be confirmed against the current KEV catalog and NVD.
 
 ## Usage
 
@@ -213,7 +218,7 @@ By default the job runs with whatever the cluster's default security context is.
 
 ## Lab setup for testing
 
-This sets up a deliberately misconfigured Docker container that exercises most of the 35 checks. Use an isolated VM only -- not on a production host or anything with sensitive data on it.
+This sets up a deliberately misconfigured Docker container that exercises most of the checks. Use an isolated VM only -- not on a production host or anything with sensitive data on it.
 
 ### Prerequisites
 
@@ -340,7 +345,7 @@ Checks that won't fire here (require real infrastructure): Check 15 (cloud IMDS)
 
 ```
 ========================================================
-  container_escape_audit.sh v3.0
+  container_escape_audit.sh v4.0
   Container escape vector detection
   FOR AUTHORISED SECURITY ASSESSMENTS ONLY
 ========================================================
@@ -369,7 +374,7 @@ Checks that won't fire here (require real infrastructure): Check 15 (cloud IMDS)
 ```json
 {
   "tool": "container_escape_audit",
-  "version": "3.0",
+  "version": "4.0",
   "timestamp": "2026-05-01T10:32:00Z",
   "host": "cea-target",
   "kernel": "6.5.0-21-generic",
@@ -417,6 +422,8 @@ A single CRITICAL finding is generally enough for a complete host compromise. Mu
 Checks 1-23 cover the established container escape primitives: Docker socket escape, privileged container mount, cgroup v1 release_agent, core_pattern pipe handler, Shocker / CAP_DAC_READ_SEARCH, CAP_SYS_ADMIN namespace re-entry, kernel module loading, DirtyPipe (CVE-2022-0847), DirtyCOW (CVE-2016-5195), Kubernetes service account abuse, kubelet unauthenticated exec, cloud IMDS credential theft, host namespace escape via nsenter, ld.so.preload injection, and /dev/mem access.
 
 Checks 24-35 add coverage for more recent and less commonly checked vectors: Copy Fail (CVE-2026-31431) AF_ALG page cache write, NVIDIAScape (CVE-2025-23266) OCI hook LD_PRELOAD injection, runc masked path race (CVE-2025-31133/-52565/-52881), root-in-container UID mapping, eBPF kernel memory inspection, debugfs/tracefs ftrace exposure, Kubernetes RBAC active probing, additional runtime sockets (Podman, BuildKit, Kata), kernel keyring extraction, OCI hook directory injection, splice/pipe2 syscall surface, and procfs namespace fd leakage.
+
+The config-driven CVE engine additionally covers the most recent kernel privilege-escalation and container-escape issues, including ptrace credential hijack (CVE-2026-46333), nf_tables anonymous-set use-after-free (CVE-2026-23111), and Fragnesia ESP (CVE-2026-46300). See the [Recent CVEs](#recent-cves) detail section below.
 
 ## Exploitation reference
 
@@ -741,6 +748,38 @@ Remediation:
 - Enable user namespaces for containers (host root not mapped)
 - AppArmor and SELinux provide limited protection due to CVE-2025-52881's LSM bypass
 
+#### CVE-2026-46333 -- Ptrace Credential Hijack (HIGH)
+
+Disclosed May 2026 by Qualys TRU. A logic flaw in the kernel's `__ptrace_may_access()` leaves a privileged process that is dropping its credentials briefly reachable through ptrace-family operations. Paired with `pidfd_getfd()`, an unprivileged local user can capture open file descriptors and authenticated IPC channels from a dying setuid process and reuse them under their own UID — disclosing files like `/etc/shadow` and SSH host keys, or executing commands as root. The vulnerable code dates to v4.10 (2016), but the public exploit path depends on `pidfd_getfd()` (added in v5.6, 2020), so 5.6 is the realistic exploitable floor. Working exploits are public.
+
+The engine performs a `kernel_version` check against the 5.6+ range. On shared or multi-tenant container hosts, any unprivileged foothold becomes a path to host root.
+
+Remediation:
+- Apply the distribution kernel update
+- Interim: set `kernel.yama.ptrace_scope=2` (blocks the public `pidfd_getfd` path)
+- Rotate SSH host keys and review credentials handled by setuid processes if untrusted local users had access during the exposure window
+
+#### CVE-2026-23111 -- nf_tables anonymous set UAF (HIGH)
+
+Patched upstream February 2026; technical details and a working PoC published June 2026 by Exodus Intelligence. A use-after-free in the `nf_tables` subsystem, triggered through the kernel's handling of anonymous sets in rule definitions. Writing to freed kernel memory leads to type confusion or control-flow hijack, giving an unprivileged local user root. In containerised scenarios this translates directly to container escape, compromising the host kernel and co-located tenants.
+
+The engine runs a `compound` check (kernel version plus `nf_tables` module presence — the module is already audited by check 47). Exploitation typically requires the ability to interact with `nf_tables` via `nft` or syscalls, usually needing unprivileged user namespaces.
+
+Remediation:
+- Apply the distribution kernel update (fix upstream since 5 Feb 2026)
+- Interim: restrict unprivileged user namespaces with `user.max_user_namespaces=0`
+- Ensure non-admin users cannot interact with `nft`
+
+#### CVE-2026-46300 -- Fragnesia (HIGH)
+
+Disclosed May 2026. A local privilege escalation in the kernel's ESP (Encapsulating Security Protocol) modules used for IPsec — the same `esp4`/`esp6` modules affected by one of the Dirty Frag vulnerabilities. In container deployments that may run arbitrary third-party workloads it may additionally facilitate container escape, though no container-escape PoC was published at disclosure.
+
+The engine runs a `compound` check leveraging the existing `esp4`/`esp6` module audit (check 46). Because it shares modules with Dirty Frag, a host already mitigated for Dirty Frag is covered.
+
+Remediation:
+- Apply the distribution kernel update
+- The Dirty Frag mitigation (disabling/blacklisting the `esp4` and `esp6` modules) also protects against this issue where those modules aren't required
+
 </details>
 
 <details>
@@ -895,6 +934,8 @@ This script is point-in-time. For continuous runtime detection, pair it with Fal
 - `AF_ALG` socket creation from non-root processes (Copy Fail indicator)
 - `LD_PRELOAD` set to paths in `/tmp` or `/dev/shm` (NVIDIAScape indicator)
 - Symlink creation over `/dev/null` or `/dev/pts/*` (runc CVE-2025-31133 indicator)
+- `nft` execution or `nf_tables` interaction by non-root users (CVE-2026-23111 indicator)
+- `pidfd_getfd` use against setuid processes by non-root users (CVE-2026-46333 indicator)
 
 ### CI/CD
 
@@ -1004,6 +1045,9 @@ Sponsorship does not grant exclusivity or any change to the open licence for non
 - [Kubernetes Pod Security Admission](https://kubernetes.io/docs/concepts/security/pod-security-admission/)
 - [CIS Kubernetes Benchmark](https://www.cisecurity.org/benchmark/kubernetes)
 - [CVE-2026-31431 Copy Fail](https://en.wikipedia.org/wiki/Copy_Fail)
+- [CVE-2026-46333 Ptrace credential hijack (Qualys TRU)](https://blog.qualys.com/vulnerabilities-threat-research/2026/05/20/cve-2026-46333-local-root-privilege-escalation-and-credential-disclosure-in-the-linux-kernel-ptrace-path)
+- [CVE-2026-23111 nf_tables UAF](https://securityarsenal.com/blog/cve-2026-23111-linux-kernel-nftables-privilege-escalation-detection-and-hardening)
+- [CVE-2026-46300 Fragnesia](https://ubuntu.com/blog/fragnesia-linux-vulnerability-fixes-available)
 - [CVE-2026-43284 / CVE-2026-43500 Dirty Frag](https://www.openwall.com/lists/oss-security/2026/05/)
 - [CVE-2024-1086 Flipping Pages](https://github.com/Notselwyn/CVE-2024-1086)
 - [CVE-2025-23266 NVIDIAScape](https://www.wiz.io/blog/nvidia-ai-vulnerability-cve-2025-23266-nvidiascape)
