@@ -1,3 +1,5 @@
+![Logo](k8s_logo.png)
+
 # K8s_container-escape-audit
 
 A bash script that runs inside a Docker or Kubernetes container and checks for escape vectors. Built for penetration testers and security teams doing container security assessments.
@@ -6,7 +8,7 @@ A bash script that runs inside a Docker or Kubernetes container and checks for e
 
 ## What it does
 
-`container_escape_audit.sh` v4.0 performs **47 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture, and an updateable database of recent kernel CVEs. All checks are strictly read-only — the script makes no changes to the system.
+`container_escape_audit.sh` v4.0 performs **51 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture, container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64), and an updateable database of recent kernel and runtime CVEs. All checks are strictly read-only — the script makes no changes to the system.
 
 Each finding comes with a structured report entry:
 
@@ -23,6 +25,18 @@ cve_checks.conf             # CVE database (update this independently of the scr
 ```
 
 One note on running as root: checks 1, 2, and 27 (privileged mode, dangerous capabilities, UID 0 mapping) will always produce findings when you run the script as root inside the container. That's expected and correct. Running as root without user namespace remapping is itself a meaningful finding, not a false positive.
+
+## Latest updates (2026-06)
+
+Coverage expanded following the CVE monitor's gap analysis:
+
+- **Four new read-only probes (checks 48-51):** io_uring reachability, kTLS/sockmap ULP attach surface, Kata Containers agent-socket exposure, and arm64 KVM/vGIC-ITS guest-to-host exposure.
+- **Eight new CVE database entries**, including the first public KVM/arm64 guest-to-host escape (CVE-2026-46316 "ITScape", CVSS 9.3), the io_uring zcrx out-of-bounds write (CVE-2026-43121), and the ksmbd remote kernel use-after-free (CVE-2022-47939).
+- **New `check_type=manual`** in the CVE engine, letting the database track container-runtime and userspace CVEs (Kata, containerd, Podman, runc, cgroup release_agent) that do not reduce to a kernel version or module test.
+- **`ksmbd` added** to the dangerous-modules audit (check 47); **AppArmor enforcement-artifact inspection** added to check 11.
+
+Entries whose `fixed_versions` / `introduced` are marked `VERIFY` in `cve_checks.conf` need confirmation against your distribution's security tracker before being relied upon for patch decisions. ITScape is arm64-only.
+
 
 ## Checks
 
@@ -108,11 +122,24 @@ These checks read sysctl values from `/proc/sys` and compare them against the re
 | 44 | `kernel.unprivileged_userns_clone` | 0 | User namespace prerequisite for most container escape CVEs |
 | 45 | `kernel.perf_event_paranoid` | ≥ 2 | Spectre-class side-channel attacks |
 | 46 | esp4 / esp6 / rxrpc modules | not loaded / blacklisted | Dirty Frag (CVE-2026-43284/43500), Fragnesia (CVE-2026-46300) |
-| 47 | Dangerous loaded modules audit | — | 14 modules checked incl. algif_aead, nf_tables, dccp, sctp, bluetooth |
+| 47 | Dangerous loaded modules audit | — | 15 modules checked incl. algif_aead, ksmbd, nf_tables, dccp, sctp, bluetooth |
+
+### Runtime escape-surface probes (new checks 48-51)
+
+Read-only reachability probes for container-escape and LPE attack surfaces flagged by the CVE monitor's gap analysis. Each tests whether a subsystem is reachable from the current context (syscall, socket, or socket-file presence) without attempting to trigger any vulnerability. They complement the version/module/socket detection done by the CVE engine.
+
+| # | Check | Severity | Related CVE(s) |
+|---|---|---|---|
+| 48 | io_uring reachability (`io_uring_setup(2)` + `io_uring_disabled` state) | HIGH | CVE-2026-43121 (zcrx OOB) and the io_uring LPE class |
+| 49 | kTLS / sockmap ULP attachable (`setsockopt(TCP_ULP, "tls")`) | MEDIUM | kTLS/sockmap "Reverse Order" UAF, `tls_sk_proto_close()` UAF (no CVE yet) |
+| 50 | Kata Containers agent socket / shared dir exposure | HIGH/MEDIUM | CVE-2026-41326 (CopyFile symlink subversion) |
+| 51 | KVM/arm64 vGIC-ITS guest-to-host exposure (arch-aware) | HIGH/INFO | CVE-2026-46316 (ITScape) |
+
+> Check 51 is architecture-aware: on x86_64 it reports "not applicable"; on arm64 it distinguishes a KVM host (`/dev/kvm` present) from a guest vantage point (GICv3/ITS present, no `/dev/kvm`) and adjusts severity accordingly.
 
 ### Config-driven CVE checks
 
-CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with thirteen entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
+CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with twenty-one entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
 
 | CVE | Name | CVSS | ITW | CISA KEV |
 |-----|------|------|-----|----------|
@@ -129,8 +156,18 @@ CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The
 | CVE-2025-38352 | OverlayFS SetUID Copy | 7.8 | ✓ | ✓ |
 | CVE-2022-0847 | DirtyPipe | 7.8 | | |
 | CVE-2016-5195 | DirtyCOW | 7.8 | ✓ | ✓ |
+| CVE-2026-46316 | ITScape (KVM/arm64 guest-to-host escape) | 9.3 | | |
+| CVE-2026-43121 | io_uring zcrx Freelist OOB | 7.0 | | |
+| CVE-2022-47939 | ksmbd Tree-Disconnect UAF | 9.8 | | |
+| CVE-2026-41326 | Kata CopyFile Symlink Subversion | 8.2 | | |
+| CVE-2026-46680 | containerd runAsNonRoot Bypass | 7.3 | | |
+| CVE-2026-55686 | Podman WORKDIR Symlink Host Write | 5.3 | | |
+| CVE-2026-41579 | runc /dev Symlink Limited Host Write | 3.3 | | |
+| CVE-2022-0492 | cgroup release_agent Escape | 7.0 | ✓ | ✓ |
 
-> The three newest entries (CVE-2026-46333, CVE-2026-23111, CVE-2026-46300) ship with their `fixed_versions` left to be confirmed per distribution — verify against your distro's security tracker before relying on a "patched" verdict, since backports vary by vendor. Their ITW / CISA KEV flags should likewise be confirmed against the current KEV catalog and NVD.
+> **Kernel CVEs** (CVE-2026-46316, CVE-2026-43121, CVE-2022-47939) use the standard `kernel_version` / `compound` check types. **Runtime / userspace CVEs** (CVE-2026-41326 Kata, CVE-2026-46680 containerd, CVE-2026-55686 Podman, CVE-2026-41579 runc, CVE-2022-0492 cgroup) use the new `check_type=manual` — they do not reduce to a kernel version or module test, so the engine emits a tracking finding for inventory while the live detection is done by a dedicated script check (see checks 12, 26, 47, 50, 51). The package fix is recorded in the `component_fixed` field.
+
+> Several entries ship with `fixed_versions` (and in some cases `introduced`) marked `VERIFY` — including the three earlier additions (CVE-2026-46333, CVE-2026-23111, CVE-2026-46300) and the newest kernel CVEs (CVE-2026-46316, CVE-2026-43121). Confirm these against your distribution's security tracker before relying on a "patched" verdict, since backports vary by vendor. ITW / CISA KEV flags should likewise be confirmed against the current KEV catalog and NVD. ITScape (CVE-2026-46316) is **arm64-only**; its `arch=arm64` key means the engine reports it as N/A on non-arm64 hosts (see [Architecture-specific CVEs](#architecture-specific-cves)), and check 51 provides an architecture-aware behavioural probe.
 
 ## Usage
 
@@ -398,7 +435,7 @@ Checks that won't fire here (require real infrastructure): Check 15 (cloud IMDS)
 |---|---|---|
 | `bash` | Yes | Script execution |
 | `grep`, `awk`, `find`, `cat` | Yes | Core checks |
-| `python3` | Optional | Copy Fail (24), eBPF (28), splice (34) |
+| `python3` | Optional | Copy Fail (24), eBPF (28), splice (34), io_uring (48), kTLS ULP (49) |
 | `curl` | Optional | IMDS and kubelet API checks |
 | `kubectl` | Optional | Kubernetes RBAC enumeration |
 | `capsh` | Optional | Human-readable capability decoding |
@@ -423,7 +460,9 @@ Checks 1-23 cover the established container escape primitives: Docker socket esc
 
 Checks 24-35 add coverage for more recent and less commonly checked vectors: Copy Fail (CVE-2026-31431) AF_ALG page cache write, NVIDIAScape (CVE-2025-23266) OCI hook LD_PRELOAD injection, runc masked path race (CVE-2025-31133/-52565/-52881), root-in-container UID mapping, eBPF kernel memory inspection, debugfs/tracefs ftrace exposure, Kubernetes RBAC active probing, additional runtime sockets (Podman, BuildKit, Kata), kernel keyring extraction, OCI hook directory injection, splice/pipe2 syscall surface, and procfs namespace fd leakage.
 
-The config-driven CVE engine additionally covers the most recent kernel privilege-escalation and container-escape issues, including ptrace credential hijack (CVE-2026-46333), nf_tables anonymous-set use-after-free (CVE-2026-23111), and Fragnesia ESP (CVE-2026-46300). See the [Recent CVEs](#recent-cves) detail section below.
+Checks 48-51 extend coverage to recently disclosed container-escape and LPE attack surfaces: io_uring reachability (CVE-2026-43121 zcrx out-of-bounds write and the broader io_uring LPE class), kTLS/sockmap ULP attach surface (the "Reverse Order" and `tls_sk_proto_close()` use-after-free reports), Kata Containers agent-socket exposure (CVE-2026-41326 CopyFile symlink subversion), and arm64 KVM/vGIC-ITS guest-to-host exposure (CVE-2026-46316 ITScape — the first public KVM/arm64 escape).
+
+The config-driven CVE engine additionally covers the most recent kernel privilege-escalation and container-escape issues, including ptrace credential hijack (CVE-2026-46333), nf_tables anonymous-set use-after-free (CVE-2026-23111), Fragnesia ESP (CVE-2026-46300), ITScape KVM/arm64 escape (CVE-2026-46316), the io_uring zcrx OOB write (CVE-2026-43121), the ksmbd remote kernel UAF (CVE-2022-47939), and a set of container-runtime CVEs tracked as advisory entries (Kata CVE-2026-41326, containerd CVE-2026-46680, Podman CVE-2026-55686, runc CVE-2026-41579, and the classic cgroup release_agent escape CVE-2022-0492 / CISA KEV). See the [Recent CVEs](#recent-cves) detail section below.
 
 ## Exploitation reference
 
@@ -936,6 +975,10 @@ This script is point-in-time. For continuous runtime detection, pair it with Fal
 - Symlink creation over `/dev/null` or `/dev/pts/*` (runc CVE-2025-31133 indicator)
 - `nft` execution or `nf_tables` interaction by non-root users (CVE-2026-23111 indicator)
 - `pidfd_getfd` use against setuid processes by non-root users (CVE-2026-46333 indicator)
+- `io_uring_setup` / `io_uring_enter` from unprivileged container processes (CVE-2026-43121 / io_uring LPE indicator)
+- `setsockopt(TCP_ULP, "tls")` from workload processes (kTLS/sockmap UAF surface)
+- Access to the kata-agent socket or writes into `/run/kata-containers/shared/*` (CVE-2026-41326 indicator)
+- On arm64 KVM hosts: unexpected guest-driven activity around the vGIC-ITS / `/dev/kvm` (CVE-2026-46316 ITScape indicator)
 
 ### CI/CD
 
@@ -993,6 +1036,8 @@ rec=How to fix it...
 
 To disable an entry without removing it, prefix its `cve_id` line with `#`.
 
+**Every entry must include both `rec` and `mitigation`.** The `rec` field is the full remediation (usually "patch to version X"); the `mitigation` field is an interim compensating control that reduces risk before patching (for example a `modprobe` blacklist, a sysctl, or a seccomp rule). Both are surfaced together in each active finding's recommendation, so an operator always sees a fix *and* a stop-gap. If no interim control exists, set `mitigation=none` — the finding will then state "Interim mitigation: none available — patching/upgrading is the only remediation." A missing (rather than `none`) `mitigation` or `rec` field triggers an `[INFO]` warning at load time so the gap is visible. Inline `# comments` are stripped from machine-parsed fields (versions, enums, socket params, `arch`) but preserved verbatim in prose fields (`what`, `impact`, `exploit`, `rec`, `mitigation`, `notes`), so keep prose-field annotations inside the sentence rather than as trailing comments.
+
 ### Check types
 
 | Type | What it does |
@@ -1001,6 +1046,17 @@ To disable an entry without removing it, prefix its `cve_id` line with `#`.
 | `module_loaded` | Checks `/proc/modules` for the listed `module_names` |
 | `socket_family` | Attempts to open a socket with the given `socket_af` / `socket_type` / `socket_proto` |
 | `compound` | Runs all three and synthesises a combined severity |
+| `manual` | Advisory/tracking entry for runtime or userspace CVEs that do not reduce to a kernel test. Emits a finding at the configured `severity` for inventory; live detection is handled by a dedicated script check named in the entry's `rec`/`notes`. Optional `component` / `component_affected` / `component_fixed` keys document the affected package version. |
+
+### Architecture-specific CVEs
+
+Some CVEs only affect one CPU architecture — for example **ITScape (CVE-2026-46316)** is arm64-only. Add an `arch=` key to gate the entry:
+
+```ini
+arch=arm64    # or x86_64, etc.  Aliases (aarch64/arm64, amd64/x86_64) are normalised.
+```
+
+When `arch=` is present and does not match `uname -m`, the engine reports the CVE as **N/A (INFO)** on that host instead of running the version/module/socket test — preventing a false positive on kernel version alone. Entries without an `arch=` key (or with `arch=any`) are tested on every architecture, as before. The companion script check 51 performs a complementary architecture-aware probe that further distinguishes an arm64 KVM *host* from a *guest* vantage point.
 
 ### Keeping the database current
 
@@ -1052,6 +1108,12 @@ Sponsorship does not grant exclusivity or any change to the open licence for non
 - [CVE-2024-1086 Flipping Pages](https://github.com/Notselwyn/CVE-2024-1086)
 - [CVE-2025-23266 NVIDIAScape](https://www.wiz.io/blog/nvidia-ai-vulnerability-cve-2025-23266-nvidiascape)
 - [CVE-2025-31133 runc masked path](https://www.cncf.io/blog/2025/11/28/runc-container-breakout-vulnerabilities-a-technical-overview/)
+- [CVE-2026-46316 ITScape — KVM/arm64 guest-to-host escape](https://seclists.org/oss-sec/2026/q2/877)
+- [CVE-2026-43121 io_uring zcrx freelist OOB](https://seclists.org/oss-sec/2026/q2/444)
+- [CVE-2022-47939 ksmbd UAF RCE (Wiz)](https://www.wiz.io/blog/cve-2022-47939-critical-vulnerability-linux-kernel-ksmbd-module-everything-you-ne)
+- [CVE-2026-41326 Kata CopyFile symlink subversion](https://github.com/kata-containers/kata-containers/security/advisories/GHSA-q49m-57vm-c8cc)
+- [CVE-2026-46680 containerd runAsNonRoot bypass](https://github.com/containerd/containerd/security/advisories/GHSA-fqw6-gf59-qr4w)
+- [CVE-2026-41579 runc /dev symlink](https://github.com/opencontainers/runc/security/advisories/GHSA-xjvp-4fhw-gc47)
 - [CVE-2022-0847 DirtyPipe](https://dirtypipe.cm4all.com/)
 - [CVE-2019-5736 runc escape](https://blog.dragonsector.pl/2019/02/cve-2019-5736-escape-from-docker-and.html)
 - [Felix Wilhelm's cgroup release_agent PoC](https://twitter.com/_fel1x/status/1151487051986087936)

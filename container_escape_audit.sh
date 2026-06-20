@@ -637,6 +637,43 @@ check_security_profiles() {
       ok "AppArmor profile applied: $aa_label"
     fi
   fi
+
+  # --- AppArmor enforcement-artifact inspection -----------------------------
+  # The gap analysis flagged "Multiple vulnerabilities in AppArmor" (oss-security
+  # 2026-05-20) as an EXTEND of the LSM status check: knowing AppArmor is
+  # "applied" is not the same as knowing the userspace stack (parser, profiles
+  # directory) is present and enforcing. Inspect the observable artifacts so a
+  # profile that is loaded-but-stale, or a missing parser, is visible.
+  local aa_enabled_file="/sys/module/apparmor/parameters/enabled"
+  local aa_present=false aa_enforcing="unknown"
+  if [[ -r "$aa_enabled_file" ]]; then
+    aa_present=true
+    case "$(cat "$aa_enabled_file" 2>/dev/null)" in
+      Y|1) aa_enforcing="enabled" ;;
+      N|0) aa_enforcing="disabled" ;;
+      *)   aa_enforcing="unknown" ;;
+    esac
+  fi
+
+  local aa_profiles_count="unknown"
+  if [[ -r /sys/kernel/security/apparmor/profiles ]]; then
+    aa_profiles_count=$(wc -l < /sys/kernel/security/apparmor/profiles 2>/dev/null || echo "unknown")
+  fi
+
+  local aa_parser="absent"
+  command -v apparmor_parser &>/dev/null && aa_parser="present"
+
+  if [[ "$aa_present" == true && "$aa_enforcing" == "disabled" ]]; then
+    warn "AppArmor LSM present but globally disabled (${aa_enabled_file}=N)"
+    add_finding "apparmor_lsm_disabled" "MEDIUM" \
+      "AppArmor LSM is present in the kernel but globally disabled" \
+      "The AppArmor LSM is compiled into this kernel but is disabled (${aa_enabled_file} reports disabled). Loaded profiles: ${aa_profiles_count}. apparmor_parser binary: ${aa_parser}. Per-container confinement labels are therefore not enforced regardless of any per-pod appArmorProfile setting." \
+      "With the LSM globally disabled, AppArmor-based mitigations for other findings in this report (for example, the cifs.upcall confinement that mitigates CIFSwitch, or the default Docker profile blocking /proc/sys writes) are NOT in effect. Recent AppArmor advisories (multiple vulnerabilities reported on oss-security, 2026-05) further underline that AppArmor cannot be relied upon as a sole control when its stack is incomplete." \
+      "Low as a standalone item; HIGH as a force-multiplier because it removes a defence-in-depth layer assumed by other mitigations." \
+      "Re-enable AppArmor at the host (kernel parameter apparmor=1 security=apparmor) and ensure apparmor_parser and the profile set are installed and loaded. Verify profiles are in enforce (not complain) mode. Keep the AppArmor userspace updated to pick up fixes for the 2026-05 advisory set."
+  elif [[ "$aa_present" == true ]]; then
+    info "AppArmor LSM enabled=${aa_enforcing}; loaded profiles=${aa_profiles_count}; parser=${aa_parser}"
+  fi
 }
 
 check_cgroup_release_agent() {
@@ -1194,7 +1231,12 @@ check_additional_runtime_sockets() {
   done
 
   local inherited_socks
-  inherited_socks=$(ls -la /proc/self/fd 2>/dev/null | grep "socket:" | wc -l || echo "0")
+  inherited_socks=$(ls -la /proc/self/fd 2>/dev/null | grep -c "socket:")
+  # Sanitise to a bare integer: grep -c always prints a single number, but guard
+  # against empty output (no /proc/self/fd) and any stray whitespace so the
+  # arithmetic test below cannot receive a malformed token.
+  inherited_socks="${inherited_socks//[!0-9]/}"
+  [[ -z "$inherited_socks" ]] && inherited_socks=0
   (( inherited_socks > 10 )) && info "Unusually high number of open socket file descriptors: $inherited_socks"
 
   [[ "$found" == false ]] && ok "No additional runtime sockets found"
@@ -1208,9 +1250,11 @@ check_kernel_keyring() {
   local cap_sys_admin=$(( (cap_dec >> 21) & 1 ))
   local keyctl_available=false; command -v keyctl &>/dev/null && keyctl_available=true
   local key_count=0
-  [[ "$keyctl_available" == true ]] && key_count=$(keyctl list @s 2>/dev/null | grep -c "key:" || echo "0")
+  [[ "$keyctl_available" == true ]] && key_count=$(keyctl list @s 2>/dev/null | grep -c "key:")
+  key_count="${key_count//[!0-9]/}"; [[ -z "$key_count" ]] && key_count=0
   local proc_keys_count=0
-  [[ -r /proc/keys ]] && proc_keys_count=$(wc -l < /proc/keys 2>/dev/null || echo "0")
+  [[ -r /proc/keys ]] && proc_keys_count=$(wc -l < /proc/keys 2>/dev/null)
+  proc_keys_count="${proc_keys_count//[!0-9]/}"; [[ -z "$proc_keys_count" ]] && proc_keys_count=0
   local dm_crypt_keys=false
   grep -q "logon\|user\|encrypted\|fscrypt" /proc/keys 2>/dev/null && dm_crypt_keys=true
 
@@ -1248,7 +1292,8 @@ check_oci_hooks() {
     [[ -w "$d" ]] && writable=true
 
     if [[ "$accessible" == true ]]; then
-      local hook_count; hook_count=$(find "$d" -name "*.json" 2>/dev/null | wc -l || echo "0")
+      local hook_count; hook_count=$(find "$d" -name "*.json" 2>/dev/null | wc -l)
+      hook_count="${hook_count//[!0-9]/}"; [[ -z "$hook_count" ]] && hook_count=0
       local sev="MEDIUM" access_desc="readable"
       [[ "$writable" == true ]] && sev="CRITICAL" && access_desc="WRITABLE"
       warn "OCI hooks directory $access_desc: $d ($hook_count hook files)"
@@ -1931,6 +1976,10 @@ check_kh_dangerous_modules() {
   MOD_SEV[cifs]="MEDIUM"; MOD_CVE[cifs]="CVE-2022-0168,CVE-2023-38432"
   MOD_REC[cifs]="Blacklist if SMB mounts are not required: 'install cifs /bin/false'."
 
+  MOD_REASON[ksmbd]="In-kernel SMB3 server (ksmbd, since 5.15) — unauthenticated remote kernel RCE history (CVE-2022-47939 SMB2_TREE_DISCONNECT UAF, ZDI 10.0); large in-kernel network attack surface on port 445; almost never legitimate in container workloads. Prefer userspace Samba."
+  MOD_SEV[ksmbd]="HIGH"; MOD_CVE[ksmbd]="CVE-2022-47939"
+  MOD_REC[ksmbd]="Unload and blacklist unless an in-kernel SMB server is genuinely required: 'rmmod ksmbd 2>/dev/null; echo install ksmbd /bin/false > /etc/modprobe.d/ksmbd.conf'. Patch kernel to >= 5.15.61 / 5.19.2 for CVE-2022-47939. Restrict TCP/445 exposure."
+
   MOD_REASON[nfs]="NFS client — attack surface for server-side-confusion attacks; compromised NFS server can exploit NFS client bugs in the kernel"
   MOD_SEV[nfs]="MEDIUM"; MOD_CVE[nfs]=""
   MOD_REC[nfs]="Blacklist if NFS is not used: 'install nfs /bin/false'."
@@ -2009,6 +2058,261 @@ check_kh_dangerous_modules() {
     done
   done
 }
+
+# ===========================================================================
+# CHECK FUNCTIONS  —  Checks 48-51 (gap-analysis behavioural probes, 2026-06)
+#
+# These checks were added to close coverage gaps identified by
+# cve_monitor.py --gap-analysis. Each is a READ-ONLY / non-destructive probe:
+# it tests reachability of a subsystem (syscall/socket/socket-file presence)
+# without attempting to trigger any vulnerability. They complement the
+# config-driven CVE engine, which handles version/module/socket detection.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Check 48 — io_uring exposure (CVE-2026-43121 zcrx OOB and io_uring CVE class)
+# Read-only reachability probe: is io_uring_setup(2) callable from here, and
+# is io_uring administratively restricted (kernel.io_uring_disabled)? Does NOT
+# create rings beyond a minimal setup that is immediately closed, and never
+# touches zcrx. io_uring is a recurring LPE/escape attack surface; many
+# hardened container profiles disable it entirely.
+# ---------------------------------------------------------------------------
+check_io_uring_exposure() {
+  hdr "48. io_uring exposure (CVE-2026-43121 zcrx and io_uring LPE class)"
+
+  # Administrative restriction state (Linux >= 6.6 exposes this sysctl)
+  local disabled_val="unset"
+  if [[ -r /proc/sys/kernel/io_uring_disabled ]]; then
+    disabled_val=$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo "unset")
+  fi
+
+  # Reachability: try io_uring_setup(2). entries=1, params struct zeroed.
+  # Return code convention from the probe:
+  #   0 = ring created (io_uring reachable) — closed immediately
+  #   1 = blocked (EPERM/EACCES/ENOSYS/EOPNOTSUPP) — not reachable
+  #   2 = python3 unavailable (cannot test)
+  local reach="unknown"
+  if command -v python3 &>/dev/null; then
+    if python3 -c "
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+# struct io_uring_params is 120 bytes on current kernels; zeroed is fine for probe.
+buf = ctypes.create_string_buffer(120)
+NR = 425  # __NR_io_uring_setup on x86_64/arm64 (common value)
+fd = libc.syscall(NR, 1, ctypes.byref(buf))
+err = ctypes.get_errno()
+if fd >= 0:
+    os.close(fd)
+    sys.exit(0)         # reachable
+# EPERM(1) EACCES(13) ENOSYS(38) EOPNOTSUPP(95) -> not reachable / disabled
+sys.exit(1)
+" 2>/dev/null; then
+      reach="reachable"
+    else
+      local rc=$?
+      [[ $rc -eq 2 ]] && reach="untestable" || reach="blocked"
+    fi
+  else
+    reach="untestable (no python3)"
+  fi
+
+  if [[ "$reach" == "reachable" ]]; then
+    local sev="HIGH"
+    # If admin has set io_uring_disabled to a restrictive value but the ring
+    # still opened, that is itself noteworthy; otherwise standard HIGH.
+    warn "io_uring is reachable from this container (io_uring_disabled=${disabled_val})"
+    add_finding "io_uring_exposure" "$sev" \
+      "io_uring is reachable from this container (attack surface for CVE-2026-43121 and the io_uring LPE class)" \
+      "io_uring_setup(2) succeeded from within this context, so the io_uring interface is reachable by unprivileged code here. kernel.io_uring_disabled=${disabled_val} (0=enabled for all, 1=disabled for unprivileged, 2=disabled for all; 'unset' means the sysctl is absent on this kernel). io_uring has a long history of kernel LPE and container-escape primitives; the most recent in this database is CVE-2026-43121 (zcrx freelist out-of-bounds write, fixed in stable 6.18.16)." \
+      "io_uring reachability is a prerequisite for io_uring-based exploits. On an unpatched kernel, a reachable io_uring (and, for CVE-2026-43121 specifically, reachable zcrx zero-copy receive on an SMP host) can be leveraged for out-of-bounds kernel writes and privilege escalation. Even patched, io_uring substantially enlarges the unprivileged-reachable kernel attack surface." \
+      "Reachability only — this probe does NOT attempt exploitation and does not confirm an unpatched kernel. Combine with the CVE engine's kernel-version result for CVE-2026-43121 to assess actual exploitability." \
+      "1) If workloads do not require io_uring, disable it for unprivileged tasks: set kernel.io_uring_disabled=2 (all) or =1 (unprivileged) via /etc/sysctl.d/. 2) Alternatively block io_uring_setup(2), io_uring_enter(2), and io_uring_register(2) in the container seccomp profile (the RuntimeDefault profile blocks io_uring on recent runtimes). 3) Patch the kernel to >= 6.18.16 (or your distro backport) for CVE-2026-43121. 4) Disable zero-copy receive (zcrx) reachability where not needed."
+  elif [[ "$reach" == "blocked" ]]; then
+    ok "io_uring not reachable (blocked by seccomp/sysctl; io_uring_disabled=${disabled_val})"
+  else
+    info "io_uring reachability ${reach} (io_uring_disabled=${disabled_val})"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 49 — kTLS / sockmap ULP exposure
+# Gap analysis: KTLS+sockmap "Reverse Order" UAF and tls_sk_proto_close() ULP
+# UAF (oss-security 2026-05/06). Read-only probe: can we attach the "tls" ULP
+# to a TCP socket here (setsockopt(TCP_ULP,"tls"))? The kTLS ULP code path is
+# the precondition for these UAF classes. The probe attaches the ULP to a
+# freshly created, never-connected socket and closes it immediately; it does
+# NOT drive the close-ordering race.
+# ---------------------------------------------------------------------------
+check_ktls_ulp_exposure() {
+  hdr "49. kTLS / sockmap ULP exposure (TLS ULP use-after-free class)"
+
+  local reach="unknown"
+  if command -v python3 &>/dev/null; then
+    # 0 = TLS ULP attachable (reachable); 1 = not available/blocked; 2 = untestable
+    if python3 -c "
+import socket, sys
+TCP_ULP = 31
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+except Exception:
+    sys.exit(1)
+try:
+    # Attaching the 'tls' ULP loads/engages the kTLS ULP code path.
+    s.setsockopt(socket.IPPROTO_TCP, TCP_ULP, b'tls')
+    s.close()
+    sys.exit(0)            # ULP attached -> reachable
+except OSError as e:
+    import errno as E
+    s.close()
+    # ENOENT(2)/EOPNOTSUPP(95): tls ULP not built/loadable -> not reachable
+    # EPERM(1)/EACCES(13): permission denied but path exists -> reachable surface
+    # ENOSYS(38): setsockopt path blocked
+    if getattr(e, 'errno', None) in (1, 13):
+        sys.exit(0)
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+      reach="reachable"
+    else
+      local rc=$?
+      [[ $rc -eq 2 ]] && reach="untestable" || reach="blocked"
+    fi
+  else
+    reach="untestable (no python3)"
+  fi
+
+  # Supplementary signal: is the tls module loaded already?
+  local tls_loaded="no"
+  grep -q '^tls ' /proc/modules 2>/dev/null && tls_loaded="yes"
+
+  if [[ "$reach" == "reachable" ]]; then
+    warn "kTLS ULP is attachable from this container (tls module loaded=${tls_loaded})"
+    add_finding "ktls_ulp_exposure" "MEDIUM" \
+      "kTLS / sockmap ULP (\"tls\") is attachable to sockets from this container" \
+      "setsockopt(TCP_ULP, \"tls\") succeeded (or returned a permission error indicating the path exists), so the kernel TLS upper-layer-protocol code is reachable from this context. tls module currently loaded: ${tls_loaded}. The kTLS/sockmap ULP machinery is the precondition for the recently reported use-after-free classes: the KTLS+sockmap 'Reverse Order' UAF/data-corruption issue and the tls_sk_proto_close() ULP UAF (oss-security, 2026-05/06), neither of which had a CVE assigned at the time of the gap analysis." \
+      "kTLS ULP reachability is the attack surface for these socket-close-ordering use-after-free bugs, which can lead to kernel memory corruption and potential local privilege escalation. This probe confirms reachability only, not the presence of an unpatched bug." \
+      "Reachability only — no exploitation attempted and no kernel version assertion made. Track the upstream fixes for the kTLS/sockmap UAF reports and re-assess once CVEs and fixed versions are published." \
+      "1) If workloads do not use in-kernel TLS offload, block the ULP attach path: deny setsockopt(TCP_ULP) for 'tls'/'espintcp' via seccomp/LSM, or blacklist the 'tls' module ('install tls /bin/false') where it is not auto-required. 2) Keep the kernel current and watch for the kTLS/sockmap UAF fixes. 3) Restrict unprivileged user-namespace creation (check 44), which is commonly the route to reaching these socket primitives."
+  elif [[ "$reach" == "blocked" ]]; then
+    ok "kTLS ULP not attachable (blocked or tls ULP unavailable; tls module loaded=${tls_loaded})"
+  else
+    info "kTLS ULP reachability ${reach} (tls module loaded=${tls_loaded})"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 50 — Kata Containers agent socket exposure (CVE-2026-41326)
+# Gap analysis: Kata CopyFile policy subversion via symlinks. The behavioural
+# signal reachable from inside a workload is the presence/accessibility of the
+# kata-agent communication socket and the shared-directory mount the CopyFile
+# symlink trick abuses. READ-ONLY: stat/listing only; nothing is written.
+# ---------------------------------------------------------------------------
+check_kata_agent_socket() {
+  hdr "50. Kata Containers agent socket exposure (CVE-2026-41326 CopyFile)"
+
+  local found=false
+
+  # Known kata-agent / shared-dir artifacts. We only stat/list (read-only).
+  local agent_sockets=(
+    /run/kata-containers/agent.sock
+    /run/vc/sbs/*/console.sock
+    /run/kata/containers/agent.sock
+  )
+  local shared_dirs=(
+    /run/kata-containers/shared/containers
+    /run/kata-containers/shared
+  )
+
+  local sock
+  for sock in "${agent_sockets[@]}"; do
+    # Expand globs; skip if no match
+    [[ -e "$sock" ]] || continue
+    found=true
+    warn "Kata agent-related socket present: $sock"
+    add_finding "kata_agent_socket_${sock//\//_}" "HIGH" \
+      "Kata Containers agent socket reachable: $sock" \
+      "A kata-agent / Kata runtime socket is present and visible from this context ($sock). The kata-agent CopyFile API (CVE-2026-41326, Kata 3.4.0–3.28.0) validates only the destination path of a write and ignores file type/payload, allowing a host-side actor with access to the agent socket to create a symlink in an allowed directory and then write through it to overwrite an arbitrary guest file." \
+      "If the agent is pre-3.29.0, an untrusted host (the threat model for Confidential VMs) can subvert guest image integrity — overwriting guest binaries, injecting code, or exfiltrating data — defeating the CVM isolation guarantee. Visibility of the agent socket from a workload context is itself an isolation concern." \
+      "Detection is artifact-presence based; this probe does not exercise CopyFile or write anything. Confirm the Kata version to determine whether CVE-2026-41326 applies (fixed in 3.29.0)." \
+      "1) Upgrade Kata Containers to >= 3.29.0. 2) Ensure the kata-agent ttrpc/gRPC socket is reachable only by the trusted shim, never by workload code. 3) Apply a kata-agent policy that validates symlink targets and rejects CopyFile writes whose resolved path escapes the permitted directory. 4) Treat any pre-3.29.0 agent as integrity-compromised in CVM deployments."
+  done
+
+  local d
+  for d in "${shared_dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    local writable="read-only"
+    [[ -w "$d" ]] && writable="WRITABLE"
+    found=true
+    local sev="MEDIUM"
+    [[ "$writable" == "WRITABLE" ]] && sev="HIGH"
+    warn "Kata shared directory present ($writable): $d"
+    add_finding "kata_shared_dir_${d//\//_}" "$sev" \
+      "Kata Containers shared directory present ($writable): $d" \
+      "The Kata shared-containers directory ($d, $writable) is the location the CVE-2026-41326 CopyFile symlink subversion abuses: an attacker creates a symlink here (an 'allowed' path) that points outside the directory, then writes through it. Its presence/writability from this context is the observable precondition." \
+      "On a vulnerable kata-agent (3.4.0–3.28.0), a writable shared directory enables the symlink-then-write primitive to overwrite arbitrary guest files. Even read-only visibility indicates Kata shared-fs plumbing is exposed to this context." \
+      "Artifact presence/writability only; no write performed by this probe." \
+      "Upgrade Kata to >= 3.29.0; restrict access to the shared directory and the agent socket; enforce a symlink-target-validating agent policy."
+  done
+
+  [[ "$found" == false ]] && ok "No Kata Containers agent socket or shared directory detected"
+}
+
+# ---------------------------------------------------------------------------
+# Check 51 — KVM/arm64 vGIC-ITS guest-to-host exposure (CVE-2026-46316 ITScape)
+# Gap analysis: first public KVM/arm64 guest-to-host escape. The meaningful
+# signal differs by vantage point:
+#   - On the HOST: is this an arm64 KVM host (/dev/kvm present, arch aarch64)?
+#   - In a GUEST: are we an arm64 VM with a vGIC-ITS interrupt controller
+#     (the exploitable in-kernel emulation) present?
+# READ-ONLY: arch detection + presence of /dev/kvm, /proc/device-tree, and
+# GICv3/ITS sysfs/devicetree nodes. No KVM ioctls are issued.
+# ---------------------------------------------------------------------------
+check_kvm_arm64_vgic_its() {
+  hdr "51. KVM/arm64 vGIC-ITS guest-to-host exposure (CVE-2026-46316 ITScape)"
+
+  local arch
+  arch=$(uname -m 2>/dev/null || echo "unknown")
+
+  if [[ "$arch" != "aarch64" && "$arch" != "arm64" ]]; then
+    ok "Host architecture is ${arch} — CVE-2026-46316 (arm64-only) not applicable"
+    return
+  fi
+
+  # We are on arm64. Distinguish host-KVM vs guest vantage points.
+  local kvm_dev=false
+  [[ -e /dev/kvm ]] && kvm_dev=true
+
+  # GICv3 ITS presence signals (devicetree or sysfs). Read-only listing.
+  local its_dt=false its_irqchip=false
+  if compgen -G "/proc/device-tree/*/*its*" >/dev/null 2>&1 || \
+     compgen -G "/sys/firmware/devicetree/base/*/*its*" >/dev/null 2>&1; then
+    its_dt=true
+  fi
+  if grep -qi 'its\|gic' /sys/kernel/irq/*/* 2>/dev/null; then
+    its_irqchip=true
+  fi
+
+  if [[ "$kvm_dev" == true ]]; then
+    warn "arm64 KVM host indicators present (/dev/kvm accessible)"
+    add_finding "kvm_arm64_itscape_host" "HIGH" \
+      "arm64 KVM host — exposed to CVE-2026-46316 (ITScape) if running untrusted guests" \
+      "This is an arm64 (${arch}) system with /dev/kvm accessible from this context, indicating an arm64 KVM host (or a context with KVM access). CVE-2026-46316 (ITScape) is a use-after-free in the arm64 KVM vGIC-ITS emulation (vgic_its_invalidate_cache double-put) that lets a malicious GUEST escape to the HOST with kernel privileges. GICv3/ITS devicetree node seen: ${its_dt}; ITS/GIC irq sysfs signal: ${its_irqchip}." \
+      "On an unpatched arm64 KVM host running untrusted guests (e.g. multi-tenant arm64 cloud, or VM-isolated container runtimes such as Kata on arm64), a compromised guest can corrupt host kernel memory and execute code at host kernel privilege — a full guest-to-host escape. /dev/kvm being reachable from a container context is itself a serious exposure." \
+      "This probe detects platform exposure (arm64 + KVM), not an unpatched kernel; combine with the CVE engine's kernel-version result for CVE-2026-46316. Public PoC exists; exploitation needs guest EL1 (root), normally held by a tenant in their own VM." \
+      "1) Patch the host kernel to include mainline commit 13031fb6b835 (and CVE-2026-46317 / follow-ups); on Rocky/RLC use the patched 9.6/9/10 kernels. 2) There is no drop-in software mitigation — until patched, restrict arm64 KVM hosts to trusted guests/tenants. 3) Do NOT expose /dev/kvm to application containers; remove the device mount. 4) Prioritise multi-tenant arm64 virtualization hosts for patching."
+  elif [[ "$its_dt" == true || "$its_irqchip" == true ]]; then
+    info "arm64 guest with GICv3/ITS interrupt controller present (ITScape guest-side relevance)"
+    add_finding "kvm_arm64_itscape_guest" "INFO" \
+      "arm64 guest with vGIC-ITS present — ITScape (CVE-2026-46316) is a host-kernel bug reachable from arm64 guests" \
+      "This arm64 (${arch}) context exposes a GICv3/ITS interrupt controller (devicetree node: ${its_dt}; irq sysfs: ${its_irqchip}) but /dev/kvm is not accessible here, consistent with running inside an arm64 guest. CVE-2026-46316 (ITScape) is exploited FROM an arm64 guest against the host KVM vGIC-ITS emulation." \
+      "If this guest runs on an unpatched arm64 KVM host, the vGIC-ITS UAF could be used to escape to the host. The exposure is a property of the underlying host kernel, which cannot be confirmed from inside the guest." \
+      "Informational from the guest vantage point — the fix must be applied on the host." \
+      "Confirm with the infrastructure/cloud provider that the arm64 KVM host kernel includes the ITScape fix (mainline commit 13031fb6b835). Avoid running sensitive workloads on unpatched multi-tenant arm64 hosts."
+  else
+    ok "arm64 system without KVM-host or vGIC-ITS indicators detected for CVE-2026-46316"
+  fi
+}
 # =============================================================================
 # cve_check_engine.sh  —  Config-driven CVE check engine
 # Drop-in addition to container_escape_audit.sh
@@ -2069,9 +2373,25 @@ _load_cve_block() {
   # CVE_BLOCK is a newline-separated string of key=value lines
   local block="$1"
   CVE_FIELD=()
+  # Fields that are machine-parsed (numbers, versions, enums, lists). For these
+  # we strip an inline "  # comment" and surrounding whitespace so authors can
+  # annotate them in the config, e.g.  fixed_versions=6.18.16  # backport TBD.
+  # Prose fields (what/impact/exploit/rec/notes/name/alias/mitigation) are left
+  # byte-for-byte intact, since they legitimately contain '#' characters.
+  local _machine_fields=" cve_id cvss severity check_type introduced fixed_versions itw poc_public cisa_kev subsystem module_names socket_af socket_type socket_proto arch component component_affected component_fixed kallsyms_sym "
+  local key rest
   while IFS='=' read -r key rest; do
     [[ -z "$key" || "$key" == \#* ]] && continue
     key="${key// /}"
+    if [[ "$_machine_fields" == *" $key "* ]]; then
+      # Strip a trailing inline comment introduced by whitespace + '#'
+      if [[ "$rest" == *[[:space:]]#* ]]; then
+        rest="${rest%%[[:space:]]#*}"
+      fi
+      # Trim leading/trailing whitespace
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      rest="${rest%"${rest##*[![:space:]]}"}"
+    fi
     CVE_FIELD["$key"]="$rest"
   done <<< "$block"
 }
@@ -2327,11 +2647,26 @@ _emit_cve_finding() {
 
   local full_what="${what_prefix}${CVE_FIELD[what]:-No description available.}"
 
+  # Build the recommendation: full remediation (rec) plus the interim/compensating
+  # control (mitigation), so every CVE finding consistently surfaces a mitigating
+  # factor. If mitigation is absent or "none", say so explicitly rather than
+  # silently omitting it — an operator should never be left wondering whether an
+  # interim control exists.
+  local rec_text="${CVE_FIELD[rec]:-No remediation guidance available.}"
+  local mit_raw="${CVE_FIELD[mitigation]:-}"
+  local mit_text
+  case "${mit_raw,,}" in
+    ""|"none"|"n/a"|"no"|"-")
+      mit_text="Interim mitigation: none available — patching/upgrading is the only remediation." ;;
+    *)
+      mit_text="Interim mitigation (compensating control until patched): ${mit_raw}" ;;
+  esac
+
   add_finding "cve_${id_safe}" "$sev" "$title" \
     "$full_what" \
     "${CVE_FIELD[impact]:-No impact description available.}" \
     "${CVE_FIELD[exploit]:-No exploitability assessment available.}" \
-    "${CVE_FIELD[rec]:-No remediation guidance available.}"
+    "${rec_text} ${mit_text}"
 }
 
 # ---------------------------------------------------------------------------
@@ -2343,6 +2678,19 @@ _run_single_cve_check() {
   local cve="${CVE_FIELD[cve_id]:-UNKNOWN}"
   local name="${CVE_FIELD[name]:-$cve}"
   local check_type="${CVE_FIELD[check_type]:-kernel_version}"
+
+  # --- Config completeness check -------------------------------------------
+  # Every CVE entry must carry both a remediation (rec) and a mitigating-factor
+  # (mitigation) field so that findings always present a fix AND an interim
+  # control. Warn (once per entry) if either is absent, so gaps surface at run
+  # time rather than silently degrading to a generic fallback. 'mitigation=none'
+  # is valid (means no compensating control exists) — only a missing field warns.
+  if [[ -z "${CVE_FIELD[rec]+x}" ]]; then
+    info "${cve} (${name}): config entry has no 'rec' (remediation) field — finding will use a generic fallback"
+  fi
+  if [[ -z "${CVE_FIELD[mitigation]+x}" ]]; then
+    info "${cve} (${name}): config entry has no 'mitigation' field — add one (use 'mitigation=none' if no interim control exists)"
+  fi
   # Build a unique, stable finding ID for this CVE (subsystem slug prevents
   # collisions when two entries share a CVE number, e.g. CVE-2025-38352)
   local _sub_slug
@@ -2352,6 +2700,40 @@ _run_single_cve_check() {
   [[ -n "$_sub_slug" ]] && _cve_id_slug="${_cve_id_slug}_${_sub_slug}"
   local kver
   kver=$(uname -r 2>/dev/null || echo "unknown")
+
+  # --- Architecture gate ----------------------------------------------------
+  # Some CVEs only affect a specific CPU architecture (e.g. CVE-2026-46316
+  # ITScape is arm64-only). If the entry declares arch= and it does not match
+  # the running machine, the kernel-version/module/socket tests would otherwise
+  # produce a false positive purely on version. Short-circuit to an INFO finding
+  # so the CVE still appears in inventory but is correctly marked N/A here.
+  local _entry_arch="${CVE_FIELD[arch]:-any}"
+  if [[ "$_entry_arch" != "any" && "$_entry_arch" != "all" && -n "$_entry_arch" ]]; then
+    local _mach _arch_norm _entry_norm
+    _mach=$(uname -m 2>/dev/null || echo "unknown")
+    # Normalise common aliases to a canonical token
+    case "$_mach" in
+      aarch64|arm64)            _arch_norm="arm64" ;;
+      x86_64|amd64)             _arch_norm="x86_64" ;;
+      i386|i486|i586|i686)      _arch_norm="x86" ;;
+      *)                        _arch_norm="$_mach" ;;
+    esac
+    case "$_entry_arch" in
+      aarch64|arm64)            _entry_norm="arm64" ;;
+      x86_64|amd64)             _entry_norm="x86_64" ;;
+      i386|i486|i586|i686|x86)  _entry_norm="x86" ;;
+      *)                        _entry_norm="$_entry_arch" ;;
+    esac
+    if [[ "$_arch_norm" != "$_entry_norm" ]]; then
+      ok "${cve} (${name}): not applicable on this architecture (requires ${_entry_arch}; running ${_mach})"
+      add_finding "cve_${_cve_id_slug}" "INFO" \
+        "${name} (${cve}) — not applicable on ${_mach} (requires ${_entry_arch})" \
+        "CVE: ${cve}. This vulnerability affects the ${_entry_arch} architecture only. The host reports ${_mach} (uname -m), so the kernel-version/module/socket test is not applicable and was skipped to avoid a false positive on kernel version alone." \
+        "N/A — wrong architecture." "N/A" \
+        "No action required on this architecture. If you also operate ${_entry_arch} hosts, run the audit there and apply the vendor patch: ${CVE_FIELD[rec]:-see advisory}."
+      return
+    fi
+  fi
 
   case "$check_type" in
 
@@ -2477,6 +2859,24 @@ _run_single_cve_check() {
           "N/A — kernel version check passed." "N/A" \
           "Verify with distribution advisory. Continue applying kernel updates."
       fi
+      ;;
+
+    # -----------------------------------------------------------------------
+    manual)
+      # Advisory/tracking entry for CVEs that do NOT reduce to a kernel
+      # version, module, or socket test (e.g. container-runtime / userspace
+      # CVEs). The actual behavioural detection, if any, lives in a dedicated
+      # script check (named in the entry's rec/notes). Here we simply emit a
+      # finding at the configured severity so the CVE id appears in the report
+      # for inventory/compliance, with detection guidance carried in rec.
+      local msev="${CVE_FIELD[severity]:-MEDIUM}"
+      local comp="${CVE_FIELD[component]:-}"
+      local comp_fixed="${CVE_FIELD[component_fixed]:-}"
+      local ctx="manual/advisory tracking entry — no kernel version/module test applies"
+      [[ -n "$comp" ]] && ctx="${ctx}; affected component: ${comp}"
+      [[ -n "$comp_fixed" ]] && ctx="${ctx}; fixed in ${comp}: ${comp_fixed}"
+      warn "${cve} (${name}): advisory tracking entry (severity ${msev}) — verify via dedicated check / component version"
+      _emit_cve_finding "$ctx" "$msev"
       ;;
 
     *)
@@ -2643,6 +3043,16 @@ check_kh_ip_forwarding
 check_kh_userns
 check_kh_perf_event
 check_kh_dangerous_modules
+
+# ---------------------------------------------------------------------------
+# Checks 48-51: gap-analysis behavioural probes (2026-06)
+# Read-only reachability probes for subsystems flagged by cve_monitor.py
+# --gap-analysis. They complement the config-driven CVE engine below.
+# ---------------------------------------------------------------------------
+check_io_uring_exposure
+check_ktls_ulp_exposure
+check_kata_agent_socket
+check_kvm_arm64_vgic_its
 
 # ---------------------------------------------------------------------------
 # Config-driven CVE checks (reads cve_checks.conf)
