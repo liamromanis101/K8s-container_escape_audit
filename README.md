@@ -127,7 +127,7 @@ These checks read sysctl values from `/proc/sys` and compare them against the re
 | 44 | `kernel.unprivileged_userns_clone` | 0 | User namespace prerequisite for most container escape CVEs |
 | 45 | `kernel.perf_event_paranoid` | ≥ 2 | Spectre-class side-channel attacks |
 | 46 | esp4 / esp6 / rxrpc modules | not loaded / blacklisted | Dirty Frag (CVE-2026-43284/43500), Fragnesia (CVE-2026-46300) |
-| 47 | Dangerous loaded modules audit | — | 15 modules checked incl. algif_aead, ksmbd, nf_tables, dccp, sctp, bluetooth |
+| 47 | Dangerous loaded modules audit | — | 15 modules checked incl. algif_aead, ksmbd, rds, rds_tcp, nf_tables, dccp, sctp, bluetooth |
 
 ### Runtime escape-surface probes (new checks 48-51)
 
@@ -144,10 +144,11 @@ Read-only reachability probes for container-escape and LPE attack surfaces flagg
 
 ### Config-driven CVE checks
 
-CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with twenty-one entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
+CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with twenty-two entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
 
 | CVE | Name | CVSS | ITW | CISA KEV |
 |-----|------|------|-----|----------|
+| CVE-2026-43494 | PinTheft (RDS + io_uring page-cache overwrite) | 7.8 | | |
 | CVE-2026-31431 | Copy Fail | 7.8 | ✓ | ✓ |
 | CVE-2026-46333 | Ptrace Credential Hijack | 7.8 | ✓ | |
 | CVE-2026-23111 | nf_tables Anonymous Set UAF | 7.8 | | |
@@ -1202,3 +1203,4 @@ Sponsorship does not grant exclusivity or any change to the open licence for non
 - [deepce](https://github.com/stealthcopter/deepce)
 - [CDK](https://github.com/cdk-team/CDK)
 - [Trail of Bits — Understanding and Hardening Linux Containers](https://github.com/trailofbits/publications/blob/master/papers/understanding_hardening_linux_containers.pdf)
+- [CVE-2026-43494 PinTheft (V12 Security PoC)](https://github.com/v12-security/pocs/tree/main/pintheft)
