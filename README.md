@@ -8,7 +8,7 @@ A bash script that runs inside a Docker or Kubernetes container and checks for e
 
 ## What it does
 
-`container_escape_audit.sh` v4.0 performs **51 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture, container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64), and an updateable database of recent kernel and runtime CVEs. All checks are strictly read-only — the script makes no changes to the system.
+`container_escape_audit.sh` v4.3 performs **51 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture, container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64), and an updateable database of recent kernel and runtime CVEs. All checks are strictly read-only — the script makes no changes to the system.
 
 Each finding comes with a structured report entry:
 
@@ -26,6 +26,10 @@ cve_checks.conf             # CVE database (update this independently of the scr
 
 One note on running as root: checks 1, 2, and 27 (privileged mode, dangerous capabilities, UID 0 mapping) will always produce findings when you run the script as root inside the container. That's expected and correct. Running as root without user namespace remapping is itself a meaningful finding, not a false positive.
 
+## Releases and verification
+
+Releases are published on GitHub with **SLSA Build Level 3 provenance**. Each release carries a signed `multiple.intoto.jsonl` attestation covering both `container_escape_audit.sh` and `cve_checks.conf`, so you can cryptographically confirm that the files you're about to run as root were built by this repository's release workflow and have not been tampered with. See [Verifying the download](#verifying-the-download) below. Because this tool is intended to run with elevated privileges during assessments, verifying provenance before each use is strongly recommended.
+
 ## Latest updates (2026-06)
 
 Coverage expanded following the CVE monitor's gap analysis:
@@ -34,6 +38,7 @@ Coverage expanded following the CVE monitor's gap analysis:
 - **Eight new CVE database entries**, including the first public KVM/arm64 guest-to-host escape (CVE-2026-46316 "ITScape", CVSS 9.3), the io_uring zcrx out-of-bounds write (CVE-2026-43121), and the ksmbd remote kernel use-after-free (CVE-2022-47939).
 - **New `check_type=manual`** in the CVE engine, letting the database track container-runtime and userspace CVEs (Kata, containerd, Podman, runc, cgroup release_agent) that do not reduce to a kernel version or module test.
 - **`ksmbd` added** to the dangerous-modules audit (check 47); **AppArmor enforcement-artifact inspection** added to check 11.
+- **SLSA Build L3 provenance** now published with each release (signed `multiple.intoto.jsonl`), verifiable with `slsa-verifier`.
 
 Entries whose `fixed_versions` / `introduced` are marked `VERIFY` in `cve_checks.conf` need confirmation against your distribution's security tracker before being relied upon for patch decisions. ITScape is arm64-only.
 
@@ -171,6 +176,32 @@ CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The
 
 ## Usage
 
+The recommended way to obtain the tool is from a **verified GitHub release**, so you can confirm provenance before running anything with elevated privileges. A direct `curl` from `main` is also available for quick, throwaway lab use.
+
+### Option A — verified release (recommended)
+
+Requires the [GitHub CLI](https://cli.github.com/) (`gh`) and [`slsa-verifier`](#verifying-the-download).
+
+```bash
+# Download the released artifacts and their signed provenance
+gh release download --repo liamromanis101/K8s-container_escape_audit \
+  --pattern "container_escape_audit.sh" \
+  --pattern "cve_checks.conf" \
+  --pattern "multiple.intoto.jsonl"
+
+# Verify provenance (both files at once) before trusting them
+slsa-verifier verify-artifact container_escape_audit.sh cve_checks.conf \
+  --provenance-path multiple.intoto.jsonl \
+  --source-uri github.com/liamromanis101/K8s-container_escape_audit
+
+chmod +x container_escape_audit.sh
+./container_escape_audit.sh
+```
+
+A `PASSED: Verified SLSA provenance` line confirms the files are authentic before you run them.
+
+### Option B — direct download from `main` (quick lab use)
+
 ```bash
 curl -O https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/main/container_escape_audit.sh
 curl -O https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/main/cve_checks.conf
@@ -178,7 +209,36 @@ chmod +x container_escape_audit.sh
 ./container_escape_audit.sh
 ```
 
+> This route is convenient for disposable lab containers but provides **no provenance guarantee** — the files are not verified against a signed attestation. Prefer Option A for any real assessment.
+
 Both files must be in the same directory. The script looks for `cve_checks.conf` alongside itself by default.
+
+### Verifying the download
+
+Releases are published with SLSA Build Level 3 provenance: a signed in-toto attestation (`multiple.intoto.jsonl`) generated by the release workflow using GitHub's OIDC identity and Sigstore keyless signing. Verifying it confirms three things at once — the files came from this repository, they were produced by the expected workflow, and their contents match the recorded digests (no tampering in transit or at rest).
+
+Install `slsa-verifier` (current version v2.7.1) using whichever method suits you:
+
+```bash
+# Go (binary lands in $(go env GOPATH)/bin — ensure that's on your PATH)
+go install github.com/slsa-framework/slsa-verifier/v2/cli/slsa-verifier@v2.7.1
+
+# macOS (Homebrew, community-maintained formula)
+brew install slsa-verifier
+```
+
+You can also download a prebuilt binary from the [slsa-verifier releases](https://github.com/slsa-framework/slsa-verifier/releases) and check it against the published `SHA256SUM.md`.
+
+Then verify (optionally pin the expected tag with `--source-tag`):
+
+```bash
+slsa-verifier verify-artifact container_escape_audit.sh cve_checks.conf \
+  --provenance-path multiple.intoto.jsonl \
+  --source-uri github.com/liamromanis101/K8s-container_escape_audit \
+  --source-tag v4.3
+```
+
+The provenance file is named `multiple.intoto.jsonl` because each release attests to more than one artifact. Always verify the files **as downloaded from the release** — the verifier compares the exact bytes you pass against the signed digests, so a locally modified copy will (correctly) fail.
 
 ### Options
 
@@ -382,7 +442,7 @@ Checks that won't fire here (require real infrastructure): Check 15 (cloud IMDS)
 
 ```
 ========================================================
-  container_escape_audit.sh v4.0
+  container_escape_audit.sh v4.3
   Container escape vector detection
   FOR AUTHORISED SECURITY ASSESSMENTS ONLY
 ========================================================
@@ -411,7 +471,7 @@ Checks that won't fire here (require real infrastructure): Check 15 (cloud IMDS)
 ```json
 {
   "tool": "container_escape_audit",
-  "version": "4.0",
+  "version": "4.3",
   "timestamp": "2026-05-01T10:32:00Z",
   "host": "cea-target",
   "kernel": "6.5.0-21-generic",
@@ -442,6 +502,8 @@ Checks that won't fire here (require real infrastructure): Check 15 (cloud IMDS)
 | `ip` | Optional | Node IP detection for kubelet checks |
 | `keyctl` | Optional | Kernel keyring enumeration (32) |
 | `sestatus` | Optional | SELinux status |
+
+For verifying releases (Option A): `gh` (GitHub CLI) and `slsa-verifier`. Both are optional and only needed if you verify provenance, which is recommended for real assessments.
 
 ## Severity levels
 
@@ -1067,6 +1129,24 @@ Version `cve_checks.conf` separately from the script. When a distribution ships 
 curl -sO https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/main/cve_checks.conf
 ```
 
+## Releasing (maintainers)
+
+Releases are cut as Git tags matching `v*`, which triggers the SLSA provenance workflow. The workflow hashes both release artifacts, generates a signed `multiple.intoto.jsonl` attestation, and attaches it to the GitHub release.
+
+```bash
+# Cut a new release from main (creates the tag, the release, and fires provenance)
+gh release create vX.Y --target main --generate-notes
+
+# Watch the provenance workflow
+gh run watch
+
+# Confirm the signed provenance attached to the release
+gh api repos/liamromanis101/K8s-container_escape_audit/releases/tags/vX.Y \
+  --jq '.assets[].name'   # expect: multiple.intoto.jsonl
+```
+
+Two points worth remembering: the provenance generator is **tag-triggered**, so the workflow runs on the tag push (not on a plain "release created" event); and a Git tag freezes the workflow file as it existed at that commit, so always land workflow fixes on `main` before cutting the tag.
+
 ## Contributing
 
 When adding a new check function:
@@ -1100,6 +1180,8 @@ Sponsorship does not grant exclusivity or any change to the open licence for non
 - [GTFOBins](https://gtfobins.github.io/)
 - [Kubernetes Pod Security Admission](https://kubernetes.io/docs/concepts/security/pod-security-admission/)
 - [CIS Kubernetes Benchmark](https://www.cisecurity.org/benchmark/kubernetes)
+- [SLSA — Supply-chain Levels for Software Artifacts](https://slsa.dev/)
+- [slsa-verifier](https://github.com/slsa-framework/slsa-verifier)
 - [CVE-2026-31431 Copy Fail](https://en.wikipedia.org/wiki/Copy_Fail)
 - [CVE-2026-46333 Ptrace credential hijack (Qualys TRU)](https://blog.qualys.com/vulnerabilities-threat-research/2026/05/20/cve-2026-46333-local-root-privilege-escalation-and-credential-disclosure-in-the-linux-kernel-ptrace-path)
 - [CVE-2026-23111 nf_tables UAF](https://securityarsenal.com/blog/cve-2026-23111-linux-kernel-nftables-privilege-escalation-detection-and-hardening)
