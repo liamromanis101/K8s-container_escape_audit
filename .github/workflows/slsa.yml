@@ -16,7 +16,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     outputs:
-      digests: ${{ steps.hash.outputs.digests }}
+      hashes: ${{ steps.hash.outputs.hashes }}
 
     steps:
       - name: Checkout repository
@@ -29,7 +29,7 @@ jobs:
           # The two files that constitute a release of this tool.
           # Update this list if additional files are added to the release.
           files="container_escape_audit.sh cve_checks.conf"
-          echo "digests=$(sha256sum $files | base64 -w0)" >> "${GITHUB_OUTPUT}"
+          echo "hashes=$(sha256sum $files | base64 -w0)" >> "${GITHUB_OUTPUT}"
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -60,6 +60,6 @@ jobs:
       contents: write  # To upload the provenance file to the release.
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
     with:
-      base64-subjects: "${{ needs.build.outputs.digests }}"
+      base64-subjects: "${{ needs.build.outputs.hashes }}"
       upload-assets: true
       compile-generator: true
