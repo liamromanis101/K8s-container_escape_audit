@@ -59,7 +59,8 @@ jobs:
       id-token: write  # To sign the provenance via Sigstore/OIDC.
       contents: write  # To upload the provenance file to the release.
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
-    with:
+  with:
       base64-subjects: "${{ needs.build.outputs.hashes }}"
       upload-assets: true
+      upload-tag-name: ${{ github.event.release.tag_name }}
       compile-generator: true
