@@ -2447,8 +2447,15 @@ _kernel_in_affected_range() {
   fi
 
   # Parse fixed_versions: "series:version series:version ..."
-  # or "none" meaning no patch available yet
-  [[ "$fixed_str" == "none" ]] && return 0  # No fix exists — assume affected
+  # Sentinels / malformed values that carry no confirmed fixed version must
+  # flag conservatively (assume affected) rather than fall through to the
+  # version math below, where a non-numeric token would be coerced to 0 by
+  # _kver_to_int and wrongly clear the host. Handles:
+  #   none   — no patch available yet
+  #   VERIFY — fixed version not yet confirmed against the distro tracker
+  #   any value without a "series:version" pair (no ':') — malformed/sentinel
+  [[ "$fixed_str" == "none" || "$fixed_str" == "VERIFY" ]] && return 0
+  [[ "$fixed_str" != *:* ]] && return 0  # no usable series:version — assume affected
 
   local kmaj kmin
   IFS='.' read -r kmaj kmin _ <<< "$kver_clean"
@@ -2662,11 +2669,32 @@ _emit_cve_finding() {
       mit_text="Interim mitigation (compensating control until patched): ${mit_raw}" ;;
   esac
 
+  # Patch-status note. The fixed_versions field may carry a confirmed list of
+  # "series:version" pairs, or a sentinel meaning the fixed version is not yet
+  # established. In the sentinel cases the engine flags conservatively (assume
+  # affected), so the operator MUST be told the "patched" boundary is unknown —
+  # otherwise a VERIFY/none finding looks identical to one checked against a
+  # real fixed version, and they cannot tell whether their kernel is genuinely
+  # pre-fix or simply unverified. Keep this in _emit_cve_finding so it applies
+  # to every check type that produces a finding, not just kernel_version.
+  local fixed_raw="${CVE_FIELD[fixed_versions]:-none}"
+  local patch_note=""
+  case "$fixed_raw" in
+    none)
+      patch_note="Patch status: no fixed kernel version is recorded for this CVE (fixed_versions=none) — at disclosure no upstream fix was available, or this is a userspace/runtime CVE tracked separately. This finding cannot confirm a patched kernel; verify against your distribution's security advisory." ;;
+    VERIFY|verify)
+      patch_note="Patch status: the fixed kernel version is NOT yet confirmed in the CVE database (fixed_versions=VERIFY). This host is flagged conservatively as potentially affected; the engine cannot determine whether your kernel is patched. Confirm the fixed package version against your distribution's security tracker before treating this as resolved." ;;
+    *:*)
+      patch_note="Patch status: comparison was made against recorded fixed versions (${fixed_raw}). Distributions often backport fixes without changing the upstream version string, so confirm against your distribution's security advisory." ;;
+    *)
+      patch_note="Patch status: fixed_versions value '${fixed_raw}' is not a recognised series:version list; treated as unconfirmed and flagged conservatively. Confirm the fixed version against your distribution's security tracker." ;;
+  esac
+
   add_finding "cve_${id_safe}" "$sev" "$title" \
     "$full_what" \
     "${CVE_FIELD[impact]:-No impact description available.}" \
     "${CVE_FIELD[exploit]:-No exploitability assessment available.}" \
-    "${rec_text} ${mit_text}"
+    "${rec_text} ${mit_text} ${patch_note}"
 }
 
 # ---------------------------------------------------------------------------
@@ -2740,8 +2768,14 @@ _run_single_cve_check() {
     # -----------------------------------------------------------------------
     kernel_version)
       if _kernel_in_affected_range; then
-        warn "${cve} (${name}): kernel ${kver} appears in the affected version range"
-        _emit_cve_finding "kernel ${kver} in affected range (introduced: ${CVE_FIELD[introduced]:-unknown}, fixed_versions: ${CVE_FIELD[fixed_versions]:-none})"
+        local _fx="${CVE_FIELD[fixed_versions]:-none}"
+        local _fx_tag=""
+        case "$_fx" in
+          VERIFY|verify) _fx_tag=" [fixed version UNCONFIRMED — flagged conservatively]" ;;
+          none)          _fx_tag=" [no fixed version recorded]" ;;
+        esac
+        warn "${cve} (${name}): kernel ${kver} appears in the affected version range${_fx_tag}"
+        _emit_cve_finding "kernel ${kver} in affected range (introduced: ${CVE_FIELD[introduced]:-unknown}, fixed_versions: ${_fx})"
       else
         ok "${cve} (${name}): kernel ${kver} appears outside affected range"
         add_finding "cve_${_cve_id_slug}" "INFO" \
@@ -2832,21 +2866,27 @@ _run_single_cve_check() {
       # INFO:     kernel not in affected range
 
       if [[ "$kver_affected" == true ]]; then
+        local _cfx="${CVE_FIELD[fixed_versions]:-none}"
+        local _cfx_tag=""
+        case "$_cfx" in
+          VERIFY|verify) _cfx_tag=" [fixed version UNCONFIRMED]" ;;
+          none)          _cfx_tag=" [no fixed version recorded]" ;;
+        esac
         if [[ -n "$mod_loaded_list" || "$socket_accessible" == true ]]; then
           overall_sev="${CVE_FIELD[severity]:-CRITICAL}"
-          crit "${cve} (${name}): LIKELY VULNERABLE — kernel ${kver} in range; module(s) loaded / socket accessible"
+          crit "${cve} (${name}): LIKELY VULNERABLE — kernel ${kver} in range; module(s) loaded / socket accessible${_cfx_tag}"
           _emit_cve_finding \
             "kernel in affected range; loaded modules: ${mod_loaded_list:-none}; socket AF=${CVE_FIELD[socket_af]:-N/A} accessible: ${socket_accessible}; non-blacklisted: ${mod_not_blacklisted:-none}" \
             "$overall_sev"
         elif [[ -n "$mod_not_blacklisted" ]]; then
           overall_sev="HIGH"
-          warn "${cve} (${name}): kernel ${kver} in affected range; module(s) not loaded but NOT blacklisted (auto-load risk): ${mod_not_blacklisted}"
+          warn "${cve} (${name}): kernel ${kver} in affected range; module(s) not loaded but NOT blacklisted (auto-load risk): ${mod_not_blacklisted}${_cfx_tag}"
           _emit_cve_finding \
             "kernel in affected range; modules not currently loaded but not blacklisted — auto-load on socket creation is possible: ${mod_not_blacklisted}" \
             "HIGH"
         else
           overall_sev="MEDIUM"
-          warn "${cve} (${name}): kernel ${kver} in affected range; modules appear blacklisted or absent"
+          warn "${cve} (${name}): kernel ${kver} in affected range; modules appear blacklisted or absent${_cfx_tag}"
           _emit_cve_finding \
             "kernel in affected range; modules not loaded and appear blacklisted — interim mitigation may be in effect, but kernel patch is still required" \
             "MEDIUM"

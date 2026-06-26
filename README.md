@@ -144,7 +144,7 @@ Read-only reachability probes for container-escape and LPE attack surfaces flagg
 
 ### Config-driven CVE checks
 
-CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with twenty-two entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
+CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with twenty-three entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
 
 | CVE | Name | CVSS | ITW | CISA KEV |
 |-----|------|------|-----|----------|
