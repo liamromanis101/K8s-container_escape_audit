@@ -6,7 +6,7 @@
 <title>container_escape_audit — find the way out before someone else does</title>
 <meta name="description" content="A read-only bash audit that runs inside a Docker or Kubernetes container and reports every viable escape vector. Built for penetration testers and security teams.">
 <meta property="og:title" content="container_escape_audit">
-<meta property="og:description" content="Find the way out of a container before someone else does. 47 read-only checks plus a config-driven CVE engine.">
+<meta property="og:description" content="Find the way out of a container before someone else does. 51 read-only checks plus a config-driven CVE engine.">
 <meta property="og:type" content="website">
 <meta property="og:image" content="logo.png">
 <link rel="icon" type="image/png" href="favicon.png">
@@ -228,9 +228,10 @@
 
   /* ---- what-it-does cards ---- */
   .field-grid {
-    display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-top: 40px;
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 40px;
   }
-  @media (max-width: 720px){ .field-grid { grid-template-columns: 1fr; } }
+  @media (max-width: 900px){ .field-grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 600px){ .field-grid { grid-template-columns: 1fr; } }
   .field {
     border: 1px solid var(--line); border-radius: 10px; padding: 24px;
     background: var(--bg-card); transition: border-color .2s, transform .2s;
@@ -350,7 +351,7 @@
    <div class="hero-copy">
     <div class="eyebrow">read-only · docker &amp; kubernetes · v4.3</div>
     <h1>Find the way <span class="out">out</span> of a container before someone else does.</h1>
-    <p class="lede">A single bash script runs inside a Docker or Kubernetes container and reports every viable escape vector — <strong>47 checks plus a config-driven CVE engine</strong>. It makes no changes to the system. Built for penetration testers and security teams running real assessments.</p>
+    <p class="lede">A single bash script runs inside a Docker or Kubernetes container and reports every viable escape vector — <strong>51 checks plus a config-driven CVE engine</strong>. It makes no changes to the system. Built for penetration testers and security teams running real assessments.</p>
     <div class="hero-actions">
       <a class="btn-primary" href="#start">Run the audit →</a>
       <a class="btn-ghost" href="https://github.com/liamromanis101/K8s-container_escape_audit" target="_blank" rel="noopener">View source</a>
@@ -372,7 +373,7 @@
     </div>
 
     <div class="stats">
-      <div class="stat"><div class="num">47<span class="u">+</span></div><div class="lab">distinct checks</div></div>
+      <div class="stat"><div class="num">51</div><div class="lab">distinct checks</div></div>
       <div class="stat"><div class="num" id="cveCount">25</div><div class="lab">CVEs tracked</div></div>
       <div class="stat"><div class="num">0</div><div class="lab">writes to the system</div></div>
       <div class="stat"><div class="num">100<span class="u">%</span></div><div class="lab">pure bash</div></div>
@@ -383,8 +384,8 @@
 <section class="block" id="what">
   <div class="wrap">
     <div class="sec-eyebrow">// what it inspects</div>
-    <h2>Eight surfaces an attacker would probe first.</h2>
-    <p class="sec-intro">Each check maps to an established escape primitive — privileged config, capability abuse, namespace breakout, mount exposure, kernel surface, Kubernetes RBAC, cloud metadata theft, and kernel hardening posture.</p>
+    <h2>Nine surfaces an attacker would probe first.</h2>
+    <p class="sec-intro">Each check maps to an established escape primitive — privileged config, capability abuse, namespace breakout, mount exposure, kernel surface, Kubernetes RBAC, cloud metadata theft, container-runtime escape, and kernel hardening posture.</p>
 
     <div class="field-grid">
       <div class="field">
@@ -430,7 +431,13 @@
         <div class="tags"><span class="tag">169.254.169.254</span><span class="tag">IMDS</span><span class="tag">IAM</span></div>
       </div>
       <div class="field">
-        <div class="idx">08 / hardening</div>
+        <div class="idx">08 / runtime</div>
+        <h3>Container-runtime escape</h3>
+        <p>io_uring reachability, kTLS/sockmap surface, Kata agent socket exposure, and KVM/arm64 guest-to-host vGIC-ITS probing.</p>
+        <div class="tags"><span class="tag">io_uring</span><span class="tag">Kata</span><span class="tag">KVM/arm64</span></div>
+      </div>
+      <div class="field">
+        <div class="idx">09 / hardening</div>
         <h3>Kernel hardening posture</h3>
         <p>Reads sysctl values against a hardening baseline — kptr/dmesg restrict, ASLR, unprivileged userns clone, and a dangerous-module audit.</p>
         <div class="tags"><span class="tag">kptr_restrict</span><span class="tag">randomize_va_space</span><span class="tag">perf_event</span></div>
@@ -472,16 +479,16 @@
   <div class="wrap">
     <div class="sec-eyebrow">// recent vectors</div>
     <h2>Current CVEs, not just the 2016 classics.</h2>
-    <p class="sec-intro">Checks 24–47 add coverage for vectors most scanners miss, alongside a CVE engine driven by an updatable plain-text database you can version independently of the script.</p>
+    <p class="sec-intro">Checks 24–51 add coverage for vectors most scanners miss — including container-runtime escapes (io_uring, kTLS/sockmap, Kata, KVM/arm64) — alongside a CVE engine driven by an updatable plain-text database you can version independently of the script.</p>
 
     <div class="cov-grid">
       <div class="cov">
-        <h4>2025–2026 escapes</h4>
+        <h4>2026 headliners</h4>
         <ul>
+          <li>ITScape — CVE-2026-46316 (CVSS 9.3)</li>
           <li>Copy Fail — CVE-2026-31431</li>
-          <li>NVIDIAScape — CVE-2025-23266</li>
-          <li>runc masked-path race — CVE-2025-31133</li>
-          <li>Dirty Frag — CVE-2026-43284 / 43500</li>
+          <li>Dirty Frag family — 43284 / 43500</li>
+          <li>io_uring zcrx OOB — CVE-2026-43121</li>
         </ul>
       </div>
       <div class="cov">
@@ -490,7 +497,7 @@
           <li>DirtyPipe — CVE-2022-0847</li>
           <li>DirtyCOW — CVE-2016-5195</li>
           <li>Flipping Pages — CVE-2024-1086</li>
-          <li>cgroup v1 release_agent</li>
+          <li>ksmbd UAF — CVE-2022-47939</li>
         </ul>
       </div>
       <div class="cov">
