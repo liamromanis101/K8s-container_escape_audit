@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>container_escape_audit — find the way out before someone else does</title>
+<meta name="description" content="A read-only bash audit that runs inside a Docker or Kubernetes container and reports every viable escape vector. Built for penetration testers and security teams.">
+<meta property="og:title" content="container_escape_audit">
+<meta property="og:description" content="Find the way out of a container before someone else does. 47 read-only checks plus a config-driven CVE engine.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="logo.png">
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="apple-touch-icon" href="favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0e0d;
+    --bg-raised: #111817;
+    --bg-card: #0e1413;
+    --ink: #d6e0dc;
+    --ink-dim: #7d8a85;
+    --ink-faint: #4a5550;
+    --line: #1d2725;
+    --line-bright: #2a3633;
+    --crit: #ff5247;
+    --high: #ff9e3d;
+    --med: #ffd84a;
+    --info: #4a9d8e;
+    --acid: #3ddc97;
+    --acid-dim: #2a9e6c;
+    --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    --display: 'Space Grotesk', system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    * { animation: none !important; transition: none !important; }
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--display);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  a { color: inherit; text-decoration: none; }
+
+  ::selection { background: var(--acid); color: var(--bg); }
+
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 28px; }
+
+  /* ---- top bar ---- */
+  .topbar {
+    position: sticky; top: 0; z-index: 50;
+    background: rgba(10,14,13,0.82);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--line);
+  }
+  .topbar-inner {
+    display: flex; align-items: center; justify-content: space-between;
+    height: 60px;
+  }
+  .brand {
+    font-family: var(--mono); font-weight: 700; font-size: 14px;
+    letter-spacing: -0.02em; display: flex; align-items: center; gap: 9px;
+  }
+  .brand .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--acid); box-shadow: 0 0 10px var(--acid);
+    animation: pulse 2.6s ease-in-out infinite;
+  }
+  .brand-mark { display: block; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.35} }
+  .nav-links { display: flex; gap: 26px; font-size: 13px; font-family: var(--mono); }
+  .nav-links a { color: var(--ink-dim); transition: color .2s; }
+  .nav-links a:hover { color: var(--acid); }
+  .nav-cta {
+    font-family: var(--mono); font-size: 13px; font-weight: 500;
+    border: 1px solid var(--line-bright); padding: 7px 15px; border-radius: 6px;
+    color: var(--ink); transition: all .2s;
+  }
+  .nav-cta:hover { border-color: var(--acid); color: var(--acid); }
+  @media (max-width: 720px){ .nav-links { display:none; } }
+
+  /* ---- hero ---- */
+  .hero { padding: 88px 0 56px; position: relative; }
+  .hero::before {
+    content: ""; position: absolute; inset: 0;
+    background:
+      radial-gradient(900px 380px at 78% -8%, rgba(61,220,151,0.07), transparent 60%),
+      linear-gradient(transparent 0%, transparent calc(100% - 1px), var(--line) 100%);
+    pointer-events: none;
+  }
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--acid-dim); margin-bottom: 22px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .hero-grid {
+    display: grid; grid-template-columns: 1.35fr 0.85fr;
+    gap: 48px; align-items: center; position: relative;
+  }
+  .hero-logo { position: relative; }
+  .hero-logo img {
+    width: 100%; height: auto; max-width: 420px; margin: 0 auto; display: block;
+    position: relative; z-index: 1;
+    animation: floatLogo 6s ease-in-out infinite;
+  }
+  .hero-logo::after {
+    content: ""; position: absolute; inset: -6% -2% 8% -2%;
+    background: radial-gradient(closest-side, rgba(255,255,255,0.045), transparent 72%);
+    border-radius: 50%; z-index: 0;
+  }
+  @keyframes floatLogo { 0%,100%{ transform: translateY(0); } 50%{ transform: translateY(-9px); } }
+  @media (max-width: 860px){
+    .hero-grid { grid-template-columns: 1fr; gap: 20px; }
+    .hero-logo { order: -1; max-width: 300px; margin: 0 0 8px; }
+  }
+  .eyebrow::before {
+    content: ""; width: 26px; height: 1px; background: var(--acid-dim);
+  }
+  h1 {
+    font-size: clamp(38px, 6.4vw, 70px);
+    line-height: 1.02; font-weight: 700; letter-spacing: -0.035em;
+    max-width: 16ch;
+  }
+  h1 .out {
+    color: var(--acid);
+    position: relative; white-space: nowrap;
+  }
+  .lede {
+    margin-top: 26px; font-size: clamp(16px, 2vw, 19px);
+    color: var(--ink-dim); max-width: 56ch; line-height: 1.65;
+  }
+  .lede strong { color: var(--ink); font-weight: 500; }
+  .hero-actions {
+    margin-top: 38px; display: flex; gap: 14px; flex-wrap: wrap; align-items: center;
+  }
+  .btn-primary {
+    font-family: var(--mono); font-weight: 700; font-size: 14px;
+    background: var(--acid); color: var(--bg); padding: 13px 24px;
+    border-radius: 7px; transition: all .18s; border: 1px solid var(--acid);
+  }
+  .btn-primary:hover { background: #54e9a8; transform: translateY(-1px); box-shadow: 0 8px 24px rgba(61,220,151,0.22); }
+  .btn-ghost {
+    font-family: var(--mono); font-size: 14px; color: var(--ink-dim);
+    padding: 13px 20px; border: 1px solid var(--line-bright); border-radius: 7px;
+    transition: all .18s;
+  }
+  .btn-ghost:hover { color: var(--ink); border-color: var(--ink-dim); }
+  .warn-strip {
+    margin-top: 34px; font-family: var(--mono); font-size: 12.5px;
+    color: var(--high); border-left: 2px solid var(--high);
+    padding: 8px 0 8px 14px; max-width: 60ch; line-height: 1.5;
+  }
+
+  /* ---- terminal signature ---- */
+  .terminal {
+    margin-top: 56px; border: 1px solid var(--line-bright); border-radius: 10px;
+    background: var(--bg-card); overflow: hidden;
+    box-shadow: 0 28px 60px -28px rgba(0,0,0,0.7);
+  }
+  .term-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 11px 16px; border-bottom: 1px solid var(--line);
+    background: var(--bg-raised);
+  }
+  .term-head .tdot { width: 11px; height: 11px; border-radius: 50%; background: var(--line-bright); }
+  .term-title {
+    margin-left: 10px; font-family: var(--mono); font-size: 12px; color: var(--ink-faint);
+  }
+  .term-body {
+    padding: 22px 22px 26px; font-family: var(--mono); font-size: 13px;
+    line-height: 1.85; overflow-x: auto;
+  }
+  .term-body .ln { white-space: pre; display: block; opacity: 0; animation: typein .42s ease forwards; }
+  @keyframes typein { from { opacity: 0; transform: translateX(-4px); } to { opacity: 1; transform: none; } }
+  .c-prompt { color: var(--acid); }
+  .c-dim { color: var(--ink-faint); }
+  .c-crit { color: var(--crit); font-weight: 700; }
+  .c-high { color: var(--high); font-weight: 700; }
+  .c-med { color: var(--med); }
+  .c-label { color: var(--ink-dim); }
+  .c-ok { color: var(--acid); }
+
+  /* ---- stats ---- */
+  .stats {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    border: 1px solid var(--line); border-radius: 10px; margin-top: 40px;
+    overflow: hidden; background: var(--bg-card);
+  }
+  .stat { padding: 26px 22px; border-right: 1px solid var(--line); }
+  .stat:last-child { border-right: none; }
+  .stat .num {
+    font-family: var(--mono); font-size: 34px; font-weight: 700;
+    color: var(--ink); letter-spacing: -0.03em; line-height: 1;
+  }
+  .stat .num .u { color: var(--acid); }
+  .stat .lab {
+    font-family: var(--mono); font-size: 11.5px; color: var(--ink-dim);
+    margin-top: 9px; letter-spacing: 0.04em;
+  }
+  @media (max-width: 720px){
+    .stats { grid-template-columns: repeat(2,1fr); }
+    .stat:nth-child(2){ border-right: none; }
+    .stat:nth-child(1),.stat:nth-child(2){ border-bottom: 1px solid var(--line); }
+  }
+
+  /* ---- section frame ---- */
+  section.block { padding: 76px 0; border-top: 1px solid var(--line); }
+  .sec-eyebrow {
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--acid-dim); margin-bottom: 16px;
+  }
+  h2 {
+    font-size: clamp(26px, 3.6vw, 38px); font-weight: 700;
+    letter-spacing: -0.03em; line-height: 1.1; max-width: 20ch;
+  }
+  .sec-intro { color: var(--ink-dim); margin-top: 16px; max-width: 58ch; font-size: 16px; }
+
+  /* ---- what-it-does cards ---- */
+  .field-grid {
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-top: 40px;
+  }
+  @media (max-width: 720px){ .field-grid { grid-template-columns: 1fr; } }
+  .field {
+    border: 1px solid var(--line); border-radius: 10px; padding: 24px;
+    background: var(--bg-card); transition: border-color .2s, transform .2s;
+  }
+  .field:hover { border-color: var(--line-bright); transform: translateY(-2px); }
+  .field .idx { font-family: var(--mono); font-size: 12px; color: var(--acid-dim); }
+  .field h3 {
+    font-family: var(--mono); font-size: 15px; font-weight: 600; margin: 12px 0 8px;
+    color: var(--ink); letter-spacing: -0.01em;
+  }
+  .field p { font-size: 14px; color: var(--ink-dim); line-height: 1.6; }
+  .field .tags { margin-top: 14px; display: flex; gap: 7px; flex-wrap: wrap; }
+  .tag {
+    font-family: var(--mono); font-size: 10.5px; padding: 3px 8px;
+    border-radius: 4px; border: 1px solid var(--line-bright); color: var(--ink-faint);
+  }
+
+  /* ---- report anatomy ---- */
+  .anatomy { margin-top: 40px; display: grid; grid-template-columns: 1.1fr 1fr; gap: 18px; align-items: start; }
+  @media (max-width: 820px){ .anatomy { grid-template-columns: 1fr; } }
+  .finding {
+    border: 1px solid var(--line-bright); border-radius: 10px; overflow: hidden;
+    background: var(--bg-card); font-family: var(--mono);
+  }
+  .finding-bar {
+    background: var(--crit); color: var(--bg); padding: 9px 16px;
+    font-size: 12px; font-weight: 700; letter-spacing: 0.03em;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .finding-row { padding: 13px 16px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .finding-row:last-child { border-bottom: none; }
+  .finding-row .k { color: var(--acid-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; display:block; margin-bottom: 4px; }
+  .finding-row .v { color: var(--ink); line-height: 1.55; }
+  .finding-row .v.dim { color: var(--ink-dim); }
+  .anatomy-note { font-size: 15px; color: var(--ink-dim); line-height: 1.7; padding-top: 6px; }
+  .anatomy-note h3 { font-family: var(--display); font-size: 19px; color: var(--ink); margin-bottom: 12px; font-weight: 600; }
+  .sev-legend { margin-top: 20px; display: flex; flex-direction: column; gap: 10px; }
+  .sev-item { display: flex; gap: 12px; align-items: baseline; font-size: 13.5px; }
+  .sev-chip { font-family: var(--mono); font-size: 10.5px; font-weight: 700; padding: 2px 7px; border-radius: 3px; flex-shrink: 0; width: 64px; text-align: center; }
+  .chip-crit { background: rgba(255,82,71,0.14); color: var(--crit); }
+  .chip-high { background: rgba(255,158,61,0.14); color: var(--high); }
+  .chip-med  { background: rgba(255,216,74,0.13); color: var(--med); }
+  .chip-info { background: rgba(74,157,142,0.14); color: var(--info); }
+  .sev-item span.txt { color: var(--ink-dim); }
+
+  /* ---- coverage ---- */
+  .cov-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 14px; margin-top: 40px; }
+  @media (max-width: 820px){ .cov-grid { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 520px){ .cov-grid { grid-template-columns: 1fr; } }
+  .cov {
+    border: 1px solid var(--line); border-radius: 9px; padding: 18px 18px 20px;
+    background: var(--bg-card);
+  }
+  .cov h4 { font-family: var(--mono); font-size: 13px; color: var(--ink); font-weight: 600; margin-bottom: 12px; display:flex; align-items:center; gap:8px; }
+  .cov h4::before { content:""; width:6px; height:6px; background: var(--acid); border-radius: 1px; }
+  .cov ul { list-style: none; display: flex; flex-direction: column; gap: 7px; }
+  .cov li { font-size: 12.5px; color: var(--ink-dim); font-family: var(--mono); line-height: 1.4; padding-left: 14px; position: relative; }
+  .cov li::before { content: "›"; position: absolute; left: 0; color: var(--ink-faint); }
+
+  /* ---- quickstart ---- */
+  .qs-term {
+    margin-top: 36px; border: 1px solid var(--line-bright); border-radius: 10px;
+    background: var(--bg-card); overflow: hidden;
+  }
+  .qs-body { padding: 22px 24px; font-family: var(--mono); font-size: 13.5px; line-height: 2; overflow-x: auto; }
+  .qs-body .cmt { color: var(--ink-faint); }
+  .qs-body .cmd { color: var(--ink); }
+  .qs-body .cmd::before { content: "$ "; color: var(--acid); }
+  .copy-btn {
+    font-family: var(--mono); font-size: 11px; color: var(--ink-dim);
+    border: 1px solid var(--line-bright); background: transparent; cursor: pointer;
+    padding: 5px 11px; border-radius: 5px; transition: all .15s;
+  }
+  .copy-btn:hover { color: var(--acid); border-color: var(--acid-dim); }
+
+  /* ---- cta ---- */
+  .final {
+    border-top: 1px solid var(--line);
+    padding: 84px 0;
+    text-align: center;
+    background: radial-gradient(700px 300px at 50% 0%, rgba(61,220,151,0.06), transparent 65%);
+  }
+  .final h2 { margin: 0 auto; }
+  .final .lede { margin: 18px auto 0; }
+  .final .hero-actions { justify-content: center; }
+
+  /* ---- footer ---- */
+  footer { border-top: 1px solid var(--line); padding: 40px 0; }
+  .foot-inner { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 18px; }
+  .foot-inner .meta { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); line-height: 1.7; }
+  .foot-inner .meta a { color: var(--ink-dim); }
+  .foot-inner .meta a:hover { color: var(--acid); }
+  .foot-links { display: flex; gap: 22px; font-family: var(--mono); font-size: 12.5px; }
+  .foot-links a { color: var(--ink-dim); }
+  .foot-links a:hover { color: var(--acid); }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="wrap topbar-inner">
+    <a class="brand" href="#top"><img class="brand-mark" src="favicon.png" alt="" width="26" height="26">container_escape_audit</a>
+    <nav class="nav-links">
+      <a href="#what">What it checks</a>
+      <a href="#report">The report</a>
+      <a href="#coverage">Coverage</a>
+      <a href="#start">Quickstart</a>
+    </nav>
+    <a class="nav-cta" href="https://github.com/liamromanis101/K8s-container_escape_audit" target="_blank" rel="noopener">GitHub ↗</a>
+  </div>
+</div>
+
+<a id="top"></a>
+<header class="hero">
+  <div class="wrap hero-grid">
+   <div class="hero-copy">
+    <div class="eyebrow">read-only · docker &amp; kubernetes · v4.0</div>
+    <h1>Find the way <span class="out">out</span> of a container before someone else does.</h1>
+    <p class="lede">A single bash script runs inside a Docker or Kubernetes container and reports every viable escape vector — <strong>47 checks plus a config-driven CVE engine</strong>. It makes no changes to the system. Built for penetration testers and security teams running real assessments.</p>
+    <div class="hero-actions">
+      <a class="btn-primary" href="#start">Run the audit →</a>
+      <a class="btn-ghost" href="https://github.com/liamromanis101/K8s-container_escape_audit" target="_blank" rel="noopener">View source</a>
+    </div>
+    <p class="warn-strip">For authorised security assessments only. Do not run this on systems you don't have explicit written permission to test.</p>
+   </div>
+   <div class="hero-logo">
+     <img src="logo.png" alt="K8s Container Escape Audit logo — a Kubernetes helm above a shipping container with its door broken open" width="420" height="431">
+   </div>
+  </div>
+
+  <div class="wrap">
+    <div class="terminal" aria-hidden="true">
+      <div class="term-head">
+        <span class="tdot"></span><span class="tdot"></span><span class="tdot"></span>
+        <span class="term-title">./container_escape_audit.sh</span>
+      </div>
+      <div class="term-body" id="termBody"></div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="num">47<span class="u">+</span></div><div class="lab">distinct checks</div></div>
+      <div class="stat"><div class="num">10</div><div class="lab">CVEs tracked</div></div>
+      <div class="stat"><div class="num">0</div><div class="lab">writes to the system</div></div>
+      <div class="stat"><div class="num">100<span class="u">%</span></div><div class="lab">pure bash</div></div>
+    </div>
+  </div>
+</header>
+
+<section class="block" id="what">
+  <div class="wrap">
+    <div class="sec-eyebrow">// what it inspects</div>
+    <h2>Eight surfaces an attacker would probe first.</h2>
+    <p class="sec-intro">Each check maps to an established escape primitive — privileged config, capability abuse, namespace breakout, mount exposure, kernel surface, Kubernetes RBAC, cloud metadata theft, and kernel hardening posture.</p>
+
+    <div class="field-grid">
+      <div class="field">
+        <div class="idx">01 / configuration</div>
+        <h3>Privilege &amp; capabilities</h3>
+        <p>Privileged mode, dangerous Linux capabilities, host namespace sharing, and root-in-container UID mapping that maps straight to host root.</p>
+        <div class="tags"><span class="tag">CAP_SYS_ADMIN</span><span class="tag">--privileged</span><span class="tag">hostPID</span></div>
+      </div>
+      <div class="field">
+        <div class="idx">02 / filesystem</div>
+        <h3>Mounts &amp; writable paths</h3>
+        <p>Runtime sockets, host filesystem bind mounts, writable auth files and cron dirs, linker config, OverlayFS layers, and OCI hook injection paths.</p>
+        <div class="tags"><span class="tag">docker.sock</span><span class="tag">/etc/passwd</span><span class="tag">ld.so.preload</span></div>
+      </div>
+      <div class="field">
+        <div class="idx">03 / kernel</div>
+        <h3>Kernel surface</h3>
+        <p>cgroup release_agent escapes, /proc and /dev/mem exposure, eBPF reachability, debugfs/tracefs, kernel keyring, and page-cache write primitives.</p>
+        <div class="tags"><span class="tag">core_pattern</span><span class="tag">release_agent</span><span class="tag">eBPF</span></div>
+      </div>
+      <div class="field">
+        <div class="idx">04 / k8s &amp; cloud</div>
+        <h3>Kubernetes &amp; cloud</h3>
+        <p>Service account token reach, live RBAC escalation probing, unauthenticated kubelet API, secret mounts, and reachable cloud instance metadata.</p>
+        <div class="tags"><span class="tag">SA token</span><span class="tag">kubelet :10250</span><span class="tag">169.254.169.254</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="report">
+  <div class="wrap">
+    <div class="sec-eyebrow">// the deliverable</div>
+    <h2>Every finding is a self-contained briefing.</h2>
+    <p class="sec-intro">No raw flags to decode. Each result tells you what it is, what an attacker does with it, how hard that is, and exactly how to close it — ready to paste into a report.</p>
+
+    <div class="anatomy">
+      <div class="finding">
+        <div class="finding-bar"><span>CRITICAL</span><span>CVE-2026-31431</span></div>
+        <div class="finding-row"><span class="k">What it is</span><span class="v">AF_ALG socket family reachable; the authencesn AEAD algorithm can be bound and spliced.</span></div>
+        <div class="finding-row"><span class="k">Impact</span><span class="v">Controlled 4-byte writes into the page cache of any readable setuid binary → root.</span></div>
+        <div class="finding-row"><span class="k">Exploitability</span><span class="v dim">Trivial. A ~732-byte Python PoC achieves root reliably. No capabilities required. On CISA KEV.</span></div>
+        <div class="finding-row"><span class="k">Recommendation</span><span class="v dim">Apply distro kernel patches. Interim: unload algif_aead, block AF_ALG via seccomp.</span></div>
+      </div>
+
+      <div class="anatomy-note">
+        <h3>Severity that reflects reality</h3>
+        <p>A single CRITICAL is generally enough for full host compromise. But findings combine — a MEDIUM seccomp gap alongside a HIGH capability becomes a practical escape path the tool flags accordingly.</p>
+        <div class="sev-legend">
+          <div class="sev-item"><span class="sev-chip chip-crit">CRITICAL</span><span class="txt">Host escape likely with minimal effort.</span></div>
+          <div class="sev-item"><span class="sev-chip chip-high">HIGH</span><span class="txt">Exploitable with moderate effort or in combination.</span></div>
+          <div class="sev-item"><span class="sev-chip chip-med">MEDIUM</span><span class="txt">Defence-in-depth gap; raises other findings' risk.</span></div>
+          <div class="sev-item"><span class="sev-chip chip-info">INFO</span><span class="txt">Recorded for context and cross-referencing.</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="coverage">
+  <div class="wrap">
+    <div class="sec-eyebrow">// recent vectors</div>
+    <h2>Current CVEs, not just the 2016 classics.</h2>
+    <p class="sec-intro">Checks 24–47 add coverage for vectors most scanners miss, alongside a CVE engine driven by an updatable plain-text database you can version independently of the script.</p>
+
+    <div class="cov-grid">
+      <div class="cov">
+        <h4>2025–2026 escapes</h4>
+        <ul>
+          <li>Copy Fail — CVE-2026-31431</li>
+          <li>NVIDIAScape — CVE-2025-23266</li>
+          <li>runc masked-path race — CVE-2025-31133</li>
+          <li>Dirty Frag — CVE-2026-43284 / 43500</li>
+        </ul>
+      </div>
+      <div class="cov">
+        <h4>The classics</h4>
+        <ul>
+          <li>DirtyPipe — CVE-2022-0847</li>
+          <li>DirtyCOW — CVE-2016-5195</li>
+          <li>Flipping Pages — CVE-2024-1086</li>
+          <li>cgroup v1 release_agent</li>
+        </ul>
+      </div>
+      <div class="cov">
+        <h4>Hardening posture</h4>
+        <ul>
+          <li>kptr / dmesg restrict, ASLR</li>
+          <li>unprivileged userns clone</li>
+          <li>perf_event_paranoid</li>
+          <li>14 dangerous module audit</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="start">
+  <div class="wrap">
+    <div class="sec-eyebrow">// quickstart</div>
+    <h2>Two files, same directory, one run.</h2>
+    <p class="sec-intro">The script and its CVE database sit side by side. Output goes to a timestamped report — or JSON for piping into CI, SIEM, or jq.</p>
+
+    <div class="qs-term">
+      <div class="term-head">
+        <span class="tdot"></span><span class="tdot"></span><span class="tdot"></span>
+        <span class="term-title">bash</span>
+        <button class="copy-btn" id="copyBtn" style="margin-left:auto" type="button">copy</button>
+      </div>
+      <div class="qs-body" id="qsBody"><span class="cmt"># pull the script and its CVE database</span>
+<span class="cmd">curl -O https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/main/container_escape_audit.sh</span>
+<span class="cmd">curl -O https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/main/cve_checks.conf</span>
+<span class="cmd">chmod +x container_escape_audit.sh</span>
+
+<span class="cmt"># standard run — writes a timestamped report</span>
+<span class="cmd">./container_escape_audit.sh</span>
+
+<span class="cmt"># JSON out, filter to CRITICAL findings only</span>
+<span class="cmd">./container_escape_audit.sh --json --no-report | jq '.findings[] | select(.severity=="CRITICAL")'</span></div>
+    </div>
+  </div>
+</section>
+
+<section class="final">
+  <div class="wrap">
+    <div class="sec-eyebrow" style="text-align:center">// get started</div>
+    <h2>Know your escape paths before the engagement does.</h2>
+    <p class="lede">Free for personal use, internal assessments, and non-profit work under CC&nbsp;BY-NC&nbsp;4.0.</p>
+    <div class="hero-actions">
+      <a class="btn-primary" href="https://github.com/liamromanis101/K8s-container_escape_audit" target="_blank" rel="noopener">Clone on GitHub →</a>
+      <a class="btn-ghost" href="https://github.com/liamromanis101/K8s-container_escape_audit/releases/tag/v4.0" target="_blank" rel="noopener">Latest release: v4.0</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot-inner">
+    <div class="meta">
+      container_escape_audit · © 2026 Liam Romanis<br>
+      Licensed under <a href="https://creativecommons.org/licenses/by-nc/4.0/" target="_blank" rel="noopener">CC BY-NC 4.0</a> — commercial use terms apply.
+    </div>
+    <div class="foot-links">
+      <a href="https://github.com/liamromanis101/K8s-container_escape_audit" target="_blank" rel="noopener">Source</a>
+      <a href="https://github.com/liamromanis101/K8s-container_escape_audit/issues" target="_blank" rel="noopener">Issues</a>
+      <a href="https://github.com/sponsors/liamromanis101" target="_blank" rel="noopener">Sponsor</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // Animated terminal boot sequence
+  (function () {
+    var lines = [
+      ['<span class="c-prompt">$</span> <span class="c-dim">./container_escape_audit.sh</span>', 0],
+      ['<span class="c-dim">────────────────────────────────────────────</span>', 60],
+      ['<span class="c-dim">--- 1. Privileged container ---</span>', 120],
+      ['<span class="c-crit">[CRIT]</span> <span class="c-label">Container appears PRIVILEGED (CapEff=000001ffffffffff)</span>', 160],
+      ['<span class="c-dim">--- 4. Dangerous filesystem mounts ---</span>', 220],
+      ['<span class="c-crit">[CRIT]</span> <span class="c-label">Runtime socket accessible: /var/run/docker.sock</span>', 260],
+      ['<span class="c-dim">--- 24. Copy Fail (CVE-2026-31431) ---</span>', 320],
+      ['<span class="c-crit">[CRIT]</span> <span class="c-label">VULNERABLE — AEAD socket bindable, kernel 6.5.0-21</span>', 360],
+      ['<span class="c-dim">--- 6. Kubernetes service account ---</span>', 420],
+      ['<span class="c-high">[HIGH]</span> <span class="c-label">Service account token is readable</span>', 460],
+      ['&nbsp;', 520],
+      ['<span class="c-ok">════ SUMMARY ════</span>', 560],
+      ['<span class="c-crit">CRITICAL: 3</span>  <span class="c-high">HIGH: 4</span>  <span class="c-med">MEDIUM: 5</span>  <span class="c-dim">INFO: 2</span>', 600]
+    ];
+    var body = document.getElementById('termBody');
+    if (!body) return;
+    var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduce) {
+      lines.forEach(function (l) {
+        var el = document.createElement('span');
+        el.className = 'ln'; el.style.opacity = 1; el.style.animation = 'none';
+        el.innerHTML = l[0]; body.appendChild(el);
+      });
+      return;
+    }
+    lines.forEach(function (l) {
+      var el = document.createElement('span');
+      el.className = 'ln'; el.innerHTML = l[0];
+      el.style.animationDelay = l[1] + 'ms';
+      body.appendChild(el);
+    });
+  })();
+
+  // Copy quickstart
+  (function () {
+    var btn = document.getElementById('copyBtn');
+    var body = document.getElementById('qsBody');
+    if (!btn || !body) return;
+    btn.addEventListener('click', function () {
+      var text = body.innerText.replace(/^\$ /gm, '');
+      navigator.clipboard.writeText(text).then(function () {
+        btn.textContent = 'copied ✓';
+        setTimeout(function () { btn.textContent = 'copy'; }, 1600);
+      });
+    });
+  })();
+</script>
+</body>
+</html>
