@@ -242,6 +242,7 @@
     color: var(--ink); letter-spacing: -0.01em;
   }
   .field p { font-size: 14px; color: var(--ink-dim); line-height: 1.6; }
+  .field p code { font-family: var(--mono); font-size: 12.5px; color: var(--ink); background: var(--bg-raised); padding: 1px 5px; border-radius: 4px; }
   .field .tags { margin-top: 14px; display: flex; gap: 7px; flex-wrap: wrap; }
   .tag {
     font-family: var(--mono); font-size: 10.5px; padding: 3px 8px;
@@ -388,27 +389,51 @@
     <div class="field-grid">
       <div class="field">
         <div class="idx">01 / configuration</div>
-        <h3>Privilege &amp; capabilities</h3>
-        <p>Privileged mode, dangerous Linux capabilities, host namespace sharing, and root-in-container UID mapping that maps straight to host root.</p>
-        <div class="tags"><span class="tag">CAP_SYS_ADMIN</span><span class="tag">--privileged</span><span class="tag">hostPID</span></div>
+        <h3>Privileged mode</h3>
+        <p>Detects <code>--privileged</code> containers and the full capability set that comes with them — the single fastest path to host root.</p>
+        <div class="tags"><span class="tag">--privileged</span><span class="tag">CapEff</span></div>
       </div>
       <div class="field">
-        <div class="idx">02 / filesystem</div>
-        <h3>Mounts &amp; writable paths</h3>
-        <p>Runtime sockets, host filesystem bind mounts, writable auth files and cron dirs, linker config, OverlayFS layers, and OCI hook injection paths.</p>
+        <div class="idx">02 / configuration</div>
+        <h3>Capability abuse</h3>
+        <p>Flags dangerous Linux capabilities that enable mount, ptrace, module loading, and eBPF escapes even without full privilege.</p>
+        <div class="tags"><span class="tag">CAP_SYS_ADMIN</span><span class="tag">CAP_SYS_PTRACE</span><span class="tag">CAP_BPF</span></div>
+      </div>
+      <div class="field">
+        <div class="idx">03 / namespaces</div>
+        <h3>Namespace breakout</h3>
+        <p>Host PID, network, IPC, and mount namespace sharing, plus root-in-container UID mapping that maps straight to host root.</p>
+        <div class="tags"><span class="tag">hostPID</span><span class="tag">nsenter</span><span class="tag">userns</span></div>
+      </div>
+      <div class="field">
+        <div class="idx">04 / filesystem</div>
+        <h3>Mount exposure</h3>
+        <p>Runtime sockets, host filesystem bind mounts, writable auth files and cron dirs, linker config, and OCI hook injection paths.</p>
         <div class="tags"><span class="tag">docker.sock</span><span class="tag">/etc/passwd</span><span class="tag">ld.so.preload</span></div>
       </div>
       <div class="field">
-        <div class="idx">03 / kernel</div>
+        <div class="idx">05 / kernel</div>
         <h3>Kernel surface</h3>
-        <p>cgroup release_agent escapes, /proc and /dev/mem exposure, eBPF reachability, debugfs/tracefs, kernel keyring, and page-cache write primitives.</p>
+        <p>cgroup release_agent escapes, /proc and /dev/mem exposure, eBPF reachability, debugfs/tracefs, keyring, and page-cache writes.</p>
         <div class="tags"><span class="tag">core_pattern</span><span class="tag">release_agent</span><span class="tag">eBPF</span></div>
       </div>
       <div class="field">
-        <div class="idx">04 / k8s &amp; cloud</div>
-        <h3>Kubernetes &amp; cloud</h3>
-        <p>Service account token reach, live RBAC escalation probing, unauthenticated kubelet API, secret mounts, and reachable cloud instance metadata.</p>
-        <div class="tags"><span class="tag">SA token</span><span class="tag">kubelet :10250</span><span class="tag">169.254.169.254</span></div>
+        <div class="idx">06 / kubernetes</div>
+        <h3>Kubernetes RBAC</h3>
+        <p>Service account token reach, live RBAC escalation probing, unauthenticated kubelet API, and exposed secret mount directories.</p>
+        <div class="tags"><span class="tag">SA token</span><span class="tag">kubelet :10250</span><span class="tag">RBAC</span></div>
+      </div>
+      <div class="field">
+        <div class="idx">07 / cloud</div>
+        <h3>Cloud metadata theft</h3>
+        <p>Checks whether the AWS, Azure, or GCP instance metadata service is reachable — a direct route to cloud credentials and role assumption.</p>
+        <div class="tags"><span class="tag">169.254.169.254</span><span class="tag">IMDS</span><span class="tag">IAM</span></div>
+      </div>
+      <div class="field">
+        <div class="idx">08 / hardening</div>
+        <h3>Kernel hardening posture</h3>
+        <p>Reads sysctl values against a hardening baseline — kptr/dmesg restrict, ASLR, unprivileged userns clone, and a dangerous-module audit.</p>
+        <div class="tags"><span class="tag">kptr_restrict</span><span class="tag">randomize_va_space</span><span class="tag">perf_event</span></div>
       </div>
     </div>
   </div>
