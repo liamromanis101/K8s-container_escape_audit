@@ -1,5 +1,10 @@
 ![Logo](k8s_logo.png)
 
+![Version](https://img.shields.io/badge/version-4.3-blue)
+![Checks](https://img.shields.io/badge/checks-51-blue)
+![CVEs tracked](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fliamromanis101%2FK8s-container_escape_audit%2Fmain%2F.github%2Fbadges%2Fcve-count.json)
+![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)
+
 # K8s_container-escape-audit
 
 A bash script that runs inside a Docker or Kubernetes container and checks for escape vectors. Built for penetration testers and security teams doing container security assessments.
