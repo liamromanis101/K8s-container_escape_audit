@@ -36,11 +36,12 @@ Coverage expanded following the CVE monitor's gap analysis:
 
 - **Four new read-only probes (checks 48-51):** io_uring reachability, kTLS/sockmap ULP attach surface, Kata Containers agent-socket exposure, and arm64 KVM/vGIC-ITS guest-to-host exposure.
 - **Eight new CVE database entries**, including the first public KVM/arm64 guest-to-host escape (CVE-2026-46316 "ITScape", CVSS 9.3), the io_uring zcrx out-of-bounds write (CVE-2026-43121), and the ksmbd remote kernel use-after-free (CVE-2022-47939).
+- **Two further kernel-LPE entries (2026-06-29):** CVE-2026-43503 ("DirtyClone", CVSS 8.8) — the fourth DirtyFrag-family page-cache-write variant, paired with Fragnesia/CVE-2026-46300 as one split remediation — and CVE-2026-46331 ("pedit COW", CVSS 8.5) — a partial-COW page-cache corruption in the `net/sched` `act_pedit` traffic-control action with a public `packet_edit_meme` PoC. This same pass confirmed previously-`VERIFY` fixed versions for several earlier entries against the Debian/Ubuntu trackers.
 - **New `check_type=manual`** in the CVE engine, letting the database track container-runtime and userspace CVEs (Kata, containerd, Podman, runc, cgroup release_agent) that do not reduce to a kernel version or module test.
 - **`ksmbd` added** to the dangerous-modules audit (check 47); **AppArmor enforcement-artifact inspection** added to check 11.
 - **SLSA Build L3 provenance** now published with each release (signed `multiple.intoto.jsonl`), verifiable with `slsa-verifier`.
 
-Entries whose `fixed_versions` / `introduced` are marked `VERIFY` in `cve_checks.conf` need confirmation against your distribution's security tracker before being relied upon for patch decisions. ITScape is arm64-only.
+Most kernel-CVE `fixed_versions` / `introduced` fields are now confirmed against the Debian and Ubuntu security trackers. The few that remain marked `VERIFY` in `cve_checks.conf` (CVE-2026-46316, CVE-2026-43121, CVE-2026-43494, and the Podman `component_fixed`) need confirmation against your distribution's security tracker before being relied upon for patch decisions. ITScape is arm64-only.
 
 
 ## Checks
@@ -126,7 +127,7 @@ These checks read sysctl values from `/proc/sys` and compare them against the re
 | 43 | `net.ipv4.ip_forward` / IPv6 forwarding | informational | Expected on K8s nodes |
 | 44 | `kernel.unprivileged_userns_clone` | 0 | User namespace prerequisite for most container escape CVEs |
 | 45 | `kernel.perf_event_paranoid` | ≥ 2 | Spectre-class side-channel attacks |
-| 46 | esp4 / esp6 / rxrpc modules | not loaded / blacklisted | Dirty Frag (CVE-2026-43284/43500), Fragnesia (CVE-2026-46300) |
+| 46 | esp4 / esp6 / rxrpc modules | not loaded / blacklisted | Dirty Frag (CVE-2026-43284/43500), Fragnesia (CVE-2026-46300), DirtyClone (CVE-2026-43503) |
 | 47 | Dangerous loaded modules audit | — | 15 modules checked incl. algif_aead, ksmbd, rds, rds_tcp, nf_tables, dccp, sctp, bluetooth |
 
 ### Runtime escape-surface probes (new checks 48-51)
@@ -144,17 +145,20 @@ Read-only reachability probes for container-escape and LPE attack surfaces flagg
 
 ### Config-driven CVE checks
 
-CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with twenty-three entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
+CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with twenty-five entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
 
 | CVE | Name | CVSS | ITW | CISA KEV |
 |-----|------|------|-----|----------|
 | CVE-2026-43494 | PinTheft (RDS + io_uring page-cache overwrite) | 7.8 | | |
 | CVE-2026-31431 | Copy Fail | 7.8 | ✓ | ✓ |
 | CVE-2026-46333 | Ptrace Credential Hijack | 7.8 | ✓ | |
-| CVE-2026-23111 | nf_tables Anonymous Set UAF | 7.8 | | |
+| CVE-2026-23111 | nf_tables Catchall Verdict-Map UAF | 7.8 | | |
 | CVE-2026-46300 | Fragnesia ESP | 7.8 | | |
+| CVE-2026-43503 | DirtyClone | 8.8 | | |
+| CVE-2026-46243 | CIFSwitch (CIFS SPNEGO upcall LPE) | 7.8 | | |
 | CVE-2026-43284 | Dirty Frag ESP | 8.8 | ✓ | |
 | CVE-2026-43500 | Dirty Frag RxRPC | 7.8 | ✓ | |
+| CVE-2026-46331 | pedit COW (act_pedit partial-COW) | 8.5 | | |
 | CVE-2024-1086 | Flipping Pages | 7.8 | ✓ | ✓ |
 | CVE-2025-21756 | Attack of the Vsock | 7.8 | | |
 | CVE-2025-38352 | Chronomaly | 7.0 | ✓ | |
@@ -173,7 +177,9 @@ CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The
 
 > **Kernel CVEs** (CVE-2026-46316, CVE-2026-43121, CVE-2022-47939) use the standard `kernel_version` / `compound` check types. **Runtime / userspace CVEs** (CVE-2026-41326 Kata, CVE-2026-46680 containerd, CVE-2026-55686 Podman, CVE-2026-41579 runc, CVE-2022-0492 cgroup) use the new `check_type=manual` — they do not reduce to a kernel version or module test, so the engine emits a tracking finding for inventory while the live detection is done by a dedicated script check (see checks 12, 26, 47, 50, 51). The package fix is recorded in the `component_fixed` field.
 
-> Several entries ship with `fixed_versions` (and in some cases `introduced`) marked `VERIFY` — including the three earlier additions (CVE-2026-46333, CVE-2026-23111, CVE-2026-46300) and the newest kernel CVEs (CVE-2026-46316, CVE-2026-43121). Confirm these against your distribution's security tracker before relying on a "patched" verdict, since backports vary by vendor. ITW / CISA KEV flags should likewise be confirmed against the current KEV catalog and NVD. ITScape (CVE-2026-46316) is **arm64-only**; its `arch=arm64` key means the engine reports it as N/A on non-arm64 hosts (see [Architecture-specific CVEs](#architecture-specific-cves)), and check 51 provides an architecture-aware behavioural probe.
+> **DirtyFrag family.** CVE-2026-43503 (DirtyClone), CVE-2026-46300 (Fragnesia), and CVE-2026-43284 / CVE-2026-43500 (Dirty Frag) are sibling page-cache-write LPEs sharing one primitive: file-backed page-cache memory treated as a writable network buffer because the `SKBFL_SHARED_FRAG` marker is dropped along some skb path. **Important:** CVE-2026-46300 and CVE-2026-43503 are a single upstream remediation split across two CVE IDs — the kernel CNA assigned 43503 to the *second* Fragnesia commit (`48f6a5356a33`), and both ship together in the same vendor advisories (e.g. Debian DSA-6295-1). Track and patch them as a pair; a host fixed for one but not the other is not protected. The esp4/esp6/rxrpc module audit (check 46) and the kernel-version test together gate this family.
+
+> Most kernel-CVE `fixed_versions` / `cvss` fields are now confirmed against the Debian security tracker and Ubuntu/NVD (CVE-2026-43503, CVE-2026-46331, CVE-2026-46300, CVE-2026-46333, CVE-2026-23111). A few entries still carry `VERIFY` markers where backports were mid-rollout at publication — **CVE-2026-46316** (ITScape), **CVE-2026-43121** (io_uring zcrx), **CVE-2026-43494** (PinTheft), and the `component_fixed` for **CVE-2026-55686** (Podman). Confirm any `VERIFY` field against your distribution's security tracker before relying on a "patched" verdict, since backports vary by vendor, and recheck ITW / CISA KEV flags against the current KEV catalog and NVD. Note CVE-2026-46333's CVSS is disputed (NVD 5.5 vs Red Hat/Qualys "Important"); the database uses 7.8 for practical-impact alerting. ITScape (CVE-2026-46316) is **arm64-only**; its `arch=arm64` key means the engine reports it as N/A on non-arm64 hosts (see [Architecture-specific CVEs](#architecture-specific-cves)), and check 51 provides an architecture-aware behavioural probe.
 
 ## Usage
 
@@ -1188,6 +1194,8 @@ Sponsorship does not grant exclusivity or any change to the open licence for non
 - [CVE-2026-23111 nf_tables UAF](https://securityarsenal.com/blog/cve-2026-23111-linux-kernel-nftables-privilege-escalation-detection-and-hardening)
 - [CVE-2026-46300 Fragnesia](https://ubuntu.com/blog/fragnesia-linux-vulnerability-fixes-available)
 - [CVE-2026-43284 / CVE-2026-43500 Dirty Frag](https://www.openwall.com/lists/oss-security/2026/05/)
+- [CVE-2026-43503 DirtyClone (JFrog Security Research)](https://research.jfrog.com/post/dissecting-and-exploiting-linux-lpe-variant-dirtyclone-cve-2026-43503/)
+- [CVE-2026-46331 pedit COW (Debian DSA-6355-1)](https://security-tracker.debian.org/tracker/CVE-2026-46331)
 - [CVE-2024-1086 Flipping Pages](https://github.com/Notselwyn/CVE-2024-1086)
 - [CVE-2025-23266 NVIDIAScape](https://www.wiz.io/blog/nvidia-ai-vulnerability-cve-2025-23266-nvidiascape)
 - [CVE-2025-31133 runc masked path](https://www.cncf.io/blog/2025/11/28/runc-container-breakout-vulnerabilities-a-technical-overview/)
