@@ -348,7 +348,7 @@
 <header class="hero">
   <div class="wrap hero-grid">
    <div class="hero-copy">
-    <div class="eyebrow">read-only · docker &amp; kubernetes · v4.0</div>
+    <div class="eyebrow">read-only · docker &amp; kubernetes · v4.3</div>
     <h1>Find the way <span class="out">out</span> of a container before someone else does.</h1>
     <p class="lede">A single bash script runs inside a Docker or Kubernetes container and reports every viable escape vector — <strong>47 checks plus a config-driven CVE engine</strong>. It makes no changes to the system. Built for penetration testers and security teams running real assessments.</p>
     <div class="hero-actions">
@@ -373,7 +373,7 @@
 
     <div class="stats">
       <div class="stat"><div class="num">47<span class="u">+</span></div><div class="lab">distinct checks</div></div>
-      <div class="stat"><div class="num">10</div><div class="lab">CVEs tracked</div></div>
+      <div class="stat"><div class="num" id="cveCount">25</div><div class="lab">CVEs tracked</div></div>
       <div class="stat"><div class="num">0</div><div class="lab">writes to the system</div></div>
       <div class="stat"><div class="num">100<span class="u">%</span></div><div class="lab">pure bash</div></div>
     </div>
@@ -539,7 +539,7 @@
     <p class="lede">Free for personal use, internal assessments, and non-profit work under CC&nbsp;BY-NC&nbsp;4.0.</p>
     <div class="hero-actions">
       <a class="btn-primary" href="https://github.com/liamromanis101/K8s-container_escape_audit" target="_blank" rel="noopener">Clone on GitHub →</a>
-      <a class="btn-ghost" href="https://github.com/liamromanis101/K8s-container_escape_audit/releases/tag/v4.0" target="_blank" rel="noopener">Latest release: v4.0</a>
+      <a class="btn-ghost" href="https://github.com/liamromanis101/K8s-container_escape_audit/releases/tag/v4.3" target="_blank" rel="noopener">Latest release: v4.3</a>
     </div>
   </div>
 </section>
@@ -593,6 +593,24 @@
       el.style.animationDelay = l[1] + 'ms';
       body.appendChild(el);
     });
+  })();
+
+  // Live CVE count from cve_checks.conf — falls back silently to the
+  // hardcoded number if the fetch fails or is rate-limited.
+  (function () {
+    var el = document.getElementById('cveCount');
+    if (!el || !window.fetch) return;
+    var url = 'https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/main/cve_checks.conf';
+    fetch(url, { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.text() : Promise.reject(r.status); })
+      .then(function (text) {
+        // Count active entries: lines starting with "cve_id=" (commented-out
+        // blocks begin "#cve_id=" and are correctly excluded).
+        var matches = text.match(/^cve_id=/gm);
+        var count = matches ? matches.length : 0;
+        if (count > 0) { el.textContent = count; }
+      })
+      .catch(function () { /* keep the hardcoded fallback */ });
   })();
 
   // Copy quickstart
