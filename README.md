@@ -110,11 +110,22 @@ Most kernel-CVE `fixed_versions` / `introduced` fields are now confirmed against
 
 ### Runtime and namespace (new checks 24-35)
 
+This group covers the escape and runtime vectors added after the original 1-23 baseline. Checks 24 and 46 are handled by the config-driven CVE engine (see [CVE engine](#cve-engine)) rather than as standalone functions; the remainder are listed in their topical tables above and collected here for reference.
+
 | # | Check | Severity |
 |---|---|---|
-| 24 | NVIDIAScape (CVE-2025-23266) — NVIDIA Container Toolkit OCI hook LD_PRELOAD injection | CRITICAL |
-| 25 | runc masked path race (CVE-2025-31133 / CVE-2025-52565 / CVE-2025-52881) | CRITICAL |
-| 26 | User namespace UID mapping (root-in-container = root-on-host without remapping) | HIGH |
+| 24 | Copy Fail (CVE-2026-31431) AF_ALG page-cache write — via CVE engine | CRITICAL |
+| 25 | NVIDIAScape (CVE-2025-23266) — NVIDIA Container Toolkit OCI hook LD_PRELOAD injection | CRITICAL |
+| 26 | runc masked path race (CVE-2025-31133 / CVE-2025-52565 / CVE-2025-52881) | CRITICAL |
+| 27 | User namespace UID mapping (root-in-container = root-on-host without remapping) | HIGH |
+| 28 | eBPF exposure (CAP_BPF + bpf syscall availability) | CRITICAL |
+| 29 | debugfs / tracefs mounted and accessible | HIGH |
+| 30 | Kubernetes RBAC active escalation path probing | HIGH-CRITICAL |
+| 31 | Additional container runtime sockets (Podman, BuildKit, Kata) | CRITICAL |
+| 32 | Kernel keyring exposure | HIGH |
+| 33 | OCI hook injection paths (`/run/oci/hooks.d`) | CRITICAL/MEDIUM |
+| 34 | Core pattern and page cache write primitives (splice + pipe2 syscall availability) | HIGH |
+| 35 | Procfs namespace file descriptor leakage | MEDIUM |
 
 ### Kernel hardening posture (new checks 36-47)
 
