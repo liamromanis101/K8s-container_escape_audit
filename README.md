@@ -42,6 +42,7 @@ Coverage expanded following the CVE monitor's gap analysis:
 - **Four new read-only probes (checks 48-51):** io_uring reachability, kTLS/sockmap ULP attach surface, Kata Containers agent-socket exposure, and arm64 KVM/vGIC-ITS guest-to-host exposure.
 - **Eight new CVE database entries**, including the first public KVM/arm64 guest-to-host escape (CVE-2026-46316 "ITScape", CVSS 9.3), the io_uring zcrx out-of-bounds write (CVE-2026-43121), and the ksmbd remote kernel use-after-free (CVE-2022-47939).
 - **Two further kernel-LPE entries (2026-06-29):** CVE-2026-43503 ("DirtyClone", CVSS 8.8) — the fourth DirtyFrag-family page-cache-write variant, paired with Fragnesia/CVE-2026-46300 as one split remediation — and CVE-2026-46331 ("pedit COW", CVSS 8.5) — a partial-COW page-cache corruption in the `net/sched` `act_pedit` traffic-control action with a public `packet_edit_meme` PoC. This same pass confirmed previously-`VERIFY` fixed versions for several earlier entries against the Debian/Ubuntu trackers.
+- **Two historical runc container-escape entries:** CVE-2019-5736 (the classic `/proc/self/exe` host-binary overwrite, CVSS 8.6, CISA KEV, fixed in runc 1.0-rc7) and CVE-2024-21626 ("Leaky Vessels", `process.cwd` leaked-fd breakout, CVSS 8.6, fixed in runc 1.1.12). Both are `check_type=manual` inventory entries — the host runc version is generally not observable from inside a container, so a clean result should be treated as *unknown* rather than *safe*, with the runc-version signal from check 26 as the practical detection hook. The Leaky Vessels BuildKit siblings (CVE-2024-23651/23652/23653) are intentionally excluded as out-of-scope image-build tooling.
 - **New `check_type=manual`** in the CVE engine, letting the database track container-runtime and userspace CVEs (Kata, containerd, Podman, runc, cgroup release_agent) that do not reduce to a kernel version or module test.
 - **`ksmbd` added** to the dangerous-modules audit (check 47); **AppArmor enforcement-artifact inspection** added to check 11.
 - **SLSA Build L3 provenance** now published with each release (signed `multiple.intoto.jsonl`), verifiable with `slsa-verifier`.
@@ -161,7 +162,7 @@ Read-only reachability probes for container-escape and LPE attack surfaces flagg
 
 ### Config-driven CVE checks
 
-CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with twenty-five entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
+CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with twenty-seven entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
 
 | CVE | Name | CVSS | ITW | CISA KEV |
 |-----|------|------|-----|----------|
@@ -189,9 +190,11 @@ CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The
 | CVE-2026-46680 | containerd runAsNonRoot Bypass | 7.3 | | |
 | CVE-2026-55686 | Podman WORKDIR Symlink Host Write | 5.3 | | |
 | CVE-2026-41579 | runc /dev Symlink Limited Host Write | 3.3 | | |
+| CVE-2019-5736 | runc /proc/self/exe Host Binary Overwrite | 8.6 | ✓ | ✓ |
+| CVE-2024-21626 | runc process.cwd Leaked-FD Container Breakout (Leaky Vessels) | 8.6 | | |
 | CVE-2022-0492 | cgroup release_agent Escape | 7.0 | ✓ | ✓ |
 
-> **Kernel CVEs** (CVE-2026-46316, CVE-2026-43121, CVE-2022-47939) use the standard `kernel_version` / `compound` check types. **Runtime / userspace CVEs** (CVE-2026-41326 Kata, CVE-2026-46680 containerd, CVE-2026-55686 Podman, CVE-2026-41579 runc, CVE-2022-0492 cgroup) use the new `check_type=manual` — they do not reduce to a kernel version or module test, so the engine emits a tracking finding for inventory while the live detection is done by a dedicated script check (see checks 12, 26, 47, 50, 51). The package fix is recorded in the `component_fixed` field.
+> **Kernel CVEs** (CVE-2026-46316, CVE-2026-43121, CVE-2022-47939) use the standard `kernel_version` / `compound` check types. **Runtime / userspace CVEs** (CVE-2026-41326 Kata, CVE-2026-46680 containerd, CVE-2026-55686 Podman, CVE-2026-41579 / CVE-2019-5736 / CVE-2024-21626 runc, CVE-2022-0492 cgroup) use the new `check_type=manual` — they do not reduce to a kernel version or module test, so the engine emits a tracking finding for inventory while the live detection is done by a dedicated script check (see checks 12, 26, 47, 50, 51). The package fix is recorded in the `component_fixed` field. Note that CVE-2019-5736 and CVE-2024-21626 (Leaky Vessels) are historical runc escapes retained for inventory completeness: the host runc version is usually not visible from inside a container, so a clean result for these should be read as *unknown* rather than *safe* absent host-side inspection or the runc-version signal from check 26.
 
 > **DirtyFrag family.** CVE-2026-43503 (DirtyClone), CVE-2026-46300 (Fragnesia), and CVE-2026-43284 / CVE-2026-43500 (Dirty Frag) are sibling page-cache-write LPEs sharing one primitive: file-backed page-cache memory treated as a writable network buffer because the `SKBFL_SHARED_FRAG` marker is dropped along some skb path. **Important:** CVE-2026-46300 and CVE-2026-43503 are a single upstream remediation split across two CVE IDs — the kernel CNA assigned 43503 to the *second* Fragnesia commit (`48f6a5356a33`), and both ship together in the same vendor advisories (e.g. Debian DSA-6295-1). Track and patch them as a pair; a host fixed for one but not the other is not protected. The esp4/esp6/rxrpc module audit (check 46) and the kernel-version test together gate this family.
 
@@ -547,7 +550,7 @@ Checks 24-35 add coverage for more recent and less commonly checked vectors: Cop
 
 Checks 48-51 extend coverage to recently disclosed container-escape and LPE attack surfaces: io_uring reachability (CVE-2026-43121 zcrx out-of-bounds write and the broader io_uring LPE class), kTLS/sockmap ULP attach surface (the "Reverse Order" and `tls_sk_proto_close()` use-after-free reports), Kata Containers agent-socket exposure (CVE-2026-41326 CopyFile symlink subversion), and arm64 KVM/vGIC-ITS guest-to-host exposure (CVE-2026-46316 ITScape — the first public KVM/arm64 escape).
 
-The config-driven CVE engine additionally covers the most recent kernel privilege-escalation and container-escape issues, including ptrace credential hijack (CVE-2026-46333), nf_tables anonymous-set use-after-free (CVE-2026-23111), Fragnesia ESP (CVE-2026-46300), ITScape KVM/arm64 escape (CVE-2026-46316), the io_uring zcrx OOB write (CVE-2026-43121), the ksmbd remote kernel UAF (CVE-2022-47939), and a set of container-runtime CVEs tracked as advisory entries (Kata CVE-2026-41326, containerd CVE-2026-46680, Podman CVE-2026-55686, runc CVE-2026-41579, and the classic cgroup release_agent escape CVE-2022-0492 / CISA KEV). See the [Recent CVEs](#recent-cves) detail section below.
+The config-driven CVE engine additionally covers the most recent kernel privilege-escalation and container-escape issues, including ptrace credential hijack (CVE-2026-46333), nf_tables anonymous-set use-after-free (CVE-2026-23111), Fragnesia ESP (CVE-2026-46300), ITScape KVM/arm64 escape (CVE-2026-46316), the io_uring zcrx OOB write (CVE-2026-43121), the ksmbd remote kernel UAF (CVE-2022-47939), and a set of container-runtime CVEs tracked as advisory entries (Kata CVE-2026-41326, containerd CVE-2026-46680, Podman CVE-2026-55686, runc CVE-2026-41579 plus the historical runc escapes CVE-2019-5736 and CVE-2024-21626 "Leaky Vessels", and the classic cgroup release_agent escape CVE-2022-0492 / CISA KEV). See the [Recent CVEs](#recent-cves) detail section below.
 
 ## Exploitation reference
 
@@ -1223,6 +1226,7 @@ Sponsorship does not grant exclusivity or any change to the open licence for non
 - [CVE-2026-41579 runc /dev symlink](https://github.com/opencontainers/runc/security/advisories/GHSA-xjvp-4fhw-gc47)
 - [CVE-2022-0847 DirtyPipe](https://dirtypipe.cm4all.com/)
 - [CVE-2019-5736 runc escape](https://blog.dragonsector.pl/2019/02/cve-2019-5736-escape-from-docker-and.html)
+- [CVE-2024-21626 Leaky Vessels (Snyk Labs)](https://labs.snyk.io/resources/cve-2024-21626-runc-process-cwd-container-breakout/)
 - [Felix Wilhelm's cgroup release_agent PoC](https://twitter.com/_fel1x/status/1151487051986087936)
 - [deepce](https://github.com/stealthcopter/deepce)
 - [CDK](https://github.com/cdk-team/CDK)

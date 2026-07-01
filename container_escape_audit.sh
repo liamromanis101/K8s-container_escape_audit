@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# container_escape_audit.sh  —  v4.0
+# container_escape_audit.sh  —  v4.4
 # Copyright (c) 2026 Liam Romanis
 #
 # Licence: Creative Commons Attribution-NonCommercial 4.0 International
@@ -77,8 +77,8 @@ SEP=$'\x1f'
 
 add_finding() {
   local id="$1" severity="$2" title="$3"
-  local what="${4:-}" impact="${5:-}" exploit="${6:-}" rec="${7:-}"
-  FINDINGS["$id"]="${severity}${SEP}${title}${SEP}${what}${SEP}${impact}${SEP}${exploit}${SEP}${rec}"
+  local what="${4:-}" impact="${5:-}" exploit="${6:-}" rec="${7:-}" evidence="${8:-}"
+  FINDINGS["$id"]="${severity}${SEP}${title}${SEP}${what}${SEP}${impact}${SEP}${exploit}${SEP}${rec}${SEP}${evidence}"
   FINDING_ORDER+=("$id")
 }
 
@@ -90,6 +90,101 @@ warn()  { [[ "$OUTPUT_JSON" == false ]] && echo -e "${YELLOW}[WARN]${RESET}  $*"
 crit()  { [[ "$OUTPUT_JSON" == false ]] && echo -e "${RED}[CRIT]${RESET}  $*"; }
 ok()    { [[ "$QUIET" == false && "$OUTPUT_JSON" == false ]] && echo -e "${GREEN}[ OK ]${RESET}  $*"; }
 hdr()   { [[ "$OUTPUT_JSON" == false ]] && echo -e "\n${BOLD}${CYAN}--- $* ---${RESET}"; }
+
+# ---------------------------------------------------------------------------
+# CVE evidence trail
+# ---------------------------------------------------------------------------
+# Each CVE check records the individual sub-tests it performs — the concrete
+# observation AND the raw value behind it — into CVE_EVIDENCE. The buffer is
+# reset at the start of every CVE check via _ev_reset, accumulated by _ev as
+# the helpers run, and rendered both to stdout (beneath the verdict line) and
+# into the finding's 7th 'evidence' field for the report and JSON.
+#
+# Each entry has the form "<outcome>${US}<label>${US}<detail>" where outcome is
+# one of PASS / FLAG / INFO / SKIP, used only to pick a glyph/colour on stdout.
+CVE_EVIDENCE=()
+EUS=$'\x1e'   # unit separator between outcome/label/detail within one entry
+EROW=$'\x1d'  # row separator between evidence entries when packed into a field
+
+_ev_reset() { CVE_EVIDENCE=(); }
+
+# _ev <outcome> <label> <detail>
+#   outcome: PASS | FLAG | INFO | SKIP
+#   label  : short name of the sub-test (e.g. "Kernel version range")
+#   detail : the concrete result incl. raw values (e.g. "running=6017000 ...")
+_ev() {
+  local outcome="$1" label="$2" detail="${3:-}"
+  CVE_EVIDENCE+=("${outcome}${EUS}${label}${EUS}${detail}")
+}
+
+# Glyph + colour for an evidence outcome (stdout only)
+_ev_glyph() {
+  case "$1" in
+    PASS) echo -e "${GREEN}+${RESET}" ;;
+    FLAG) echo -e "${YELLOW}!${RESET}" ;;
+    SKIP) echo -e "${CYAN}~${RESET}" ;;
+    *)    echo -e "${CYAN}.${RESET}" ;;
+  esac
+}
+
+# Print the accumulated evidence to stdout as indented sub-bullets.
+# Long detail lines are word-wrapped to the terminal width and continuation
+# lines are hang-indented to align under the first line's text, so wrapped
+# output stays in the indented column instead of falling back to column 0.
+# Suppressed in --quiet and --json modes (the report/JSON still carry it).
+_ev_print_stdout() {
+  [[ "$OUTPUT_JSON" == true || "$QUIET" == true ]] && return
+  local entry outcome label detail glyph
+
+  # Visible prefix is: 9 spaces + 1 glyph char + 1 space = 11 columns.
+  # Continuation lines are indented to that same column.
+  local indent="           "   # 11 spaces
+
+  # Determine wrap width from the terminal, default to 100, clamp to a sane min.
+  local width="${COLUMNS:-0}"
+  if [[ "$width" -le 0 ]]; then
+    width=$(tput cols 2>/dev/null || echo 100)
+  fi
+  [[ "$width" -lt 40 ]] && width=100
+  # Width available for the wrapped text after the 11-column indent.
+  local textw=$(( width - 11 ))
+  [[ "$textw" -lt 30 ]] && textw=30
+
+  for entry in "${CVE_EVIDENCE[@]}"; do
+    IFS="$EUS" read -r outcome label detail <<< "$entry"
+    glyph=$(_ev_glyph "$outcome")
+
+    local body
+    if [[ -n "$detail" ]]; then
+      body="${label}: ${detail}"
+    else
+      body="${label}"
+    fi
+
+    # Word-wrap the body, then attach the glyph prefix to the first line and
+    # hang-indent every continuation line to the same column.
+    local first_line=true
+    while IFS= read -r wrapped; do
+      if [[ "$first_line" == true ]]; then
+        echo -e "         ${glyph} ${wrapped}"
+        first_line=false
+      else
+        echo -e "${indent}${wrapped}"
+      fi
+    done < <(printf '%s\n' "$body" | fold -s -w "$textw")
+  done
+}
+
+# Pack the current CVE_EVIDENCE buffer into a single field value (rows joined
+# with EROW) for storage in the finding. Returns empty string if no evidence.
+_ev_pack() {
+  local out="" entry
+  for entry in "${CVE_EVIDENCE[@]}"; do
+    [[ -n "$out" ]] && out+="${EROW}"
+    out+="${entry}"
+  done
+  printf '%s' "$out"
+}
 
 # ---------------------------------------------------------------------------
 # Report writer
@@ -111,7 +206,7 @@ write_report() {
 
     local n_crit=0 n_high=0 n_med=0 n_info=0
     for fid in "${FINDING_ORDER[@]}"; do
-      IFS="$SEP" read -r sev _ _ _ _ _ <<< "${FINDINGS[$fid]}"
+      IFS="$SEP" read -r sev _ _ _ _ _ _ <<< "${FINDINGS[$fid]}"
       case "$sev" in
         CRITICAL) (( n_crit++ )) ;;
         HIGH)     (( n_high++ )) ;;
@@ -132,7 +227,7 @@ write_report() {
     for pass in CRITICAL HIGH MEDIUM INFO; do
       local printed_header=false
       for fid in "${FINDING_ORDER[@]}"; do
-        IFS="$SEP" read -r sev title what impact exploit rec <<< "${FINDINGS[$fid]}"
+        IFS="$SEP" read -r sev title what impact exploit rec evidence <<< "${FINDINGS[$fid]}"
         [[ "$sev" != "$pass" ]] && continue
 
         if [[ "$printed_header" == false ]]; then
@@ -151,6 +246,26 @@ write_report() {
         echo "  WHAT IT IS"
         echo "$what" | fold -s -w 70 | sed 's/^/    /'
         echo ""
+        if [[ -n "$evidence" ]]; then
+          echo "  CHECKS PERFORMED"
+          local _row _o _l _d _mark
+          while IFS= read -r _row; do
+            [[ -z "$_row" ]] && continue
+            IFS="$EUS" read -r _o _l _d <<< "$_row"
+            case "$_o" in
+              PASS) _mark="[pass]" ;;
+              FLAG) _mark="[FLAG]" ;;
+              SKIP) _mark="[skip]" ;;
+              *)    _mark="[info]" ;;
+            esac
+            if [[ -n "$_d" ]]; then
+              printf '    %s %s: %s\n' "$_mark" "$_l" "$_d" | fold -s -w 74 | sed '2,$s/^/        /'
+            else
+              printf '    %s %s\n' "$_mark" "$_l"
+            fi
+          done <<< "$(printf '%s' "$evidence" | tr "$EROW" '\n')"
+          echo ""
+        fi
         echo "  IMPACT"
         echo "$impact" | fold -s -w 70 | sed 's/^/    /'
         echo ""
@@ -176,26 +291,65 @@ write_report() {
 # ---------------------------------------------------------------------------
 # JSON emitter
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# _json_escape — escape a string for safe inclusion in JSON.
+# Handles backslash, double-quote, control chars (tab/newline/CR) and any
+# literal backslash-escapes carried in field text (e.g. "\0", "\n"). Without
+# this, descriptions containing a backslash or a raw control char produce
+# invalid JSON. Prefer python3 when present (fully correct), else fall back to
+# sed for the common cases.
+# ---------------------------------------------------------------------------
+_json_escape() {
+  local s="$1"
+  if command -v python3 &>/dev/null; then
+    printf '%s' "$s" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])'
+  else
+    # Fallback: backslash first, then quotes, then collapse real control chars.
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\n'/\\n}"
+    printf '%s' "$s"
+  fi
+}
+
 emit_json() {
   local first=true
   echo "{"
   echo "  \"tool\": \"container_escape_audit\","
-  echo "  \"version\": \"4.0\","
+  echo "  \"version\": \"4.4\","
   echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
   echo "  \"host\": \"$(hostname 2>/dev/null || echo 'unknown')\","
   echo "  \"kernel\": \"$(uname -r 2>/dev/null || echo 'unknown')\","
   echo "  \"findings\": ["
   for fid in "${FINDING_ORDER[@]}"; do
-    IFS="$SEP" read -r sev title what impact exploit rec <<< "${FINDINGS[$fid]}"
+    IFS="$SEP" read -r sev title what impact exploit rec evidence <<< "${FINDINGS[$fid]}"
     [[ "$first" == false ]] && echo ","
     first=false
-    printf '    {\n      "id": "%s",\n      "severity": "%s",\n      "title": "%s",\n      "what": "%s",\n      "impact": "%s",\n      "exploitability": "%s",\n      "recommendation": "%s"\n    }' \
-      "$fid" "$sev" \
-      "${title//\"/\\\"}" \
-      "${what//\"/\\\"}" \
-      "${impact//\"/\\\"}" \
-      "${exploit//\"/\\\"}" \
-      "${rec//\"/\\\"}"
+    printf '    {\n      "id": "%s",\n      "severity": "%s",\n      "title": "%s",\n      "what": "%s",\n      "impact": "%s",\n      "exploitability": "%s",\n      "recommendation": "%s",\n      "checks_performed": [' \
+      "$(_json_escape "$fid")" "$(_json_escape "$sev")" \
+      "$(_json_escape "$title")" \
+      "$(_json_escape "$what")" \
+      "$(_json_escape "$impact")" \
+      "$(_json_escape "$exploit")" \
+      "$(_json_escape "$rec")"
+    if [[ -n "$evidence" ]]; then
+      local _ev_first=true _row _o _l _d
+      echo ""
+      while IFS= read -r _row; do
+        [[ -z "$_row" ]] && continue
+        IFS="$EUS" read -r _o _l _d <<< "$_row"
+        [[ "$_ev_first" == false ]] && echo ","
+        _ev_first=false
+        printf '        {"outcome": "%s", "check": "%s", "detail": "%s"}' \
+          "$(_json_escape "$_o")" "$(_json_escape "$_l")" "$(_json_escape "$_d")"
+      done <<< "$(printf '%s' "$evidence" | tr "$EROW" '\n')"
+      printf '\n      ]'
+    else
+      printf ']'
+    fi
+    printf '\n    }'
   done
   echo ""
   echo "  ]"
@@ -289,13 +443,62 @@ check_capabilities() {
   CAP_EXPLOIT[0]="Low-medium. Most effective as a chaining capability alongside other misconfigurations."
   CAP_REC[0]="Remove CAP_CHOWN unless strictly required. Use readOnlyRootFilesystem: true."
 
+  CAP_NAME[39]="CAP_BPF"
+  CAP_WHAT[39]="CAP_BPF (split out of CAP_SYS_ADMIN in kernel 5.8) permits loading BPF programs and creating most BPF map types via bpf(2)."
+  CAP_IMPACT[39]="Combined with CAP_PERFMON (or CAP_SYS_ADMIN), a container can load kernel-tracing BPF programs to read arbitrary kernel memory and, in documented cross-container attacks, escape to the host. On its own it substantially widens the kernel attack surface reachable from the container."
+  CAP_EXPLOIT[39]="Medium-high. The CAP_BPF + CAP_PERFMON container-escape chain is publicly documented ('Bewildered eBPF on Clouds'). Requires the bpf(2) syscall to be reachable (see check 28)."
+  CAP_REC[39]="Remove CAP_BPF unless the workload legitimately loads eBPF. Block bpf(2) via seccomp. Prefer RuntimeDefault seccomp, which denies bpf(2)."
+
+  CAP_NAME[38]="CAP_PERFMON"
+  CAP_WHAT[38]="CAP_PERFMON (split out of CAP_SYS_ADMIN in kernel 5.8) grants access to performance-monitoring and observability interfaces including perf_event_open(2) and certain BPF helpers."
+  CAP_IMPACT[38]="Extends the BPF/tracing attack surface. In combination with CAP_BPF it enables kernel-memory reads used in cross-container escape research. perf subsystem bugs have historically yielded LPE."
+  CAP_EXPLOIT[38]="Medium. Primarily dangerous chained with CAP_BPF or against a vulnerable perf subsystem (see check 46 perf_event hardening)."
+  CAP_REC[38]="Remove CAP_PERFMON unless profiling is required. Restrict perf_event_open(2) via kernel.perf_event_paranoid and seccomp."
+
+  CAP_NAME[1]="CAP_DAC_OVERRIDE"
+  CAP_WHAT[1]="CAP_DAC_OVERRIDE bypasses all discretionary access control (read, write, and execute permission checks) on files and directories."
+  CAP_IMPACT[1]="Full read/write to any file the container can see regardless of ownership or mode. On any host-mounted path this permits editing /etc/passwd, SSH keys, SUID binaries, or unit files to escalate or escape."
+  CAP_EXPLOIT[1]="Low-medium alone; High when any sensitive host path is mounted (see check 4). No exploit needed — it is a direct permission bypass."
+  CAP_REC[1]="Remove CAP_DAC_OVERRIDE unless strictly required. Use readOnlyRootFilesystem: true and avoid mounting host paths."
+
+  CAP_NAME[27]="CAP_MKNOD"
+  CAP_WHAT[27]="CAP_MKNOD allows creating special files (device nodes) with mknod(2), including block and character devices."
+  CAP_IMPACT[27]="A container can create a device node for a host block device (e.g. the root disk) and then read/write it directly, bypassing the filesystem entirely — a classic path to host disk access and escape when device cgroup controls are permissive."
+  CAP_EXPLOIT[27]="Medium. Requires that the device cgroup allow access to the created node; where it does, 'mknod' + 'dd' against the host disk is straightforward."
+  CAP_REC[27]="Remove CAP_MKNOD (it is dropped by the runtime default set but often re-added). Ensure the device cgroup denies unlisted devices."
+
+  CAP_NAME[18]="CAP_SYS_CHROOT"
+  CAP_WHAT[18]="CAP_SYS_CHROOT permits calling chroot(2) to change the apparent filesystem root."
+  CAP_IMPACT[18]="Enables chroot-based confinement-escape tricks (double-chroot / fchdir breakout) and assists other escapes that manipulate the root directory. Dangerous mainly in combination with host-path visibility or CAP_DAC_READ_SEARCH."
+  CAP_EXPLOIT[18]="Low-medium. A chaining primitive rather than a standalone escape."
+  CAP_REC[18]="Remove CAP_SYS_CHROOT unless the workload legitimately re-roots. Apply seccomp blocking chroot(2)."
+
+  CAP_NAME[13]="CAP_NET_RAW"
+  CAP_WHAT[13]="CAP_NET_RAW allows opening raw and packet sockets (AF_PACKET), enabling arbitrary packet crafting and sniffing on the container's network."
+  CAP_IMPACT[13]="Permits sniffing traffic of co-located pods on a shared L2 segment, ARP/DNS spoofing, and lateral-movement traffic interception. Not a host escape but a strong pivot primitive."
+  CAP_EXPLOIT[13]="Medium. Requires packet tooling in the container; ARP-spoofing co-tenants is well tooled."
+  CAP_REC[13]="Drop CAP_NET_RAW (it is in the default set but rarely needed). Enforce with the PSA restricted profile and NetworkPolicy segmentation."
+
+  CAP_NAME[34]="CAP_SYSLOG"
+  CAP_WHAT[34]="CAP_SYSLOG permits privileged syslog(2) operations, including reading the kernel ring buffer and viewing kernel pointers even when kptr_restrict is set."
+  CAP_IMPACT[34]="Leaks kernel addresses (defeating KASLR) via dmesg / kallsyms exposure, providing the information leak that most kernel LPE exploits require to be reliable."
+  CAP_EXPLOIT[34]="Low direct impact, High as an enabler — it supplies the address leak that turns an unreliable kernel bug into a deterministic exploit (see checks 36/37 kptr/dmesg restrict)."
+  CAP_REC[34]="Remove CAP_SYSLOG. Set kernel.kptr_restrict=2 and kernel.dmesg_restrict=1 on the host."
+
+  # Optional per-capability severity override (defaults to HIGH when unset).
+  local -A CAP_SEV
+  CAP_SEV[13]="MEDIUM"   # CAP_NET_RAW  — lateral-movement pivot, not host escape
+  CAP_SEV[18]="MEDIUM"   # CAP_SYS_CHROOT — chaining primitive
+  CAP_SEV[34]="MEDIUM"   # CAP_SYSLOG   — info-leak enabler
+
   local cap_dec found_any=false
   cap_dec=$(printf "%d" "0x${capeff}")
   for bit in "${!CAP_NAME[@]}"; do
     local mask=$(( 1 << bit ))
     if (( (cap_dec & mask) != 0 )); then
+      local cap_sev="${CAP_SEV[$bit]:-HIGH}"
       warn "Dangerous capability present: ${CAP_NAME[$bit]} (bit $bit)"
-      add_finding "cap_${bit}" "HIGH" \
+      add_finding "cap_${bit}" "$cap_sev" \
         "Dangerous capability present: ${CAP_NAME[$bit]}" \
         "${CAP_WHAT[$bit]}" "${CAP_IMPACT[$bit]}" "${CAP_EXPLOIT[$bit]}" "${CAP_REC[$bit]}"
       found_any=true
@@ -621,6 +824,25 @@ check_security_profiles() {
     1) ok "Seccomp: strict mode (mode 1)" ;;
     2) ok "Seccomp: BPF filter active (mode 2)" ;;
   esac
+
+  # --- no_new_privs bit -----------------------------------------------------
+  # The kernel-level control behind allowPrivilegeEscalation: false. When 0, a
+  # process can gain privileges via SUID binaries or file capabilities on exec;
+  # when 1, the kernel refuses those transitions for the process and its
+  # children. Readable directly from /proc/self/status (NoNewPrivs: 0|1).
+  local nnp
+  nnp=$(grep -i '^NoNewPrivs:' /proc/self/status 2>/dev/null | awk '{print $2}')
+  if [[ "$nnp" == "0" ]]; then
+    warn "no_new_privs is NOT set (NoNewPrivs: 0)"
+    add_finding "no_new_privs_unset" "MEDIUM" \
+      "no_new_privs bit is not set (privilege escalation via SUID/file caps possible)" \
+      "The no_new_privs process attribute is 0, meaning the kernel will still honour set-user-ID/set-group-ID bits and file capabilities when this process or its children call execve(2). This is the kernel primitive behind the Kubernetes allowPrivilegeEscalation setting; a value of 0 indicates allowPrivilegeEscalation was not set to false (or was explicitly true)." \
+      "If a SUID-root binary (e.g. a stray sudo, mount, or ping with the SUID bit) or a file with file capabilities exists in the container image, a non-root process can execute it to gain elevated privileges, which is often the first rung of an escape chain that other findings in this report can complete." \
+      "Low on its own; a force-multiplier when combined with SUID binaries (check 13) or a writable-auth-file / mount finding. It removes a kernel-enforced barrier rather than being an exploit itself." \
+      "Set securityContext.allowPrivilegeEscalation: false on the container (this sets no_new_privs=1). Pair with runAsNonRoot: true and a dropped capability set, and strip SUID/SGID bits from image binaries that do not need them."
+  elif [[ "$nnp" == "1" ]]; then
+    ok "no_new_privs is set (NoNewPrivs: 1) — SUID/file-cap privilege gain blocked"
+  fi
 
   if [[ -f /proc/self/attr/current ]]; then
     local aa_label
@@ -1176,6 +1398,8 @@ check_k8s_rbac_escalation() {
   checks["exec_pods"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"create","resource":"pods/exec"}}}'
   checks["bind_clusterrole"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"bind","resource":"clusterrolebindings"}}}'
   checks["create_daemonsets"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"namespace":"kube-system","verb":"create","resource":"daemonsets"}}}'
+  checks["impersonate_users"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"impersonate","resource":"users"}}}'
+  checks["attach_pods"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"create","resource":"pods/attach"}}}'
 
   local escalation_paths=()
   for check_name in "${!checks[@]}"; do
@@ -1192,12 +1416,12 @@ check_k8s_rbac_escalation() {
   if [[ ${#escalation_paths[@]} -gt 0 ]]; then
     local paths_str="${escalation_paths[*]}"
     local severity="HIGH"
-    echo "$paths_str" | grep -q "create_pods\|list_secrets_all\|bind_clusterrole\|create_daemonsets" && severity="CRITICAL"
+    echo "$paths_str" | grep -q "create_pods\|list_secrets_all\|bind_clusterrole\|create_daemonsets\|impersonate_users" && severity="CRITICAL"
     crit "Kubernetes RBAC escalation paths identified: ${paths_str}"
     add_finding "k8s_rbac_escalation" "$severity" \
       "Kubernetes RBAC escalation paths available: ${paths_str}" \
       "Active RBAC checks against $api_server confirm this service account has: ${paths_str}." \
-      "create_pods in kube-system: can deploy a privileged pod to escape any namespace boundary. list_secrets (cluster-wide): can enumerate all secrets. exec_pods: can execute commands in other pods. bind_clusterrole: can grant cluster-admin to any service account. create_daemonsets: can run on every node." \
+      "create_pods in kube-system: can deploy a privileged pod to escape any namespace boundary. list_secrets (cluster-wide): can enumerate all secrets. exec_pods: can execute commands in other pods. bind_clusterrole: can grant cluster-admin to any service account. create_daemonsets: can run on every node. impersonate_users: can assume the identity of any user, group, or service account (including cluster-admin) on every request — a direct, often-overlooked path to full cluster control. attach_pods: can attach to running pods' process streams, equivalent to exec for stealing data or running commands in other workloads." \
       "Low-moderate complexity. Requires only kubectl or curl with the service account token. Tools such as peirates and rbac-police automate Kubernetes privilege escalation." \
       "Conduct a full RBAC audit. Remove all permissions not strictly required. Implement OPA/Gatekeeper or Kyverno admission controllers to enforce least-privilege service account policies."
   else
@@ -2000,6 +2224,18 @@ check_kh_dangerous_modules() {
   MOD_SEV[rds]="MEDIUM"; MOD_CVE[rds]=""
   MOD_REC[rds]="Blacklist: 'install rds /bin/false'."
 
+  MOD_REASON[rds_tcp]="RDS-over-TCP transport — second gate of PinTheft (CVE-2026-43494): the RDS zerocopy pin-reference bug is reached via rds/rds_tcp and chained with io_uring to overwrite the page cache. Cross-reference the io_uring reachability probe (check 48)."
+  MOD_SEV[rds_tcp]="HIGH"; MOD_CVE[rds_tcp]="CVE-2026-43494"
+  MOD_REC[rds_tcp]="Blacklist both RDS modules: printf 'install rds /bin/false\ninstall rds_tcp /bin/false\n' > /etc/modprobe.d/pintheft.conf; rmmod rds_tcp rds 2>/dev/null. Either this or disabling io_uring (kernel.io_uring_disabled=2) breaks the documented exploit chain."
+
+  MOD_REASON[vsock]="Virtio/VM sockets core (AF_VSOCK) — host-guest socket transport; 'Attack of the Vsock' (CVE-2025-21756) is a use-after-free in this subsystem giving local privilege escalation. Rarely needed inside application containers."
+  MOD_SEV[vsock]="HIGH"; MOD_CVE[vsock]="CVE-2025-21756"
+  MOD_REC[vsock]="Blacklist if AF_VSOCK is not required (it usually is not in containers): 'install vsock /bin/false'. Patch the kernel for CVE-2025-21756."
+
+  MOD_REASON[vmw_vsock_virtio_transport]="Virtio transport for AF_VSOCK — loads alongside vsock and exposes the same 'Attack of the Vsock' (CVE-2025-21756) UAF attack surface."
+  MOD_SEV[vmw_vsock_virtio_transport]="HIGH"; MOD_CVE[vmw_vsock_virtio_transport]="CVE-2025-21756"
+  MOD_REC[vmw_vsock_virtio_transport]="Blacklist with the rest of the vsock stack if AF_VSOCK is not required: 'install vmw_vsock_virtio_transport /bin/false'. Patch the kernel for CVE-2025-21756."
+
   MOD_REASON[atm]="Asynchronous Transfer Mode — legacy networking protocol; multiple historical kernel vulnerabilities; no production use in modern deployments"
   MOD_SEV[atm]="MEDIUM"; MOD_CVE[atm]=""
   MOD_REC[atm]="Blacklist: 'install atm /bin/false'."
@@ -2313,6 +2549,124 @@ check_kvm_arm64_vgic_its() {
     ok "arm64 system without KVM-host or vGIC-ITS indicators detected for CVE-2026-46316"
   fi
 }
+
+# ---------------------------------------------------------------------------
+# Check 52 — Container runtime versions (best-effort)
+# Gives the manual-type runc CVE entries (CVE-2019-5736, CVE-2024-21626) a real
+# three-state detection signal instead of inventory-only. Read-only: reads
+# binaries and runs '<bin> --version'; never eval's output, never writes.
+# ---------------------------------------------------------------------------
+check_runtime_versions() {
+  hdr "52. Container runtime versions (best-effort)"
+
+  # Candidate binary locations reachable from a container when host paths leak.
+  local -a runc_paths=(
+    /usr/bin/runc /usr/sbin/runc /usr/local/sbin/runc /usr/local/bin/runc
+    /run/torcx/unpack/docker/bin/runc /host/usr/bin/runc /host/usr/sbin/runc
+  )
+  local -a containerd_paths=(
+    /usr/bin/containerd /usr/local/bin/containerd /host/usr/bin/containerd
+  )
+  local -a crio_paths=(
+    /usr/bin/crio /usr/local/bin/crio /host/usr/bin/crio
+  )
+
+  # Extract a semver-ish token from a `--version` string without eval.
+  _rt_version_of() {
+    local bin="$1" out=""
+    [[ -x "$bin" ]] || return 1
+    out=$("$bin" --version 2>/dev/null | head -3) || return 1
+    # runc:        "runc version 1.1.12"
+    # containerd:  "containerd github.com/containerd/containerd v1.7.2 <sha>"
+    # crio:        "crio version 1.28.4"
+    local ver
+    # Prefer a token following the word "version"; fall back to any leading-v semver
+    # (containerd prints "containerd github.com/... v1.7.2 <sha>" with no "version" word).
+    ver=$(printf '%s\n' "$out" | grep -oiE 'version[[:space:]]+v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)?' \
+            | head -1 | grep -oiE 'v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)?')
+    [[ -z "$ver" ]] && ver=$(printf '%s\n' "$out" | grep -oiE '\bv[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)?' | head -1)
+    [[ -z "$ver" ]] && ver=$(printf '%s\n' "$out" | grep -oiE '\b[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)?' | head -1)
+    [[ -n "$ver" ]] && { printf '%s' "${ver#v}"; return 0; }
+    return 1
+  }
+
+  # dpkg-style "is A < B" using sort -V. Returns 0 (true) if $1 < $2.
+  _ver_lt() { [[ "$1" == "$2" ]] && return 1; [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$1" ]]; }
+
+  local found_any=false
+
+  # --- runc ---------------------------------------------------------------
+  local runc_bin="" runc_ver=""
+  for p in "${runc_paths[@]}"; do
+    if runc_ver=$(_rt_version_of "$p" 2>/dev/null); then runc_bin="$p"; break; fi
+  done
+
+  if [[ -n "$runc_ver" ]]; then
+    found_any=true
+    # 1.1.12 fixes CVE-2024-21626; 1.0.0-rc7 fixes CVE-2019-5736 (both < 1.1.12).
+    local runc_verdicts=""
+    _ver_lt "$runc_ver" "1.1.12" && runc_verdicts+="CVE-2024-21626 (Leaky Vessels, fixed 1.1.12); "
+    # 5736 practically only matters on ancient runc (<= 1.0.0-rc6, fixed in 1.0.0-rc7).
+    # NB: `sort -V` ranks "1.0.0-rc6" ABOVE "1.0.0", so do not use _ver_lt for the rc
+    # boundary — detect the pre-release/pre-1.0 case explicitly instead.
+    local runc_major_minor_patch="${runc_ver%%-*}"   # strip any -rcN / -dev suffix
+    if _ver_lt "$runc_major_minor_patch" "1.0.0"; then
+      # e.g. 0.9.x — unambiguously pre-1.0
+      runc_verdicts+="CVE-2019-5736 (/proc/self/exe overwrite, fixed 1.0.0-rc7); "
+    elif [[ "$runc_major_minor_patch" == "1.0.0" && "$runc_ver" =~ -rc([0-6])([^0-9]|$) ]]; then
+      # 1.0.0-rc0 .. 1.0.0-rc6 are vulnerable; 1.0.0-rc7+ and 1.0.0 are fixed
+      runc_verdicts+="CVE-2019-5736 (/proc/self/exe overwrite, fixed 1.0.0-rc7); "
+    fi
+    if [[ -n "$runc_verdicts" ]]; then
+      crit "runc ${runc_ver} at ${runc_bin} is affected by: ${runc_verdicts%; }"
+      add_finding "runtime_runc_vulnerable" "CRITICAL" \
+        "Vulnerable runc detected: ${runc_ver} (${runc_bin})" \
+        "A runc binary reachable from this context reports version ${runc_ver}. This version predates fixes for: ${runc_verdicts%; }. Because the binary was reachable, this is a definitive VERIFY-ON-HOST verdict rather than an inventory-only advisory." \
+        "These are container-to-host escape vulnerabilities: an attacker able to run a malicious image or exec into a container can break out to root on the node, compromising the host and co-located workloads." \
+        "Definitive where the reachable binary is the one the node actually uses to run containers. If this binary is a leaked/host-mounted copy, confirm it matches the active runtime." \
+        "Upgrade runc to >= 1.1.12 (and ensure Docker/containerd/CRI-O invoke the patched binary). Re-pull/rebuild node images. Verify with 'runc --version' on the node."
+    else
+      ok "runc ${runc_ver} (${runc_bin}) is at or above 1.1.12 — past the runc escape fixes tracked here"
+    fi
+  fi
+
+  # --- containerd ---------------------------------------------------------
+  local ctr_bin="" ctr_ver=""
+  for p in "${containerd_paths[@]}"; do
+    if ctr_ver=$(_rt_version_of "$p" 2>/dev/null); then ctr_bin="$p"; break; fi
+  done
+  [[ -n "$ctr_ver" ]] && { found_any=true; info "containerd ${ctr_ver} reachable at ${ctr_bin} (cross-check against CVE-2026-46680 fixed 1.7.32/2.0.9/2.2.4/2.3.1)"; }
+
+  # --- cri-o --------------------------------------------------------------
+  local crio_bin="" crio_ver=""
+  for p in "${crio_paths[@]}"; do
+    if crio_ver=$(_rt_version_of "$p" 2>/dev/null); then crio_bin="$p"; break; fi
+  done
+  [[ -n "$crio_ver" ]] && { found_any=true; info "cri-o ${crio_ver} reachable at ${crio_bin} (cross-check against CVE-2022-0811 cr8escape fixed 1.19.6/1.20.7/1.21.6/1.22.3)"; }
+
+  # --- three-state fallback when NOTHING is reachable ---------------------
+  if [[ "$found_any" == false ]]; then
+    # Precondition signal: in-container root without userns remapping.
+    # /proc/self/uid_map "0 0 <count>" means container-0 maps to host-0 (NOT remapped).
+    local uidmap unmapped_root=false
+    uidmap=$(awk 'NR==1{print $1, $2}' /proc/self/uid_map 2>/dev/null || echo "")
+    [[ "$uidmap" == "0 0" && "$(id -u)" == "0" ]] && unmapped_root=true
+
+    if [[ "$unmapped_root" == true ]]; then
+      warn "No runtime version reachable, but in-container root is NOT userns-remapped — runc escape preconditions present"
+      add_finding "runtime_version_unknown_exposed" "MEDIUM" \
+        "Container runtime version not observable; runc-escape preconditions present" \
+        "No runc/containerd/cri-o binary was reachable from this context, so the host runtime version could not be confirmed. However, this process is root inside the container and /proc/self/uid_map shows container UID 0 mapping directly to host UID 0 (no user-namespace remapping), which is the precondition required by CVE-2019-5736-class escapes." \
+        "If the node's runc is unpatched, the escape path is available; the missing version means this cannot be ruled out. This is the POTENTIALLY-EXPOSED state, not a confirmed vulnerability." \
+        "Cannot be scored without the host runtime version — treat as verify-required, not safe." \
+        "Confirm 'runc --version' on the node (>= 1.1.12). Enable user-namespace remapping so container root is not host root, which blocks the CVE-2019-5736 overwrite regardless of runc version (see check 27)."
+    else
+      info "No container runtime binary reachable from this context and no unmapped-root precondition — runtime version UNKNOWN (not 'safe'). Confirm 'runc --version' on the node."
+    fi
+  fi
+
+  unset -f _rt_version_of _ver_lt
+}
 # =============================================================================
 # cve_check_engine.sh  —  Config-driven CVE check engine
 # Drop-in addition to container_escape_audit.sh
@@ -2442,8 +2796,14 @@ _kernel_in_affected_range() {
     local intro_int
     intro_int=$(_kver_to_int "$introduced")
     if (( kver_int < intro_int )); then
+      _ev PASS "Introduced-version gate" \
+        "running ${kver_clean} (int ${kver_int}) < introduced ${introduced} (int ${intro_int}) — predates the bug, not affected"
       return 1  # Below introduced version — not affected
     fi
+    _ev INFO "Introduced-version gate" \
+      "running ${kver_clean} (int ${kver_int}) >= introduced ${introduced} (int ${intro_int}) — at/after the version that introduced the bug"
+  else
+    _ev INFO "Introduced-version gate" "no introduced version recorded (introduced=0) — gate skipped"
   fi
 
   # Parse fixed_versions: "series:version series:version ..."
@@ -2454,8 +2814,16 @@ _kernel_in_affected_range() {
   #   none   — no patch available yet
   #   VERIFY — fixed version not yet confirmed against the distro tracker
   #   any value without a "series:version" pair (no ':') — malformed/sentinel
-  [[ "$fixed_str" == "none" || "$fixed_str" == "VERIFY" ]] && return 0
-  [[ "$fixed_str" != *:* ]] && return 0  # no usable series:version — assume affected
+  if [[ "$fixed_str" == "none" || "$fixed_str" == "VERIFY" ]]; then
+    _ev FLAG "Fixed-version comparison" \
+      "fixed_versions='${fixed_str}' — no confirmed fix to compare against; flagged conservatively as affected"
+    return 0
+  fi
+  if [[ "$fixed_str" != *:* ]]; then
+    _ev FLAG "Fixed-version comparison" \
+      "fixed_versions='${fixed_str}' carries no usable series:version pair — treated as unconfirmed; flagged conservatively as affected"
+    return 0  # no usable series:version — assume affected
+  fi
 
   local kmaj kmin
   IFS='.' read -r kmaj kmin _ <<< "$kver_clean"
@@ -2463,12 +2831,14 @@ _kernel_in_affected_range() {
 
   local found_series=false
   local series_fixed_int=0
+  local series_fixed_ver=""
 
   for entry in $fixed_str; do
     local s v
     IFS=':' read -r s v <<< "$entry"
     if [[ "$s" == "$series" ]]; then
       found_series=true
+      series_fixed_ver="$v"
       series_fixed_int=$(_kver_to_int "$v")
       break
     fi
@@ -2477,8 +2847,12 @@ _kernel_in_affected_range() {
   if [[ "$found_series" == true ]]; then
     # We know the fixed version for this series
     if (( kver_int >= series_fixed_int )); then
+      _ev PASS "Fixed-version comparison" \
+        "series ${series} fixed at ${series_fixed_ver} (int ${series_fixed_int}); running ${kver_clean} (int ${kver_int}) >= fixed — patched in this series"
       return 1  # Kernel is at or above the fix — not affected
     else
+      _ev FLAG "Fixed-version comparison" \
+        "series ${series} fixed at ${series_fixed_ver} (int ${series_fixed_int}); running ${kver_clean} (int ${kver_int}) < fixed — pre-fix, affected"
       return 0  # Kernel is below the fix — affected
     fi
   else
@@ -2489,6 +2863,7 @@ _kernel_in_affected_range() {
     # it is likely patched in mainline. If it is OLDER, it may be unpatched.
     local max_fixed_int=0
     local max_fixed_series_int=0
+    local max_fixed_series_str=""
     for entry in $fixed_str; do
       local s v
       IFS=':' read -r s v <<< "$entry"
@@ -2496,6 +2871,7 @@ _kernel_in_affected_range() {
       s_int=$(_kver_to_int "${s}.0")
       if (( s_int > max_fixed_series_int )); then
         max_fixed_series_int=$s_int
+        max_fixed_series_str="$s"
         max_fixed_int=$(_kver_to_int "$v")
       fi
     done
@@ -2506,11 +2882,15 @@ _kernel_in_affected_range() {
     # If running series is newer than the highest fixed series in the list,
     # assume the fix was merged into mainline and this series has it.
     if (( series_int > max_fixed_series_int )); then
+      _ev PASS "Fixed-version comparison" \
+        "series ${series} not listed in fixed_versions (${fixed_str}); newer than highest fixed series ${max_fixed_series_str} — fix presumed in mainline, not affected"
       return 1  # Likely patched in this newer series
     fi
 
     # Running series is older than or equal to the highest fixed series
     # and is not explicitly listed — flag as affected (conservative)
+    _ev FLAG "Fixed-version comparison" \
+      "series ${series} not listed in fixed_versions (${fixed_str}) and not newer than highest fixed series ${max_fixed_series_str} — cannot confirm a backport; flagged conservatively as affected"
     return 0
   fi
 }
@@ -2525,16 +2905,25 @@ _check_module_loaded() {
   [[ "$mod_str" == "none" ]] && return 1
 
   local loaded=()
+  local notloaded=()
   for mod in $mod_str; do
     if grep -q "^${mod} " /proc/modules 2>/dev/null; then
       loaded+=("$mod")
+    else
+      notloaded+=("$mod")
     fi
   done
 
   if [[ ${#loaded[@]} -gt 0 ]]; then
+    _ev FLAG "Module loaded (/proc/modules)" \
+      "LOADED: ${loaded[*]}${notloaded:+; not loaded: ${notloaded[*]}}"
+    _MOD_LOADED_RESULT="${loaded[*]}"
     echo "${loaded[*]}"
     return 0
   fi
+  _ev PASS "Module loaded (/proc/modules)" \
+    "none of [${mod_str}] present in /proc/modules"
+  _MOD_LOADED_RESULT=""
   return 1
 }
 
@@ -2548,6 +2937,7 @@ _check_module_blacklisted() {
   [[ "$mod_str" == "none" ]] && echo "yes" && return 0
 
   local not_blacklisted=()
+  local blacklisted=()
   for mod in $mod_str; do
     local found=false
     for f in /etc/modprobe.d/*.conf /etc/modprobe.conf; do
@@ -2557,13 +2947,23 @@ _check_module_blacklisted() {
         break
       fi
     done
-    [[ "$found" == false ]] && not_blacklisted+=("$mod")
+    if [[ "$found" == false ]]; then
+      not_blacklisted+=("$mod")
+    else
+      blacklisted+=("$mod")
+    fi
   done
 
   if [[ ${#not_blacklisted[@]} -gt 0 ]]; then
+    _ev FLAG "Module blacklist (/etc/modprobe.d)" \
+      "NOT blacklisted: ${not_blacklisted[*]}${blacklisted:+; blacklisted: ${blacklisted[*]}} — auto-load on use remains possible"
+    _MOD_NOT_BLACKLISTED_RESULT="${not_blacklisted[*]}"
     echo "${not_blacklisted[*]}"
     return 1
   fi
+  _ev PASS "Module blacklist (/etc/modprobe.d)" \
+    "all of [${mod_str}] blacklisted via 'install ... /bin/false'"
+  _MOD_NOT_BLACKLISTED_RESULT=""
   echo "yes"
   return 0
 }
@@ -2579,27 +2979,43 @@ _check_socket_accessible() {
   local sp="${CVE_FIELD[socket_proto]:-0}"
 
   [[ "$af" == "none" ]] && return 1
-  command -v python3 &>/dev/null || return 2  # Can't test without python3
+  if ! command -v python3 &>/dev/null; then
+    _ev SKIP "Socket reachability" "python3 not available — AF=${af} SOCK=${st} could not be probed"
+    return 2  # Can't test without python3
+  fi
 
-  python3 -c "
+  local sock_detail
+  sock_detail=$(python3 -c "
 import socket, sys
 af=$af; st=$st; sp=$sp
 try:
     s = socket.socket(af, st, sp)
     s.close()
+    print('opened cleanly (AF reachable)')
     sys.exit(0)
 except Exception as e:
     import errno as E
     err = getattr(e, 'errno', None)
+    name = E.errorcode.get(err, 'UNKNOWN') if err is not None else 'NONE'
     # EPERM(1) or EACCES(13): socket family reachable but permission denied
     # EINVAL(22): socket reachable but invalid params
     # EPROTONOSUPPORT(93): AF known but proto not supported — AF reachable
     # EAFNOSUPPORT(97): AF completely absent/blocked
     # ENOSYS(38): syscall blocked by seccomp
     if err in (1, 13, 22, 93):
+        print('errno %s (%s) — AF reachable' % (err, name))
         sys.exit(0)  # Reachable
+    print('errno %s (%s) — AF not reachable' % (err, name))
     sys.exit(1)      # Not reachable
-" 2>/dev/null
+" 2>/dev/null)
+  local rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    _ev FLAG "Socket reachability" "AF=${af} SOCK=${st} PROTO=${sp}: ${sock_detail:-reachable}"
+  else
+    _ev PASS "Socket reachability" "AF=${af} SOCK=${st} PROTO=${sp}: ${sock_detail:-blocked/absent}"
+  fi
+  return $rc
 }
 
 # ---------------------------------------------------------------------------
@@ -2609,11 +3025,16 @@ except Exception as e:
 _check_kernel_symbol() {
   local sym="${CVE_FIELD[kallsyms_sym]:-}"
   [[ -z "$sym" ]] && return 1
-  [[ -r /proc/kallsyms ]] || return 2
+  if [[ ! -r /proc/kallsyms ]]; then
+    _ev SKIP "Kernel symbol (/proc/kallsyms)" "/proc/kallsyms not readable — symbol '${sym}' could not be checked"
+    return 2
+  fi
   # Zeroed addresses (00000000) indicate kptr_restrict is hiding them
   if grep -q "^[^0].*\b${sym}\b" /proc/kallsyms 2>/dev/null; then
+    _ev FLAG "Kernel symbol (/proc/kallsyms)" "symbol '${sym}' present with a non-zero address — code path exposed"
     return 0
   fi
+  _ev PASS "Kernel symbol (/proc/kallsyms)" "symbol '${sym}' not visible (absent or zeroed by kptr_restrict)"
   return 1
 }
 
@@ -2694,7 +3115,8 @@ _emit_cve_finding() {
     "$full_what" \
     "${CVE_FIELD[impact]:-No impact description available.}" \
     "${CVE_FIELD[exploit]:-No exploitability assessment available.}" \
-    "${rec_text} ${mit_text} ${patch_note}"
+    "${rec_text} ${mit_text} ${patch_note}" \
+    "$(_ev_pack)"
 }
 
 # ---------------------------------------------------------------------------
@@ -2706,6 +3128,9 @@ _run_single_cve_check() {
   local cve="${CVE_FIELD[cve_id]:-UNKNOWN}"
   local name="${CVE_FIELD[name]:-$cve}"
   local check_type="${CVE_FIELD[check_type]:-kernel_version}"
+
+  # Fresh evidence trail for this CVE
+  _ev_reset
 
   # --- Config completeness check -------------------------------------------
   # Every CVE entry must carry both a remediation (rec) and a mitigating-factor
@@ -2753,14 +3178,20 @@ _run_single_cve_check() {
       *)                        _entry_norm="$_entry_arch" ;;
     esac
     if [[ "$_arch_norm" != "$_entry_norm" ]]; then
+      _ev SKIP "Architecture gate" \
+        "CVE requires ${_entry_arch} (normalised ${_entry_norm}); host is ${_mach} (normalised ${_arch_norm}) — not applicable, version/module tests skipped"
       ok "${cve} (${name}): not applicable on this architecture (requires ${_entry_arch}; running ${_mach})"
+      _ev_print_stdout
       add_finding "cve_${_cve_id_slug}" "INFO" \
         "${name} (${cve}) — not applicable on ${_mach} (requires ${_entry_arch})" \
         "CVE: ${cve}. This vulnerability affects the ${_entry_arch} architecture only. The host reports ${_mach} (uname -m), so the kernel-version/module/socket test is not applicable and was skipped to avoid a false positive on kernel version alone." \
         "N/A — wrong architecture." "N/A" \
-        "No action required on this architecture. If you also operate ${_entry_arch} hosts, run the audit there and apply the vendor patch: ${CVE_FIELD[rec]:-see advisory}."
+        "No action required on this architecture. If you also operate ${_entry_arch} hosts, run the audit there and apply the vendor patch: ${CVE_FIELD[rec]:-see advisory}." \
+        "$(_ev_pack)"
       return
     fi
+    _ev INFO "Architecture gate" \
+      "CVE requires ${_entry_arch} (normalised ${_entry_norm}); host ${_mach} (normalised ${_arch_norm}) matches — proceeding"
   fi
 
   case "$check_type" in
@@ -2775,14 +3206,17 @@ _run_single_cve_check() {
           none)          _fx_tag=" [no fixed version recorded]" ;;
         esac
         warn "${cve} (${name}): kernel ${kver} appears in the affected version range${_fx_tag}"
+        _ev_print_stdout
         _emit_cve_finding "kernel ${kver} in affected range (introduced: ${CVE_FIELD[introduced]:-unknown}, fixed_versions: ${_fx})"
       else
         ok "${cve} (${name}): kernel ${kver} appears outside affected range"
+        _ev_print_stdout
         add_finding "cve_${_cve_id_slug}" "INFO" \
           "${name} (${cve}) — kernel ${kver} appears patched" \
           "CVE: ${cve}. Kernel ${kver} is at or above the fixed version for this series, or below the introduced version. fixed_versions: ${CVE_FIELD[fixed_versions]:-none}." \
           "N/A — kernel version check passed." "N/A" \
-          "Continue to apply kernel updates. Verify with your distribution's security advisory."
+          "Continue to apply kernel updates. Verify with your distribution's security advisory." \
+          "$(_ev_pack)"
       fi
       ;;
 
@@ -2792,14 +3226,17 @@ _run_single_cve_check() {
       loaded_mods=$(_check_module_loaded)
       if [[ $? -eq 0 ]]; then
         warn "${cve} (${name}): vulnerable module(s) loaded: ${loaded_mods}"
+        _ev_print_stdout
         _emit_cve_finding "module(s) loaded: ${loaded_mods}"
       else
         ok "${cve} (${name}): no vulnerable modules loaded (${CVE_FIELD[module_names]:-none})"
+        _ev_print_stdout
         add_finding "cve_${_cve_id_slug}" "INFO" \
           "${name} (${cve}) — no vulnerable modules loaded" \
           "CVE: ${cve}. Module(s) ${CVE_FIELD[module_names]:-none} are not currently loaded in /proc/modules. Note: without a blacklist entry, auto-loading on socket creation remains possible." \
           "N/A — modules not loaded." "N/A" \
-          "Add a modprobe blacklist entry even when modules are not loaded: ${CVE_FIELD[mitigation]:-see vendor advisory}."
+          "Add a modprobe blacklist entry even when modules are not loaded: ${CVE_FIELD[mitigation]:-see vendor advisory}." \
+          "$(_ev_pack)"
       fi
       ;;
 
@@ -2810,11 +3247,14 @@ _run_single_cve_check() {
       sock_result=$?
       if [[ $sock_result -eq 0 ]]; then
         warn "${cve} (${name}): socket family AF=${CVE_FIELD[socket_af]} is accessible"
+        _ev_print_stdout
         _emit_cve_finding "socket AF=${CVE_FIELD[socket_af]} SOCK=${CVE_FIELD[socket_type]} accessible from container"
       elif [[ $sock_result -eq 2 ]]; then
         info "${cve} (${name}): socket check skipped (python3 not available)"
+        _ev_print_stdout
       else
         ok "${cve} (${name}): socket AF=${CVE_FIELD[socket_af]} not accessible"
+        _ev_print_stdout
       fi
       ;;
 
@@ -2825,11 +3265,14 @@ _run_single_cve_check() {
       sym_result=$?
       if [[ $sym_result -eq 0 ]]; then
         warn "${cve} (${name}): kernel symbol '${CVE_FIELD[kallsyms_sym]}' visible in /proc/kallsyms"
+        _ev_print_stdout
         _emit_cve_finding "kernel symbol ${CVE_FIELD[kallsyms_sym]} present in /proc/kallsyms"
       elif [[ $sym_result -eq 2 ]]; then
         info "${cve} (${name}): /proc/kallsyms not readable — symbol check skipped"
+        _ev_print_stdout
       else
         ok "${cve} (${name}): symbol '${CVE_FIELD[kallsyms_sym]}' not visible (kptr_restrict may be active)"
+        _ev_print_stdout
       fi
       ;;
 
@@ -2846,11 +3289,16 @@ _run_single_cve_check() {
       _kernel_in_affected_range && kver_affected=true
 
       # 2 — module check
+      # NB: call the helpers directly (not via $(...)) so the evidence they
+      # append to CVE_EVIDENCE is not lost in a subshell. Their textual result
+      # is published via the _MOD_*_RESULT globals.
       if [[ "${CVE_FIELD[module_names]:-none}" != "none" ]]; then
-        local ml
-        ml=$(_check_module_loaded) && mod_loaded_list="$ml"
-        local mnb
-        mnb=$(_check_module_blacklisted) || mod_not_blacklisted="$mnb"
+        _MOD_LOADED_RESULT=""
+        _check_module_loaded >/dev/null
+        mod_loaded_list="$_MOD_LOADED_RESULT"
+        _MOD_NOT_BLACKLISTED_RESULT=""
+        _check_module_blacklisted >/dev/null
+        mod_not_blacklisted="$_MOD_NOT_BLACKLISTED_RESULT"
       fi
 
       # 3 — socket check
@@ -2874,30 +3322,42 @@ _run_single_cve_check() {
         esac
         if [[ -n "$mod_loaded_list" || "$socket_accessible" == true ]]; then
           overall_sev="${CVE_FIELD[severity]:-CRITICAL}"
+          _ev FLAG "Severity synthesis" \
+            "kernel affected AND (module loaded='${mod_loaded_list:-none}' OR socket accessible=${socket_accessible}) -> ${overall_sev}"
           crit "${cve} (${name}): LIKELY VULNERABLE — kernel ${kver} in range; module(s) loaded / socket accessible${_cfx_tag}"
+          _ev_print_stdout
           _emit_cve_finding \
             "kernel in affected range; loaded modules: ${mod_loaded_list:-none}; socket AF=${CVE_FIELD[socket_af]:-N/A} accessible: ${socket_accessible}; non-blacklisted: ${mod_not_blacklisted:-none}" \
             "$overall_sev"
         elif [[ -n "$mod_not_blacklisted" ]]; then
           overall_sev="HIGH"
+          _ev FLAG "Severity synthesis" \
+            "kernel affected; modules not loaded but not blacklisted (${mod_not_blacklisted}) — auto-load possible -> HIGH"
           warn "${cve} (${name}): kernel ${kver} in affected range; module(s) not loaded but NOT blacklisted (auto-load risk): ${mod_not_blacklisted}${_cfx_tag}"
+          _ev_print_stdout
           _emit_cve_finding \
             "kernel in affected range; modules not currently loaded but not blacklisted — auto-load on socket creation is possible: ${mod_not_blacklisted}" \
             "HIGH"
         else
           overall_sev="MEDIUM"
+          _ev FLAG "Severity synthesis" \
+            "kernel affected; modules not loaded and appear blacklisted/absent — interim mitigation likely, patch still required -> MEDIUM"
           warn "${cve} (${name}): kernel ${kver} in affected range; modules appear blacklisted or absent${_cfx_tag}"
+          _ev_print_stdout
           _emit_cve_finding \
             "kernel in affected range; modules not loaded and appear blacklisted — interim mitigation may be in effect, but kernel patch is still required" \
             "MEDIUM"
         fi
       else
+        _ev PASS "Severity synthesis" "kernel not in affected range -> INFO (not vulnerable on version)"
         ok "${cve} (${name}): kernel ${kver} outside affected range or fixed"
+        _ev_print_stdout
         add_finding "cve_${_cve_id_slug}" "INFO" \
           "${name} (${cve}) — kernel ${kver} appears outside affected range" \
           "CVE: ${cve}. Compound check: kernel version check passed (not in affected range or at/above fixed version). Module status: loaded=${mod_loaded_list:-none}, not-blacklisted=${mod_not_blacklisted:-none}. Socket accessible: ${socket_accessible}." \
           "N/A — kernel version check passed." "N/A" \
-          "Verify with distribution advisory. Continue applying kernel updates."
+          "Verify with distribution advisory. Continue applying kernel updates." \
+          "$(_ev_pack)"
       fi
       ;;
 
@@ -2915,7 +3375,10 @@ _run_single_cve_check() {
       local ctx="manual/advisory tracking entry — no kernel version/module test applies"
       [[ -n "$comp" ]] && ctx="${ctx}; affected component: ${comp}"
       [[ -n "$comp_fixed" ]] && ctx="${ctx}; fixed in ${comp}: ${comp_fixed}"
+      _ev SKIP "Automated detection" \
+        "no kernel-version/module/socket test applies; tracked as advisory at severity ${msev}${comp:+; component=${comp}}${comp_fixed:+; component fixed=${comp_fixed}} — confirm via dedicated check / installed component version"
       warn "${cve} (${name}): advisory tracking entry (severity ${msev}) — verify via dedicated check / component version"
+      _ev_print_stdout
       _emit_cve_finding "$ctx" "$msev"
       ;;
 
@@ -3019,7 +3482,7 @@ run_cve_checks() {
 if [[ "$OUTPUT_JSON" == false ]]; then
   echo -e "${BOLD}${CYAN}"
   echo "========================================================"
-  echo "  container_escape_audit.sh v4.0"
+  echo "  container_escape_audit.sh v4.4"
   echo "  Container escape vector detection"
   echo "  FOR AUTHORISED SECURITY ASSESSMENTS ONLY"
   echo "========================================================"
@@ -3095,6 +3558,12 @@ check_kata_agent_socket
 check_kvm_arm64_vgic_its
 
 # ---------------------------------------------------------------------------
+# Check 52: container runtime version probe (best-effort, read-only)
+# Provides the detection signal referenced by the manual-type runc CVE entries.
+# ---------------------------------------------------------------------------
+check_runtime_versions
+
+# ---------------------------------------------------------------------------
 # Config-driven CVE checks (reads cve_checks.conf)
 # ---------------------------------------------------------------------------
 # Resolve config file path: CLI flag > environment variable > script directory
@@ -3115,7 +3584,7 @@ if [[ "$OUTPUT_JSON" == false ]]; then
   echo -e "${BOLD}${CYAN}==================== SUMMARY ====================${RESET}"
   local_crit=0; local_high=0; local_med=0; local_info=0
   for id in "${FINDING_ORDER[@]}"; do
-    IFS="$SEP" read -r sev title _ _ _ _ <<< "${FINDINGS[$id]}"
+    IFS="$SEP" read -r sev title _ _ _ _ _ <<< "${FINDINGS[$id]}"
     case "$sev" in
       CRITICAL) (( local_crit++ )); echo -e "  ${RED}[CRITICAL]${RESET} $title" ;;
       HIGH)     (( local_high++ )); echo -e "  ${YELLOW}[HIGH    ]${RESET} $title" ;;
