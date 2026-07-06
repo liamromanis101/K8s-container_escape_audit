@@ -1,19 +1,42 @@
 ![Logo](k8s_logo.png)
 
 ![Version](https://img.shields.io/badge/version-4.3-blue)
-![Checks](https://img.shields.io/badge/checks-51-blue)
+![Checks](https://img.shields.io/badge/checks-52-blue)
 ![CVEs tracked](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fliamromanis101%2FK8s-container_escape_audit%2Fmain%2F.github%2Fbadges%2Fcve-count.json)
 ![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)
 
 # K8s_container-escape-audit
 
+Identify exploitable Kubernetes and Docker container escape paths before attackers do..
+
 A bash script that runs inside a Docker or Kubernetes container and checks for escape vectors. Built for penetration testers and security teams doing container security assessments.
 
 > For authorised security assessments only. Do not run this on systems you don't have explicit written permission to test.
 
+
+## Designed for
+
+The Kubernetes Container Escape Audit tool is designed for organisations that need to understand whether a compromised container could lead to host or cluster compromise.
+
+It is suitable for:
+
+- Platform Engineering teams validating cluster hardening.
+- DevSecOps teams integrating security into CI/CD pipelines.
+- Kubernetes Administrators responsible for securing production clusters.
+- Cloud Security Teams assessing container workloads across AWS, Azure and hybrid environments.
+- Red Teams and Penetration Testers performing authorised security assessments.
+
+## What makes this different?
+
+Most container security tools identify vulnerable packages or Kubernetes configuration issues.
+
+Kubernetes Container Escape Audit focuses on exploitability:
+- It evaluates whether an attacker who has already gained code execution inside a container could realistically escape that container, compromise the host, or move laterally through the cluster.
+- Rather than simply reporting CVEs, it analyses the conditions required for exploitation and provides practical remediation guidance.
+
 ## What it does
 
-`container_escape_audit.sh` v4.3 performs **51 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture, container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64), and an updateable database of recent kernel and runtime CVEs. All checks are strictly read-only — the script makes no changes to the system.
+`container_escape_audit.sh` v4.5 performs **52 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture (including SELinux/AppArmor enforcement), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64), container runtime version detection, and an updateable database of recent kernel and runtime CVEs. The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system.
 
 Each finding comes with a structured report entry:
 
@@ -35,19 +58,32 @@ One note on running as root: checks 1, 2, and 27 (privileged mode, dangerous cap
 
 Releases are published on GitHub with **SLSA Build Level 3 provenance**. Each release carries a signed `multiple.intoto.jsonl` attestation covering both `container_escape_audit.sh` and `cve_checks.conf`, so you can cryptographically confirm that the files you're about to run as root were built by this repository's release workflow and have not been tampered with. See [Verifying the download](#verifying-the-download) below. Because this tool is intended to run with elevated privileges during assessments, verifying provenance before each use is strongly recommended.
 
-## Latest updates (2026-06)
+## Latest updates
+
+### v4.5 — accurate version verdicts (NVD-backed CVE engine)
+
+This release makes the CVE engine's version checking genuinely accurate, replacing the previous naive per-series comparison that could both miss vulnerable kernels and clear patched ones.
+
+- **Distro- and flavour-aware verdict engine.** The engine now detects the running distribution, release, kernel flavour (generic / aws / azure / gcp / vanilla), and installed kernel package version, then judges each CVE with the version scheme that actually applies — upstream-stable, Debian (`dpkg`-correct, epoch- and `~`-aware), or Ubuntu (`ABI.upload`) — never one comparator for all. Every verdict is one of **vulnerable / not-affected / defer-to-vendor / unknown**; absent or unmatched data resolves to *unknown*, never a silent pass.
+- **NVD-backed data pass across the entire database.** All 20 version-dependent kernel CVEs were re-verified against NVD CPE configuration ranges and converted to an enriched schema (`upstream_ranges`, `distro_status`, `vendor_defer`). This corrected real errors in the previous data: a duplicated CVE ID (an OverlayFS entry mis-tagged as CVE-2025-38352 — actually **CVE-2023-0386**), several wrong `introduced` floors, stale fixed-version points, and numerous missing affected ranges that had left older vulnerable kernels undetected.
+- **Closed-world model for upstream kernels.** For a vanilla/mainline kernel, NVD's affected ranges are treated as authoritative and complete: inside any range ⇒ vulnerable, otherwise ⇒ not-affected. This is applied only to vanilla kernels — distro-packaged kernels (whose back-ported fixes hide behind an unchanged base version) are judged by their `distro_status` package versions or deferred to the vendor, so back-ported fixes are never mistaken for exposure.
+- **Per-distribution status, including partial fixes.** `distro_status` records fixed / not-affected / vulnerable per release, so an entry can express (for example) "Debian Trixie fixed, Bookworm and Bullseye still vulnerable" — a state the old single-fixed-version format could not represent.
+- **SELinux enforcement check + system-state registry (check 11).** SELinux enforcing/permissive/disabled is now detected (previously only named), and generic system-state signals (MAC enforcement, user-namespace restriction, `/proc/sys` writability, CAP_SYS_ADMIN, root-mapping) are published to an internal registry that composite CVE checks consume instead of re-deriving. A `--dump-state` flag prints the registry.
+- **New check 52 — container runtime version probe.** Best-effort, read-only detection of reachable runc / containerd / cri-o versions, giving the runc CVE entries a real three-state detection signal.
+- **Expanded behavioural checks.** Check 2 now decodes 16 dangerous capabilities (adding CAP_BPF, CAP_PERFMON, CAP_DAC_OVERRIDE, CAP_MKNOD, CAP_SYS_CHROOT, CAP_NET_RAW, CAP_SYSLOG); check 11 reports `no_new_privs`; check 30 adds `impersonate` and `pods/attach` RBAC probes; check 47 adds `rds_tcp`, `vsock`, and `vmw_vsock_virtio_transport` to the dangerous-modules audit.
+
+### v4.4 and earlier (2026-06)
 
 Coverage expanded following the CVE monitor's gap analysis:
 
 - **Four new read-only probes (checks 48-51):** io_uring reachability, kTLS/sockmap ULP attach surface, Kata Containers agent-socket exposure, and arm64 KVM/vGIC-ITS guest-to-host exposure.
 - **Eight new CVE database entries**, including the first public KVM/arm64 guest-to-host escape (CVE-2026-46316 "ITScape", CVSS 9.3), the io_uring zcrx out-of-bounds write (CVE-2026-43121), and the ksmbd remote kernel use-after-free (CVE-2022-47939).
-- **Two further kernel-LPE entries (2026-06-29):** CVE-2026-43503 ("DirtyClone", CVSS 8.8) — the fourth DirtyFrag-family page-cache-write variant, paired with Fragnesia/CVE-2026-46300 as one split remediation — and CVE-2026-46331 ("pedit COW", CVSS 8.5) — a partial-COW page-cache corruption in the `net/sched` `act_pedit` traffic-control action with a public `packet_edit_meme` PoC. This same pass confirmed previously-`VERIFY` fixed versions for several earlier entries against the Debian/Ubuntu trackers.
-- **Two historical runc container-escape entries:** CVE-2019-5736 (the classic `/proc/self/exe` host-binary overwrite, CVSS 8.6, CISA KEV, fixed in runc 1.0-rc7) and CVE-2024-21626 ("Leaky Vessels", `process.cwd` leaked-fd breakout, CVSS 8.6, fixed in runc 1.1.12). Both are `check_type=manual` inventory entries — the host runc version is generally not observable from inside a container, so a clean result should be treated as *unknown* rather than *safe*, with the runc-version signal from check 26 as the practical detection hook. The Leaky Vessels BuildKit siblings (CVE-2024-23651/23652/23653) are intentionally excluded as out-of-scope image-build tooling.
-- **New `check_type=manual`** in the CVE engine, letting the database track container-runtime and userspace CVEs (Kata, containerd, Podman, runc, cgroup release_agent) that do not reduce to a kernel version or module test.
-- **`ksmbd` added** to the dangerous-modules audit (check 47); **AppArmor enforcement-artifact inspection** added to check 11.
-- **SLSA Build L3 provenance** now published with each release (signed `multiple.intoto.jsonl`), verifiable with `slsa-verifier`.
+- **Two further kernel-LPE entries (2026-06-29):** CVE-2026-43503 ("DirtyClone", CVSS 8.8) — the fourth DirtyFrag-family page-cache-write variant, paired with Fragnesia/CVE-2026-46300 as one split remediation — and CVE-2026-46331 ("pedit COW", CVSS 8.5) — a partial-COW page-cache corruption in the `net/sched` `act_pedit` traffic-control action with a public `packet_edit_meme` PoC.
+- **Two historical runc container-escape entries:** CVE-2019-5736 (the classic `/proc/self/exe` host-binary overwrite, CVSS 8.6, CISA KEV, fixed in runc 1.0-rc7) and CVE-2024-21626 ("Leaky Vessels", `process.cwd` leaked-fd breakout, CVSS 8.6, fixed in runc 1.1.12). Both are `check_type=manual` entries — the host runc version is generally not observable from inside a container, so a clean result is treated as *unknown* rather than *safe*, with check 52's runtime-version probe as the practical detection hook. The Leaky Vessels BuildKit siblings (CVE-2024-23651/23652/23653) are intentionally excluded as out-of-scope image-build tooling.
+- **`check_type=manual`** in the CVE engine, letting the database track container-runtime and userspace CVEs (Kata, containerd, Podman, runc, cgroup release_agent) that do not reduce to a kernel version or module test.
+- **SLSA Build L3 provenance** published with each release (signed `multiple.intoto.jsonl`), verifiable with `slsa-verifier`.
 
-Most kernel-CVE `fixed_versions` / `introduced` fields are now confirmed against the Debian and Ubuntu security trackers. The few that remain marked `VERIFY` in `cve_checks.conf` (CVE-2026-46316, CVE-2026-43121, CVE-2026-43494, and the Podman `component_fixed`) need confirmation against your distribution's security tracker before being relied upon for patch decisions. ITScape is arm64-only.
+Kernel-CVE version data is now verified against NVD and the Debian/Ubuntu security trackers. A few distro-specific package strings remain marked `VERIFY` / `approx` in `cve_checks.conf` (notably the Podman `component_fixed`, and some exact Ubuntu `ABI.upload` builds) and should be confirmed against your distribution's security tracker before being relied upon for patch decisions. ITScape is arm64-only.
 
 
 ## Checks
@@ -147,7 +183,7 @@ These checks read sysctl values from `/proc/sys` and compare them against the re
 | 46 | esp4 / esp6 / rxrpc modules | not loaded / blacklisted | Dirty Frag (CVE-2026-43284/43500), Fragnesia (CVE-2026-46300), DirtyClone (CVE-2026-43503) |
 | 47 | Dangerous loaded modules audit | — | 15 modules checked incl. algif_aead, ksmbd, rds, rds_tcp, nf_tables, dccp, sctp, bluetooth |
 
-### Runtime escape-surface probes (new checks 48-51)
+### Runtime escape-surface probes (new checks 48-52)
 
 Read-only reachability probes for container-escape and LPE attack surfaces flagged by the CVE monitor's gap analysis. Each tests whether a subsystem is reachable from the current context (syscall, socket, or socket-file presence) without attempting to trigger any vulnerability. They complement the version/module/socket detection done by the CVE engine.
 
@@ -157,12 +193,17 @@ Read-only reachability probes for container-escape and LPE attack surfaces flagg
 | 49 | kTLS / sockmap ULP attachable (`setsockopt(TCP_ULP, "tls")`) | MEDIUM | kTLS/sockmap "Reverse Order" UAF, `tls_sk_proto_close()` UAF (no CVE yet) |
 | 50 | Kata Containers agent socket / shared dir exposure | HIGH/MEDIUM | CVE-2026-41326 (CopyFile symlink subversion) |
 | 51 | KVM/arm64 vGIC-ITS guest-to-host exposure (arch-aware) | HIGH/INFO | CVE-2026-46316 (ITScape) |
+| 52 | Container runtime version probe (runc / containerd / cri-o, best-effort read-only) | CRITICAL/MEDIUM/INFO | CVE-2019-5736, CVE-2024-21626 (runc escapes) |
 
 > Check 51 is architecture-aware: on x86_64 it reports "not applicable"; on arm64 it distinguishes a KVM host (`/dev/kvm` present) from a guest vantage point (GICv3/ITS present, no `/dev/kvm`) and adjusts severity accordingly.
+
+> Check 52 reads any reachable runc / containerd / cri-o binary and runs `<binary> --version` (never executing untrusted output, never writing). Because a container usually cannot see the host runtime binary, it uses a three-state verdict: a reachable version is compared directly; if none is reachable but the process is unmapped in-container root, it reports the runc-escape preconditions as *potentially exposed*; otherwise the version is *unknown* — never silently *safe*.
 
 ### Config-driven CVE checks
 
 CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with twenty-seven entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
+
+Kernel-CVE entries carry authoritative NVD version data in an enriched schema: `upstream_ranges` (NVD CPE affected/fixed ranges for vanilla kernels), `distro_status` (per-distribution-release fixed / not-affected / vulnerable, with exact package versions for Debian and Ubuntu), and `vendor_defer` (distributions such as RHEL / Amazon / SUSE whose back-ports can't be judged from a version string). The engine reads these to produce a **vulnerable / not-affected / defer / unknown** verdict appropriate to the running system, rather than a naive comparison.
 
 | CVE | Name | CVSS | ITW | CISA KEV |
 |-----|------|------|-----|----------|
@@ -180,7 +221,7 @@ CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The
 | CVE-2025-21756 | Attack of the Vsock | 7.8 | | |
 | CVE-2025-38352 | Chronomaly | 7.0 | ✓ | |
 | CVE-2025-38617 | Packet Socket Race | 7.8 | | |
-| CVE-2025-38352 | OverlayFS SetUID Copy | 7.8 | ✓ | ✓ |
+| CVE-2023-0386 | OverlayFS SetUID Copy-Up (FUSE) Privilege Escalation | 7.8 | ✓ | ✓ |
 | CVE-2022-0847 | DirtyPipe | 7.8 | | |
 | CVE-2016-5195 | DirtyCOW | 7.8 | ✓ | ✓ |
 | CVE-2026-46316 | ITScape (KVM/arm64 guest-to-host escape) | 9.3 | | |
@@ -194,11 +235,11 @@ CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The
 | CVE-2024-21626 | runc process.cwd Leaked-FD Container Breakout (Leaky Vessels) | 8.6 | | |
 | CVE-2022-0492 | cgroup release_agent Escape | 7.0 | ✓ | ✓ |
 
-> **Kernel CVEs** (CVE-2026-46316, CVE-2026-43121, CVE-2022-47939) use the standard `kernel_version` / `compound` check types. **Runtime / userspace CVEs** (CVE-2026-41326 Kata, CVE-2026-46680 containerd, CVE-2026-55686 Podman, CVE-2026-41579 / CVE-2019-5736 / CVE-2024-21626 runc, CVE-2022-0492 cgroup) use the new `check_type=manual` — they do not reduce to a kernel version or module test, so the engine emits a tracking finding for inventory while the live detection is done by a dedicated script check (see checks 12, 26, 47, 50, 51). The package fix is recorded in the `component_fixed` field. Note that CVE-2019-5736 and CVE-2024-21626 (Leaky Vessels) are historical runc escapes retained for inventory completeness: the host runc version is usually not visible from inside a container, so a clean result for these should be read as *unknown* rather than *safe* absent host-side inspection or the runc-version signal from check 26.
+> **Kernel CVEs** use the `kernel_version` or `compound` check types and are judged by the NVD-backed version engine (vulnerable / not-affected / defer / unknown). **Runtime / userspace CVEs** (CVE-2026-41326 Kata, CVE-2026-46680 containerd, CVE-2026-55686 Podman, CVE-2026-41579 / CVE-2019-5736 / CVE-2024-21626 runc, CVE-2022-0492 cgroup) use `check_type=manual` — they do not reduce to a kernel version or module test, so the engine emits a tracking finding with the component fix recorded in `component_fixed`, while live detection is done by a dedicated script check (e.g. check 52's runtime-version probe for runc). CVE-2022-0492 (cgroup) is a dual-nature entry: it is `manual` (its exploitability depends on the behavioural cgroup-v1 / CAP_SYS_ADMIN check) but also carries NVD `upstream_ranges` that the engine surfaces as a supporting version signal. For the historical runc escapes (CVE-2019-5736, CVE-2024-21626), the host runc version is usually not visible from inside a container, so a clean result is read as *unknown* rather than *safe* absent the check-52 runtime-version signal or host-side inspection.
 
 > **DirtyFrag family.** CVE-2026-43503 (DirtyClone), CVE-2026-46300 (Fragnesia), and CVE-2026-43284 / CVE-2026-43500 (Dirty Frag) are sibling page-cache-write LPEs sharing one primitive: file-backed page-cache memory treated as a writable network buffer because the `SKBFL_SHARED_FRAG` marker is dropped along some skb path. **Important:** CVE-2026-46300 and CVE-2026-43503 are a single upstream remediation split across two CVE IDs — the kernel CNA assigned 43503 to the *second* Fragnesia commit (`48f6a5356a33`), and both ship together in the same vendor advisories (e.g. Debian DSA-6295-1). Track and patch them as a pair; a host fixed for one but not the other is not protected. The esp4/esp6/rxrpc module audit (check 46) and the kernel-version test together gate this family.
 
-> Most kernel-CVE `fixed_versions` / `cvss` fields are now confirmed against the Debian security tracker and Ubuntu/NVD (CVE-2026-43503, CVE-2026-46331, CVE-2026-46300, CVE-2026-46333, CVE-2026-23111). A few entries still carry `VERIFY` markers where backports were mid-rollout at publication — **CVE-2026-46316** (ITScape), **CVE-2026-43121** (io_uring zcrx), **CVE-2026-43494** (PinTheft), and the `component_fixed` for **CVE-2026-55686** (Podman). Confirm any `VERIFY` field against your distribution's security tracker before relying on a "patched" verdict, since backports vary by vendor, and recheck ITW / CISA KEV flags against the current KEV catalog and NVD. Note CVE-2026-46333's CVSS is disputed (NVD 5.5 vs Red Hat/Qualys "Important"); the database uses 7.8 for practical-impact alerting. ITScape (CVE-2026-46316) is **arm64-only**; its `arch=arm64` key means the engine reports it as N/A on non-arm64 hosts (see [Architecture-specific CVEs](#architecture-specific-cves)), and check 51 provides an architecture-aware behavioural probe.
+> All version-dependent kernel CVEs now carry NVD-verified `upstream_ranges` (and `distro_status` where Debian/Ubuntu package versions are confirmed). The remaining items needing confirmation before a "patched" verdict is relied upon are: **CVE-2026-46316** (ITScape — no NVD entry published yet; encoded with its introduced floor only, so 6.9+ arm64 kernels are treated as not-vulnerable pending fixed-version data), the `component_fixed` for **CVE-2026-55686** (Podman — awaiting the version from GHSA-q6r4-3wmg-fwcq), and some exact Ubuntu `ABI.upload` package builds and Debian package strings marked `[approx]` in the conf. Confirm these against your distribution's security tracker. Note CVE-2026-46333's CVSS is disputed (NVD 5.5 vs Red Hat/Qualys "Important"); the database uses 7.8 for practical-impact alerting. ITScape (CVE-2026-46316) is **arm64-only**; its `arch=arm64` key means the engine reports it as N/A on non-arm64 hosts (see [Architecture-specific CVEs](#architecture-specific-cves)), and check 51 provides an architecture-aware behavioural probe.
 
 ## Usage
 
@@ -261,7 +302,7 @@ Then verify (optionally pin the expected tag with `--source-tag`):
 slsa-verifier verify-artifact container_escape_audit.sh cve_checks.conf \
   --provenance-path multiple.intoto.jsonl \
   --source-uri github.com/liamromanis101/K8s-container_escape_audit \
-  --source-tag v4.3
+  --source-tag v4.5
 ```
 
 The provenance file is named `multiple.intoto.jsonl` because each release attests to more than one artifact. Always verify the files **as downloaded from the release** — the verifier compares the exact bytes you pass against the signed digests, so a locally modified copy will (correctly) fail.
@@ -276,6 +317,8 @@ The provenance file is named `multiple.intoto.jsonl` because each release attest
 --no-report        Skip writing the report file
 --cve-conf <file>  Path to CVE database file
                    Default: cve_checks.conf in the same directory as the script
+--dump-state       Print the internal system-state registry (MAC/userns/proc-sys
+                   signals) after the run — useful for debugging CVE verdicts
 ```
 
 ### Examples
@@ -468,7 +511,7 @@ Checks that won't fire here (require real infrastructure): Check 15 (cloud IMDS)
 
 ```
 ========================================================
-  container_escape_audit.sh v4.3
+  container_escape_audit.sh v4.5
   Container escape vector detection
   FOR AUTHORISED SECURITY ASSESSMENTS ONLY
 ========================================================
@@ -1107,6 +1150,9 @@ severity=HIGH
 check_type=compound
 introduced=6.1
 fixed_versions=6.6:6.6.50 6.12:6.12.5
+upstream_ranges=introduced|6.1 range|6.1|6.6.50 range|6.7|6.12.5
+distro_status=ubuntu|24.04|generic|fixed|6.8.0-50.50 debian|bookworm|fixed|6.1.120-1 debian|bullseye|vulnerable
+vendor_defer=rhel|RHSA-2025-XXXX amazon|ALAS-CVE-2025-XXXXX
 itw=no
 poc_public=yes
 cisa_kev=no
@@ -1122,6 +1168,12 @@ exploit=How hard it is to exploit...
 rec=How to fix it...
 ```
 
+**Version fields (preferred, NVD-backed):**
+- `upstream_ranges` — the authoritative source for **vanilla/mainline** kernels, taken from the NVD CPE configuration. Tokens are `introduced|<version>` (lower bound; below it ⇒ not-affected) and `range|<from-inclusive>|<fixed-exclusive>` (an affected interval). A vanilla kernel inside any range is vulnerable; outside all ranges it is not-affected (closed-world). Delimiter is `|` — never `:`, because Debian epochs use `:`. When NVD writes "Up to (**including**) X", encode the exclusive bound as the next patch release so X itself stays vulnerable.
+- `distro_status` — per-distribution-release status for **packaged** kernels: `distro|release[|flavour]|status[|version]`, where status is `fixed` (with a package version), `not-affected`, or `vulnerable`. This is authoritative for distro kernels, whose back-ported fixes are invisible in the base version string. Ubuntu versions compare with the `ABI.upload` scheme; Debian with `dpkg` rules.
+- `vendor_defer` — distributions (RHEL, Amazon, SUSE) whose back-port status can't be judged from a version string; the engine reports *defer to vendor advisory* rather than guessing.
+- `fixed_versions` — the legacy flat field, still read as a fallback for entries not yet migrated.
+
 To disable an entry without removing it, prefix its `cve_id` line with `#`.
 
 **Every entry must include both `rec` and `mitigation`.** The `rec` field is the full remediation (usually "patch to version X"); the `mitigation` field is an interim compensating control that reduces risk before patching (for example a `modprobe` blacklist, a sysctl, or a seccomp rule). Both are surfaced together in each active finding's recommendation, so an operator always sees a fix *and* a stop-gap. If no interim control exists, set `mitigation=none` — the finding will then state "Interim mitigation: none available — patching/upgrading is the only remediation." A missing (rather than `none`) `mitigation` or `rec` field triggers an `[INFO]` warning at load time so the gap is visible. Inline `# comments` are stripped from machine-parsed fields (versions, enums, socket params, `arch`) but preserved verbatim in prose fields (`what`, `impact`, `exploit`, `rec`, `mitigation`, `notes`), so keep prose-field annotations inside the sentence rather than as trailing comments.
@@ -1130,11 +1182,11 @@ To disable an entry without removing it, prefix its `cve_id` line with `#`.
 
 | Type | What it does |
 |------|-------------|
-| `kernel_version` | Compares `uname -r` against `introduced` and `fixed_versions` |
+| `kernel_version` | Judges the running kernel against the entry's `upstream_ranges` / `distro_status` / `vendor_defer` (falling back to legacy `fixed_versions`) and returns a **vulnerable / not-affected / defer / unknown** verdict, using the detected distro, release, flavour and installed package version with the correct per-scheme comparator. Absent or unmatched data ⇒ *unknown*, never a silent pass. |
 | `module_loaded` | Checks `/proc/modules` for the listed `module_names` |
 | `socket_family` | Attempts to open a socket with the given `socket_af` / `socket_type` / `socket_proto` |
-| `compound` | Runs all three and synthesises a combined severity |
-| `manual` | Advisory/tracking entry for runtime or userspace CVEs that do not reduce to a kernel test. Emits a finding at the configured `severity` for inventory; live detection is handled by a dedicated script check named in the entry's `rec`/`notes`. Optional `component` / `component_affected` / `component_fixed` keys document the affected package version. |
+| `compound` | Runs the version verdict plus module and socket checks and synthesises a combined severity; a *defer*/*unknown* version verdict yields a "verify" finding rather than a clean pass |
+| `manual` | Advisory/tracking entry for runtime or userspace CVEs that do not reduce to a kernel test. Emits a finding at the configured `severity` for inventory; live detection is handled by a dedicated script check named in the entry's `rec`/`notes`. Optional `component` / `component_affected` / `component_fixed` keys document the affected package version. A `manual` entry may also carry version fields (e.g. cgroup CVE-2022-0492), which the engine surfaces as a **supporting** signal alongside the behavioural verdict. |
 
 ### Architecture-specific CVEs
 

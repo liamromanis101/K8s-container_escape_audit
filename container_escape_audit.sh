@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# container_escape_audit.sh  —  v4.4
+# container_escape_audit.sh  —  v4.5
 # Copyright (c) 2026 Liam Romanis
 #
 # Licence: Creative Commons Attribution-NonCommercial 4.0 International
@@ -43,6 +43,7 @@ set -uo pipefail
 OUTPUT_JSON=false
 QUIET=false
 NO_REPORT=false
+DUMP_STATE=false
 REPORT_FILE="container_escape_report_$(date +%Y%m%d_%H%M%S).txt"
 CVE_CONF=""
 
@@ -53,6 +54,7 @@ while [[ $# -gt 0 ]]; do
     --no-report)  NO_REPORT=true ;;
     --report)     shift; REPORT_FILE="$1" ;;
     --cve-conf)   shift; CVE_CONF="$1" ;;
+    --dump-state) DUMP_STATE=true ;;
     *) echo "Unknown option: $1" >&2 ;;
   esac
   shift
@@ -83,6 +85,38 @@ add_finding() {
 }
 
 # ---------------------------------------------------------------------------
+# Generic system-state registry
+# ---------------------------------------------------------------------------
+# Standard checks record generic, CVE-agnostic facts about the system here so
+# that later composite CVE checks can reference them instead of re-deriving the
+# same signal. Keys are stable identifiers (e.g. MAC_ENFORCING, USERNS_RESTRICTED);
+# values are one of: true / false / unknown  (or a short token where a boolean
+# is insufficient, e.g. MAC_MODE=enforcing|permissive|disabled|none).
+#
+# Rationale (see design notes): a fact like "is an enforcing LSM active" or
+# "are unprivileged user namespaces restricted" is a property of the system,
+# not of any one CVE. Computing it once and publishing it here avoids every
+# CVE check re-implementing AppArmor/SELinux/userns probing, and means adding a
+# new standard signal automatically benefits every CVE that consumes it.
+declare -A SYS_STATE
+
+# set_state KEY VALUE  — publish a generic system-state fact.
+set_state() {
+  SYS_STATE["$1"]="$2"
+}
+
+# get_state KEY [DEFAULT]  — read a fact; prints DEFAULT (or "unknown") if unset.
+get_state() {
+  local key="$1" default="${2:-unknown}"
+  if [[ -n "${SYS_STATE[$key]+x}" ]]; then
+    printf '%s' "${SYS_STATE[$key]}"
+  else
+    printf '%s' "$default"
+  fi
+}
+
+
+# ---------------------------------------------------------------------------
 # Terminal logging helpers
 # ---------------------------------------------------------------------------
 info()  { [[ "$QUIET" == false && "$OUTPUT_JSON" == false ]] && echo -e "${CYAN}[INFO]${RESET}  $*"; }
@@ -105,6 +139,7 @@ hdr()   { [[ "$OUTPUT_JSON" == false ]] && echo -e "\n${BOLD}${CYAN}--- $* ---${
 CVE_EVIDENCE=()
 EUS=$'\x1e'   # unit separator between outcome/label/detail within one entry
 EROW=$'\x1d'  # row separator between evidence entries when packed into a field
+KVER_VERDICT=""   # set by _kernel_in_affected_range: fixed|not-affected|vulnerable|defer|unknown
 
 _ev_reset() { CVE_EVIDENCE=(); }
 
@@ -493,6 +528,13 @@ check_capabilities() {
 
   local cap_dec found_any=false
   cap_dec=$(printf "%d" "0x${capeff}")
+  # Publish the CAP_SYS_ADMIN signal (bit 21) — a generic precondition consumed
+  # by several composite CVE checks (unrestricted userns creation, /proc/sys).
+  if (( (cap_dec & (1 << 21)) != 0 )); then
+    set_state CAP_SYS_ADMIN "true"
+  else
+    set_state CAP_SYS_ADMIN "false"
+  fi
   for bit in "${!CAP_NAME[@]}"; do
     local mask=$(( 1 << bit ))
     if (( (cap_dec & mask) != 0 )); then
@@ -621,6 +663,15 @@ check_mounts() {
 
 check_proc() {
   hdr "5. /proc filesystem exposure"
+
+  # Publish the generic "/proc/sys writable from here" signal for composite CVE
+  # checks (privileged-container indicator; gates several page-cache and
+  # core_pattern-based escapes). core_pattern is the canonical probe point.
+  if [[ -w /proc/sys/kernel/core_pattern ]]; then
+    set_state PROC_SYS_WRITABLE "true"
+  else
+    set_state PROC_SYS_WRITABLE "false"
+  fi
 
   if [[ -w /proc/sys/kernel/core_pattern ]]; then
     crit "/proc/sys/kernel/core_pattern is writable"
@@ -896,6 +947,82 @@ check_security_profiles() {
   elif [[ "$aa_present" == true ]]; then
     info "AppArmor LSM enabled=${aa_enforcing}; loaded profiles=${aa_profiles_count}; parser=${aa_parser}"
   fi
+
+  # --- SELinux enforcement --------------------------------------------------
+  # Previously only named in this check's heading with no logic behind it.
+  # SELinux is a generic system-state signal: multiple CVEs (e.g. CIFSwitch's
+  # cifs.upcall path, the runc maskedPaths CVEs) are mitigated by an enforcing
+  # policy, so the fact is computed once here and published to SYS_STATE for any
+  # composite CVE check to consume.
+  local se_mode="none" se_source=""
+  if command -v getenforce &>/dev/null; then
+    case "$(getenforce 2>/dev/null)" in
+      Enforcing)  se_mode="enforcing" ;;
+      Permissive) se_mode="permissive" ;;
+      Disabled)   se_mode="disabled" ;;
+    esac
+    se_source="getenforce"
+  fi
+  # Fallback / corroboration via the SELinuxfs mount (works without the userspace tool).
+  if [[ "$se_mode" == "none" && -r /sys/fs/selinux/enforce ]]; then
+    case "$(cat /sys/fs/selinux/enforce 2>/dev/null)" in
+      1) se_mode="enforcing" ;;
+      0) se_mode="permissive" ;;
+    esac
+    se_source="/sys/fs/selinux/enforce"
+  fi
+  # /etc/selinux/config tells us the configured (boot) mode even if the tool is absent.
+  local se_configured="unknown"
+  if [[ -r /etc/selinux/config ]]; then
+    se_configured=$(awk -F= '/^SELINUX=/{print $2; exit}' /etc/selinux/config 2>/dev/null | tr -d '[:space:]')
+    [[ -z "$se_configured" ]] && se_configured="unknown"
+  fi
+
+  case "$se_mode" in
+    enforcing)
+      ok "SELinux: enforcing (${se_source})"
+      ;;
+    permissive)
+      warn "SELinux: permissive — policy loaded but not blocking (${se_source})"
+      add_finding "selinux_permissive" "MEDIUM" \
+        "SELinux is in permissive mode (not enforcing)" \
+        "SELinux is present and a policy is loaded, but the mode is permissive: violations are logged, not denied (observed via ${se_source}; /etc/selinux/config SELINUX=${se_configured}). The system therefore gains SELinux's audit visibility but none of its access-control protection." \
+        "Any CVE mitigation that relies on an enforcing SELinux policy — for example confinement of rootful helpers such as cifs.upcall, or LSM-label enforcement that defeats the runc maskedPaths bypass (CVE-2025-52881) — is NOT in effect while SELinux is permissive." \
+        "Low as a standalone item; a force-multiplier because it removes a defence-in-depth layer other findings assume." \
+        "Set SELinux to enforcing: 'setenforce 1' for the running system and SELINUX=enforcing in /etc/selinux/config to persist across reboot, after confirming the policy does not break required workloads."
+      ;;
+    disabled)
+      warn "SELinux: disabled"
+      add_finding "selinux_disabled" "MEDIUM" \
+        "SELinux is disabled" \
+        "SELinux is disabled on this system (observed via ${se_source}; /etc/selinux/config SELINUX=${se_configured}). No SELinux mandatory access control is in effect." \
+        "SELinux-based mitigations for other findings in this report are not available. On distributions whose default protection against CVEs like CIFSwitch depends on an enforcing SELinux policy, that protection is absent." \
+        "Low standalone; a force-multiplier removing a defence-in-depth layer." \
+        "If the platform expects SELinux (RHEL/Fedora/CentOS family), re-enable it: SELINUX=enforcing in /etc/selinux/config, ensure a policy package is installed, relabel if required (touch /.autorelabel), and reboot."
+      ;;
+    none)
+      # Distinguish "SELinux tooling/fs absent" (common on Debian/Ubuntu) from a finding.
+      info "SELinux: not present (no getenforce, no selinuxfs) — configured mode: ${se_configured}"
+      ;;
+  esac
+
+  # --- Publish consolidated MAC state to the registry -----------------------
+  # MAC_MODE captures the strongest enforcing LSM observed; MAC_ENFORCING is the
+  # convenience boolean most CVE checks will consume.
+  local mac_mode="none" mac_enforcing="false"
+  if [[ "$se_mode" == "enforcing" ]]; then
+    mac_mode="selinux-enforcing"; mac_enforcing="true"
+  elif [[ "$aa_present" == true && "$aa_enforcing" == "enabled" ]]; then
+    mac_mode="apparmor-enabled"; mac_enforcing="true"
+  elif [[ "$se_mode" == "permissive" ]]; then
+    mac_mode="selinux-permissive"; mac_enforcing="false"
+  elif [[ "$se_mode" == "disabled" || "$aa_enforcing" == "disabled" ]]; then
+    mac_mode="present-disabled"; mac_enforcing="false"
+  fi
+  set_state MAC_MODE "$mac_mode"
+  set_state MAC_ENFORCING "$mac_enforcing"
+  set_state SELINUX_MODE "$se_mode"
+  set_state APPARMOR_STATE "$aa_enforcing"
 }
 
 check_cgroup_release_agent() {
@@ -1291,6 +1418,7 @@ check_user_namespace_mapping() {
   fi
 
   if [[ "$uid" == "0" && "$user_ns_isolated" == false ]]; then
+    set_state ROOT_UNMAPPED "true"
     warn "Running as UID 0 with no user namespace remapping — root-in-container = root-on-host"
     add_finding "uid_zero_no_userns" "HIGH" \
       "Running as UID 0 with no user namespace remapping" \
@@ -1299,8 +1427,12 @@ check_user_namespace_mapping() {
       "Not a standalone exploit, but a force multiplier. Eliminates a key isolation layer." \
       "1) Enable user namespace remapping in Docker: set 'userns-remap: default' in /etc/docker/daemon.json. 2) Set runAsNonRoot: true and runAsUser: <non-zero> in pod security context. 3) Deploy rootless Podman or rootless containerd where possible."
   elif [[ "$uid" != "0" ]]; then
+    set_state ROOT_UNMAPPED "false"
     ok "Running as non-root UID $uid — UID 0 mapping not applicable"
+  else
+    set_state ROOT_UNMAPPED "false"
   fi
+  set_state USERNS_REMAPPED "$user_ns_isolated"
 }
 
 check_ebpf_exposure() {
@@ -2078,6 +2210,7 @@ check_kh_userns() {
     if [[ "$ns_max" != "UNREADABLE" ]]; then
       if [[ "$ns_max" == "0" ]]; then
         ok "user.max_user_namespaces=0 — unprivileged user namespace creation disabled (hardened)"
+        set_state USERNS_RESTRICTED "true"
         return
       else
         val="$ns_max"
@@ -2088,15 +2221,18 @@ check_kh_userns() {
 
   if [[ "$val" == "UNREADABLE" ]]; then
     info "unprivileged user namespace status not determinable from this container"
+    set_state USERNS_RESTRICTED "unknown"
     return
   fi
 
   if [[ "$val" == "0" && "$param_name" == "kernel.unprivileged_userns_clone" ]]; then
     ok "unprivileged_userns_clone=0 — unprivileged user namespaces disabled (hardened)"
+    set_state USERNS_RESTRICTED "true"
     return
   fi
 
   if [[ "$val" == "1" || ("$param_name" != "kernel.unprivileged_userns_clone" && "$val" != "0") ]]; then
+    set_state USERNS_RESTRICTED "false"
     add_finding "kh_unprivileged_userns" "HIGH" \
       "Unprivileged user namespace creation is enabled — exposes significant kernel attack surface" \
       "Kernel parameter: ${param_name}=${val}. Unprivileged user namespace creation is enabled. Any unprivileged user can call unshare(CLONE_NEWUSER) to create a new user namespace with their own UID mappings, gaining access to capabilities within that namespace and the ability to create further namespaces." \
@@ -2732,7 +2868,7 @@ _load_cve_block() {
   # annotate them in the config, e.g.  fixed_versions=6.18.16  # backport TBD.
   # Prose fields (what/impact/exploit/rec/notes/name/alias/mitigation) are left
   # byte-for-byte intact, since they legitimately contain '#' characters.
-  local _machine_fields=" cve_id cvss severity check_type introduced fixed_versions itw poc_public cisa_kev subsystem module_names socket_af socket_type socket_proto arch component component_affected component_fixed kallsyms_sym "
+  local _machine_fields=" cve_id cvss severity check_type introduced fixed_versions upstream_fixed upstream_ranges distro_status vendor_defer itw poc_public cisa_kev subsystem module_names socket_af socket_type socket_proto arch component component_affected component_fixed kallsyms_sym "
   local key rest
   while IFS='=' read -r key rest; do
     [[ -z "$key" || "$key" == \#* ]] && continue
@@ -2764,6 +2900,257 @@ _kver_to_int() {
   echo $(( maj * 1000000 + min * 1000 + pat ))
 }
 
+# ===========================================================================
+# ENRICHED VERSION ENGINE  (distro/flavour-aware, scheme-correct comparators)
+# ---------------------------------------------------------------------------
+# Consumes the enriched schema fields upstream_fixed / distro_status /
+# vendor_defer and produces an accurate five-state verdict. Validated against
+# the dpkg oracle and known Ubuntu/upstream orderings. Accuracy rule: any
+# unparseable version, unmatched flavour, or absent data resolves to UNKNOWN —
+# never silently to fixed/not-affected.
+# ===========================================================================
+
+# --- scheme-aware comparators (print -1 / 0 / 1) ---------------------------
+_ver_cmp_upstream() {
+  local a="$1" b="$2"; a="${a#v}"; b="${b#v}"
+  local a_main b_main a_rc b_rc
+  a_main="${a%%-rc*}"; b_main="${b%%-rc*}"
+  if [[ "$a" == *-rc* ]]; then a_rc="${a##*-rc}"; else a_rc="99999"; fi
+  if [[ "$b" == *-rc* ]]; then b_rc="${b##*-rc}"; else b_rc="99999"; fi
+  local IFS=.; local -a A=($a_main) B=($b_main); local i max=${#A[@]}
+  (( ${#B[@]} > max )) && max=${#B[@]}
+  for (( i=0; i<max; i++ )); do
+    local x="${A[i]:-0}" y="${B[i]:-0}"; x="${x//[!0-9]/}"; y="${y//[!0-9]/}"
+    x="${x:-0}"; y="${y:-0}"
+    (( 10#$x < 10#$y )) && { echo -1; return; }
+    (( 10#$x > 10#$y )) && { echo 1; return; }
+  done
+  (( 10#$a_rc < 10#$b_rc )) && { echo -1; return; }
+  (( 10#$a_rc > 10#$b_rc )) && { echo 1; return; }
+  echo 0
+}
+
+_ver_cmp_dpkg() {
+  local a="$1" b="$2"
+  if command -v dpkg >/dev/null 2>&1; then
+    if dpkg --compare-versions "$a" lt "$b"; then echo -1; return; fi
+    if dpkg --compare-versions "$a" gt "$b"; then echo 1; return; fi
+    echo 0; return
+  fi
+  _dpkg_fallback_cmp "$a" "$b"
+}
+
+_dpkg_fallback_cmp() {
+  local a="$1" b="$2" ea eb
+  [[ "$a" == *:* ]] || a="0:$a"; [[ "$b" == *:* ]] || b="0:$b"
+  ea="${a%%:*}"; eb="${b%%:*}"
+  (( ea < eb )) && { echo -1; return; }
+  (( ea > eb )) && { echo 1; return; }
+  _dpkg_cmp_frag "${a#*:}" "${b#*:}"
+}
+
+_dpkg_cmp_frag() {
+  local a="$1" b="$2"
+  while [[ -n "$a" || -n "$b" ]]; do
+    local an="" bn=""
+    while [[ -n "$a" && "${a:0:1}" =~ [^0-9] ]]; do an+="${a:0:1}"; a="${a:1}"; done
+    while [[ -n "$b" && "${b:0:1}" =~ [^0-9] ]]; do bn+="${b:0:1}"; b="${b:1}"; done
+    local i max=${#an}; (( ${#bn} > max )) && max=${#bn}
+    for (( i=0; i<max; i++ )); do
+      local va vb; va=$(_dpkg_char_order "${an:i:1}"); vb=$(_dpkg_char_order "${bn:i:1}")
+      (( va < vb )) && { echo -1; return; }
+      (( va > vb )) && { echo 1; return; }
+    done
+    local ad="" bd=""
+    while [[ -n "$a" && "${a:0:1}" =~ [0-9] ]]; do ad+="${a:0:1}"; a="${a:1}"; done
+    while [[ -n "$b" && "${b:0:1}" =~ [0-9] ]]; do bd+="${b:0:1}"; b="${b:1}"; done
+    ad="${ad:-0}"; bd="${bd:-0}"
+    local adn=$((10#$ad)) bdn=$((10#$bd))
+    (( adn < bdn )) && { echo -1; return; }
+    (( adn > bdn )) && { echo 1; return; }
+  done
+  echo 0
+}
+
+_dpkg_char_order() {
+  local c="$1"
+  [[ -z "$c" ]] && { echo 0; return; }
+  [[ "$c" == "~" ]] && { echo -1; return; }
+  [[ "$c" =~ [a-zA-Z] ]] && { printf '%d\n' "'$c"; return; }
+  printf '%d\n' $(( $(printf '%d' "'$c") + 256 ))
+}
+
+_ver_cmp_ubuntu() {
+  local a="$1" b="$2" a_up a_rest b_up b_rest
+  a_up="${a%%-*}"; a_rest="${a#*-}"; b_up="${b%%-*}"; b_rest="${b#*-}"
+  local c; c=$(_ver_cmp_upstream "$a_up" "$b_up"); [[ "$c" != "0" ]] && { echo "$c"; return; }
+  local a_abi="${a_rest%%.*}" a_upl="${a_rest#*.}" b_abi="${b_rest%%.*}" b_upl="${b_rest#*.}"
+  a_abi="${a_abi//[!0-9]/}"; b_abi="${b_abi//[!0-9]/}"; a_upl="${a_upl//[!0-9]/}"; b_upl="${b_upl//[!0-9]/}"
+  a_abi="${a_abi:-0}"; b_abi="${b_abi:-0}"; a_upl="${a_upl:-0}"; b_upl="${b_upl:-0}"
+  (( 10#$a_abi < 10#$b_abi )) && { echo -1; return; }
+  (( 10#$a_abi > 10#$b_abi )) && { echo 1; return; }
+  (( 10#$a_upl < 10#$b_upl )) && { echo -1; return; }
+  (( 10#$a_upl > 10#$b_upl )) && { echo 1; return; }
+  echo 0
+}
+
+# --- running-system detection (sets RUN_* globals; run once) ---------------
+RUN_DISTRO_ID=""; RUN_DISTRO_REL=""; RUN_KFLAVOUR=""; RUN_KVER_RAW=""; RUN_KPKG_VER=""
+detect_running_system() {
+  RUN_KVER_RAW="$(uname -r 2>/dev/null || echo unknown)"
+  local suffix="${RUN_KVER_RAW##*-}"
+  if [[ "$suffix" =~ ^[a-z][a-z0-9]*$ && "$suffix" != "$RUN_KVER_RAW" ]]; then
+    RUN_KFLAVOUR="$suffix"
+  else
+    RUN_KFLAVOUR="generic"
+  fi
+  [[ ! "$RUN_KVER_RAW" =~ - ]] && RUN_KFLAVOUR="vanilla"
+
+  RUN_DISTRO_ID="unknown"; RUN_DISTRO_REL="unknown"
+  if [[ -r /etc/os-release ]]; then
+    RUN_DISTRO_ID="$(awk -F= '/^ID=/{gsub(/"/,"",$2); print $2; exit}' /etc/os-release 2>/dev/null)"
+    RUN_DISTRO_REL="$(awk -F= '/^VERSION_ID=/{gsub(/"/,"",$2); print $2; exit}' /etc/os-release 2>/dev/null)"
+    if [[ "$RUN_DISTRO_ID" == "debian" ]]; then
+      local cn; cn="$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2; exit}' /etc/os-release 2>/dev/null)"
+      [[ -n "$cn" ]] && RUN_DISTRO_REL="$cn"
+    fi
+  fi
+  RUN_DISTRO_ID="${RUN_DISTRO_ID:-unknown}"; RUN_DISTRO_REL="${RUN_DISTRO_REL:-unknown}"
+
+  # Running kernel PACKAGE version (what distro_status compares against).
+  # Debian/Ubuntu: derive from the installed linux-image package; else uname -r.
+  RUN_KPKG_VER="$RUN_KVER_RAW"
+  if [[ "$RUN_KFLAVOUR" != "vanilla" ]] && command -v dpkg >/dev/null 2>&1; then
+    local pkgver
+    pkgver=$(dpkg-query -W -f='${Version}' "linux-image-${RUN_KVER_RAW}" 2>/dev/null)
+    if [[ -n "$pkgver" ]]; then
+      RUN_KPKG_VER="$pkgver"
+    else
+      # Fall back to reconstructing Ubuntu's UPSTREAM-ABI.UPLOAD from uname -r,
+      # e.g. 6.17.0-35-generic -> need the .upload; query the meta if possible.
+      # If we cannot get the packaged version, leave uname-derived and let the
+      # comparator/verdict degrade to UNKNOWN rather than guess.
+      RUN_KPKG_VER="$RUN_KVER_RAW"
+    fi
+  fi
+}
+
+# --- the five-state verdict ------------------------------------------------
+# Prints "<verdict>|<evidence>"  verdict ∈ fixed|vulnerable|not-affected|defer|unknown
+# --- NVD-range verdict for vanilla kernels ---------------------------------
+# upstream_ranges format (from NVD CPE configuration), space-separated tokens:
+#   introduced|<version>            global lower bound; below => not-affected
+#   range|<from_incl>|<fixed_excl>  affected interval [from_incl, fixed_excl)
+# A vanilla running version V is vulnerable iff it lies within any affected
+# range; not-affected if below introduced; fixed otherwise. Uses the validated
+# upstream comparator. Applied to VANILLA kernels only — never to distro
+# packages (whose base version string does not reflect back-ported fixes).
+nvd_vanilla_verdict() {
+  local V="$1" ranges="$2" introduced="" tok
+  for tok in $ranges; do
+    local IFS='|'; local -a f=($tok); unset IFS
+    [[ "${f[0]}" == "introduced" ]] && introduced="${f[1]}"
+  done
+  if [[ -n "$introduced" && "$(_ver_cmp_upstream "$V" "$introduced")" == "-1" ]]; then
+    echo "not-affected|vanilla ${V} < introduced ${introduced} (NVD range)"; return
+  fi
+  for tok in $ranges; do
+    local IFS='|'; local -a f=($tok); unset IFS
+    [[ "${f[0]}" == "range" ]] || continue
+    local from="${f[1]}" fixed="${f[2]}"
+    if [[ "$(_ver_cmp_upstream "$V" "$from")" != "-1" && "$(_ver_cmp_upstream "$V" "$fixed")" == "-1" ]]; then
+      echo "vulnerable|vanilla ${V} in NVD affected range [${from}, ${fixed}) — upstream fix at ${fixed}"; return
+    fi
+  done
+  echo "not-affected|vanilla ${V} outside all NVD affected ranges (patched-or-never-affected under closed-world model)"
+}
+
+cve_kernel_verdict() {
+  local up="${CVE_FIELD[upstream_fixed]:-}"
+  local ur="${CVE_FIELD[upstream_ranges]:-}"
+  local ds="${CVE_FIELD[distro_status]:-}"
+  local vd="${CVE_FIELD[vendor_defer]:-}"
+  local intro="${CVE_FIELD[introduced]:-0}"
+  local running_pkg="${RUN_KPKG_VER:-$RUN_KVER_RAW}"
+
+  if [[ -n "$ds" ]]; then
+    local tok
+    for tok in $ds; do
+      local IFS='|'; local -a f=($tok); unset IFS
+      local d="${f[0]}" rel="${f[1]}" flavour status version
+      case "${f[2]}" in
+        fixed|not-affected|vulnerable) flavour=""; status="${f[2]}"; version="${f[3]:-}" ;;
+        *) flavour="${f[2]}"; status="${f[3]}"; version="${f[4]:-}" ;;
+      esac
+      [[ "$d" == "$RUN_DISTRO_ID" ]] || continue
+      [[ "$rel" == "$RUN_DISTRO_REL" ]] || continue
+      [[ -n "$flavour" && "$flavour" != "$RUN_KFLAVOUR" ]] && continue
+      case "$status" in
+        not-affected) echo "not-affected|distro_status: ${d}/${rel}${flavour:+/$flavour} marked not-affected"; return ;;
+        vulnerable)   echo "vulnerable|distro_status: ${d}/${rel}${flavour:+/$flavour} marked vulnerable (no fix in this package line)"; return ;;
+        fixed)
+          [[ -z "$version" ]] && { echo "unknown|${d}/${rel} says fixed but no version recorded"; return; }
+          local cmp
+          case "$d" in
+            ubuntu) cmp=$(_ver_cmp_ubuntu "$running_pkg" "$version") ;;
+            *)      cmp=$(_ver_cmp_dpkg "$running_pkg" "$version") ;;
+          esac
+          if [[ "$cmp" == "-1" ]]; then
+            echo "vulnerable|running ${running_pkg} < fixed ${version} on ${d}/${rel}${flavour:+/$flavour}"
+          else
+            echo "fixed|running ${running_pkg} >= fixed ${version} on ${d}/${rel}${flavour:+/$flavour}"
+          fi
+          return ;;
+      esac
+    done
+  fi
+
+  if [[ -n "$vd" ]]; then
+    local tok
+    for tok in $vd; do
+      local IFS='|'; local -a f=($tok); unset IFS
+      local d="${f[0]}" adv="${f[1]:-vendor advisory}"
+      [[ "$d" == "$RUN_DISTRO_ID" ]] && { echo "defer|${d}: consult ${adv} — backport status not derivable from version string"; return; }
+    done
+  fi
+
+  if [[ "$RUN_KFLAVOUR" == "vanilla" && -n "$ur" ]]; then
+    # NVD per-series ranges are the most authoritative upstream signal; use
+    # them in preference to the single-point upstream_fixed list when present.
+    nvd_vanilla_verdict "$RUN_KVER_RAW" "$ur"
+    return
+  fi
+
+  if [[ "$RUN_KFLAVOUR" == "vanilla" && -n "$up" ]]; then
+    local run_series="${RUN_KVER_RAW%.*}"; run_series="${run_series%%-*}"
+    local tok matched_ver="" mainline_ver=""
+    for tok in $up; do
+      local s="${tok%%:*}" v="${tok#*:}"
+      [[ "$s" == "mainline" ]] && { mainline_ver="$v"; continue; }
+      [[ "$s" == "$run_series" ]] && matched_ver="$v"
+    done
+    if [[ -n "$matched_ver" ]]; then
+      local cmp; cmp=$(_ver_cmp_upstream "$RUN_KVER_RAW" "$matched_ver")
+      [[ "$cmp" == "-1" ]] && echo "vulnerable|vanilla ${RUN_KVER_RAW} < upstream-stable fix ${matched_ver} (series ${run_series})" \
+                           || echo "fixed|vanilla ${RUN_KVER_RAW} >= upstream-stable fix ${matched_ver} (series ${run_series})"
+      return
+    fi
+    if [[ -n "$mainline_ver" ]]; then
+      local cmp; cmp=$(_ver_cmp_upstream "$RUN_KVER_RAW" "$mainline_ver")
+      [[ "$cmp" == "-1" ]] && echo "vulnerable|vanilla ${RUN_KVER_RAW} < mainline fix ${mainline_ver}, series ${run_series} absent from stable table" \
+                           || echo "fixed|vanilla ${RUN_KVER_RAW} >= mainline fix ${mainline_ver}"
+      return
+    fi
+  fi
+
+  if [[ -n "$intro" && "$intro" != "0" && "$RUN_KFLAVOUR" == "vanilla" ]]; then
+    local cmp; cmp=$(_ver_cmp_upstream "$RUN_KVER_RAW" "$intro")
+    [[ "$cmp" == "-1" ]] && { echo "not-affected|vanilla ${RUN_KVER_RAW} predates introduced ${intro}"; return; }
+  fi
+
+  echo "unknown|no matching fixed-version data for ${RUN_DISTRO_ID}/${RUN_DISTRO_REL} flavour=${RUN_KFLAVOUR} (running ${RUN_KVER_RAW}); cannot assert patched — verify against vendor tracker"
+}
+
 # ---------------------------------------------------------------------------
 # _kernel_in_affected_range
 # Returns 0 (true) if the running kernel is in the affected range for a CVE.
@@ -2779,6 +3166,35 @@ _kver_to_int() {
 #      fixed version for any series is <= running version.
 # ---------------------------------------------------------------------------
 _kernel_in_affected_range() {
+  # --- Preferred path: enriched schema (upstream_fixed/distro_status/vendor_defer)
+  # When any enriched field is present, use the accurate distro/flavour-aware
+  # verdict engine. Map its five states onto this function's affected/not
+  # contract, recording precise evidence. Absent/unknown => treat as affected
+  # (conservative) but labelled UNKNOWN so severity synthesis can reflect it.
+  if [[ -n "${CVE_FIELD[upstream_fixed]:-}" || -n "${CVE_FIELD[distro_status]:-}" || -n "${CVE_FIELD[vendor_defer]:-}" ]]; then
+    local vres verdict eviden
+    vres="$(cve_kernel_verdict)"
+    verdict="${vres%%|*}"; eviden="${vres#*|}"
+    case "$verdict" in
+      fixed)
+        _ev PASS "Version verdict (enriched)" "$eviden"
+        KVER_VERDICT="fixed"; return 1 ;;
+      not-affected)
+        _ev PASS "Version verdict (enriched)" "$eviden"
+        KVER_VERDICT="not-affected"; return 1 ;;
+      vulnerable)
+        _ev FLAG "Version verdict (enriched)" "$eviden"
+        KVER_VERDICT="vulnerable"; return 0 ;;
+      defer)
+        _ev INFO "Version verdict (enriched)" "$eviden"
+        KVER_VERDICT="defer"; return 0 ;;   # can't clear -> treat as affected, but INFO evidence
+      unknown|*)
+        _ev INFO "Version verdict (enriched)" "$eviden"
+        KVER_VERDICT="unknown"; return 0 ;;  # never a silent pass
+    esac
+  fi
+
+  # --- Legacy fallback: flat fixed_versions= (transitional, pre-migration) ---
   local introduced="${CVE_FIELD[introduced]:-0}"
   local fixed_str="${CVE_FIELD[fixed_versions]:-none}"
   local kver
@@ -3198,22 +3614,50 @@ _run_single_cve_check() {
 
     # -----------------------------------------------------------------------
     kernel_version)
+      KVER_VERDICT=""
       if _kernel_in_affected_range; then
-        local _fx="${CVE_FIELD[fixed_versions]:-none}"
-        local _fx_tag=""
-        case "$_fx" in
-          VERIFY|verify) _fx_tag=" [fixed version UNCONFIRMED — flagged conservatively]" ;;
-          none)          _fx_tag=" [no fixed version recorded]" ;;
+        # Affected-or-inconclusive. Distinguish confirmed-vulnerable from
+        # defer/unknown so we don't overstate confidence either way.
+        case "$KVER_VERDICT" in
+          defer)
+            warn "${cve} (${name}): running on a vendor-tracked distro — version string cannot confirm patch status; consult the vendor advisory"
+            _ev_print_stdout
+            add_finding "cve_${_cve_id_slug}" "MEDIUM" \
+              "${name} (${cve}) — patch status must be confirmed via vendor advisory" \
+              "CVE: ${cve}. The running distribution backports fixes, so the kernel version string alone cannot determine whether this CVE is patched. Distro=${RUN_DISTRO_ID}/${RUN_DISTRO_REL}, kernel=${RUN_KVER_RAW}." \
+              "Undetermined from version alone — do not assume patched. Verify against the vendor security advisory for this CVE." "N/A" \
+              "Check your distribution's advisory for ${cve} and confirm the installed kernel package meets or exceeds the fixed build." \
+              "$(_ev_pack)"
+            ;;
+          unknown)
+            warn "${cve} (${name}): no fixed-version data matched this system — patch status UNKNOWN (not assumed safe)"
+            _ev_print_stdout
+            add_finding "cve_${_cve_id_slug}" "MEDIUM" \
+              "${name} (${cve}) — patch status unknown for this system" \
+              "CVE: ${cve}. No fixed-version data in the database matched distro=${RUN_DISTRO_ID}/${RUN_DISTRO_REL} flavour=${RUN_KFLAVOUR} (kernel ${RUN_KVER_RAW}), so patch status cannot be asserted." \
+              "Undetermined — treated as potentially affected rather than silently passed. Verify against the vendor tracker." "N/A" \
+              "Confirm exposure to ${cve} using your distribution's security tracker and the installed kernel package version." \
+              "$(_ev_pack)"
+            ;;
+          *)
+            local _fx="${CVE_FIELD[fixed_versions]:-none}"
+            local _fx_tag=""
+            case "$_fx" in
+              VERIFY|verify) _fx_tag=" [fixed version UNCONFIRMED — flagged conservatively]" ;;
+              none)          [[ -z "${CVE_FIELD[distro_status]:-}${CVE_FIELD[upstream_fixed]:-}" ]] && _fx_tag=" [no fixed version recorded]" ;;
+            esac
+            warn "${cve} (${name}): kernel ${kver} appears in the affected version range${_fx_tag}"
+            _ev_print_stdout
+            _emit_cve_finding "kernel ${kver} in affected range (verdict: ${KVER_VERDICT:-affected}; introduced: ${CVE_FIELD[introduced]:-unknown})"
+            ;;
         esac
-        warn "${cve} (${name}): kernel ${kver} appears in the affected version range${_fx_tag}"
-        _ev_print_stdout
-        _emit_cve_finding "kernel ${kver} in affected range (introduced: ${CVE_FIELD[introduced]:-unknown}, fixed_versions: ${_fx})"
       else
-        ok "${cve} (${name}): kernel ${kver} appears outside affected range"
+        # Not affected — either confirmed fixed or genuinely not-affected.
+        ok "${cve} (${name}): kernel ${kver} appears outside affected range (${KVER_VERDICT:-patched})"
         _ev_print_stdout
         add_finding "cve_${_cve_id_slug}" "INFO" \
-          "${name} (${cve}) — kernel ${kver} appears patched" \
-          "CVE: ${cve}. Kernel ${kver} is at or above the fixed version for this series, or below the introduced version. fixed_versions: ${CVE_FIELD[fixed_versions]:-none}." \
+          "${name} (${cve}) — kernel ${kver} appears patched (${KVER_VERDICT:-patched})" \
+          "CVE: ${cve}. Verdict: ${KVER_VERDICT:-patched}. Distro=${RUN_DISTRO_ID}/${RUN_DISTRO_REL} flavour=${RUN_KFLAVOUR}, kernel ${RUN_KVER_RAW}." \
           "N/A — kernel version check passed." "N/A" \
           "Continue to apply kernel updates. Verify with your distribution's security advisory." \
           "$(_ev_pack)"
@@ -3349,15 +3793,32 @@ _run_single_cve_check() {
             "MEDIUM"
         fi
       else
-        _ev PASS "Severity synthesis" "kernel not in affected range -> INFO (not vulnerable on version)"
-        ok "${cve} (${name}): kernel ${kver} outside affected range or fixed"
-        _ev_print_stdout
-        add_finding "cve_${_cve_id_slug}" "INFO" \
-          "${name} (${cve}) — kernel ${kver} appears outside affected range" \
-          "CVE: ${cve}. Compound check: kernel version check passed (not in affected range or at/above fixed version). Module status: loaded=${mod_loaded_list:-none}, not-blacklisted=${mod_not_blacklisted:-none}. Socket accessible: ${socket_accessible}." \
-          "N/A — kernel version check passed." "N/A" \
-          "Verify with distribution advisory. Continue applying kernel updates." \
-          "$(_ev_pack)"
+        # kver_affected is false, but the five-state verdict distinguishes a
+        # genuine not-affected/fixed from an inconclusive defer/unknown. Only the
+        # former is a clean pass; defer/unknown must warn rather than reassure.
+        case "$KVER_VERDICT" in
+          defer|unknown)
+            local _incon_sev="MEDIUM"
+            _ev INFO "Severity synthesis" \
+              "kernel version verdict '${KVER_VERDICT}' is inconclusive (not a confirmed fix); module state: loaded='${mod_loaded_list:-none}', not-blacklisted='${mod_not_blacklisted:-none}', socket=${socket_accessible} -> ${_incon_sev} (verify)"
+            warn "${cve} (${name}): kernel patch status ${KVER_VERDICT} (not confirmed fixed) — verify; module(s) loaded='${mod_loaded_list:-none}' socket=${socket_accessible}"
+            _ev_print_stdout
+            _emit_cve_finding \
+              "kernel version verdict inconclusive (${KVER_VERDICT}) — patch status not confirmed; loaded modules: ${mod_loaded_list:-none}; socket accessible: ${socket_accessible}. Verify against vendor advisory before assuming patched." \
+              "$_incon_sev"
+            ;;
+          *)
+            _ev PASS "Severity synthesis" "kernel not affected (${KVER_VERDICT:-not-affected}) -> INFO (not vulnerable on version)"
+            ok "${cve} (${name}): kernel ${kver} not affected (${KVER_VERDICT:-not-affected})"
+            _ev_print_stdout
+            add_finding "cve_${_cve_id_slug}" "INFO" \
+              "${name} (${cve}) — kernel ${kver} appears not affected (${KVER_VERDICT:-not-affected})" \
+              "CVE: ${cve}. Compound check: kernel version verdict=${KVER_VERDICT:-not-affected} (not in affected range / at or above fix). Module status: loaded=${mod_loaded_list:-none}, not-blacklisted=${mod_not_blacklisted:-none}. Socket accessible: ${socket_accessible}." \
+              "N/A — kernel version check passed." "N/A" \
+              "Verify with distribution advisory. Continue applying kernel updates." \
+              "$(_ev_pack)"
+            ;;
+        esac
       fi
       ;;
 
@@ -3366,17 +3827,40 @@ _run_single_cve_check() {
       # Advisory/tracking entry for CVEs that do NOT reduce to a kernel
       # version, module, or socket test (e.g. container-runtime / userspace
       # CVEs). The actual behavioural detection, if any, lives in a dedicated
-      # script check (named in the entry's rec/notes). Here we simply emit a
-      # finding at the configured severity so the CVE id appears in the report
-      # for inventory/compliance, with detection guidance carried in rec.
+      # script check (named in the entry's rec/notes). Here we emit a finding at
+      # the configured severity so the CVE id appears in the report for
+      # inventory/compliance, with detection guidance carried in rec.
       local msev="${CVE_FIELD[severity]:-MEDIUM}"
       local comp="${CVE_FIELD[component]:-}"
       local comp_fixed="${CVE_FIELD[component_fixed]:-}"
       local ctx="manual/advisory tracking entry — no kernel version/module test applies"
       [[ -n "$comp" ]] && ctx="${ctx}; affected component: ${comp}"
       [[ -n "$comp_fixed" ]] && ctx="${ctx}; fixed in ${comp}: ${comp_fixed}"
+
+      # Dual-nature entries (e.g. CVE-2022-0492 cgroup release_agent) carry
+      # enriched version data as a SUPPORTING signal even though the primary
+      # verdict is behavioural. If any version field is present, run the verdict
+      # and record it as evidence — it must not be silently ignored.
+      if [[ -n "${CVE_FIELD[upstream_ranges]:-}" || -n "${CVE_FIELD[distro_status]:-}" || -n "${CVE_FIELD[upstream_fixed]:-}" || -n "${CVE_FIELD[vendor_defer]:-}" ]]; then
+        local mvres mverdict meviden
+        mvres="$(cve_kernel_verdict)"
+        mverdict="${mvres%%|*}"; meviden="${mvres#*|}"
+        case "$mverdict" in
+          vulnerable)
+            _ev FLAG "Version signal (supporting)" "$meviden — running kernel lacks the fix; combined with the behavioural precondition this CVE is exploitable"
+            ctx="${ctx}; version signal: VULNERABLE (${meviden})" ;;
+          fixed|not-affected)
+            _ev PASS "Version signal (supporting)" "$meviden — kernel carries the fix/hardening; exploitability depends on the behavioural precondition only"
+            ctx="${ctx}; version signal: ${mverdict} (${meviden})" ;;
+          defer)
+            _ev INFO "Version signal (supporting)" "$meviden" ;;
+          *)
+            _ev INFO "Version signal (supporting)" "$meviden" ;;
+        esac
+      fi
+
       _ev SKIP "Automated detection" \
-        "no kernel-version/module/socket test applies; tracked as advisory at severity ${msev}${comp:+; component=${comp}}${comp_fixed:+; component fixed=${comp_fixed}} — confirm via dedicated check / installed component version"
+        "primary detection is behavioural / component-version based; tracked as advisory at severity ${msev}${comp:+; component=${comp}}${comp_fixed:+; component fixed=${comp_fixed}} — confirm via dedicated check / installed component version"
       warn "${cve} (${name}): advisory tracking entry (severity ${msev}) — verify via dedicated check / component version"
       _ev_print_stdout
       _emit_cve_finding "$ctx" "$msev"
@@ -3396,6 +3880,11 @@ run_cve_checks() {
   local conf="${1:-$CVE_CONF}"
 
   hdr "CVE checks (config-driven) — ${conf}"
+
+  # Detect the running distro/release/flavour/package-version once, up front,
+  # so every kernel-version verdict uses accurate, scheme-correct comparison.
+  detect_running_system
+  info "Version context: distro=${RUN_DISTRO_ID}/${RUN_DISTRO_REL} flavour=${RUN_KFLAVOUR} kernel=${RUN_KVER_RAW} pkgver=${RUN_KPKG_VER}"
 
   if [[ ! -f "$conf" ]]; then
     warn "CVE config file not found: ${conf}"
@@ -3575,6 +4064,25 @@ if [[ -z "$CVE_CONF" ]]; then
   CVE_CONF="${SCRIPT_DIR}/cve_checks.conf"
 fi
 run_cve_checks "$CVE_CONF"
+
+# ---------------------------------------------------------------------------
+# System-state registry dump (--dump-state)
+# ---------------------------------------------------------------------------
+# Prints the generic system-state facts published by the standard checks. This
+# is the shared signal layer that composite CVE checks (step 2) will consume;
+# exposing it makes the inputs to those verdicts inspectable and aids debugging.
+if [[ "$DUMP_STATE" == true && "$OUTPUT_JSON" == false ]]; then
+  echo ""
+  echo -e "${BOLD}${CYAN}=============== SYSTEM-STATE REGISTRY ===============${RESET}"
+  if [[ "${#SYS_STATE[@]}" -eq 0 ]]; then
+    echo "  (empty — no standard checks published state)"
+  else
+    for k in $(printf '%s\n' "${!SYS_STATE[@]}" | sort); do
+      printf "  %-22s %s\n" "$k" "${SYS_STATE[$k]}"
+    done
+  fi
+  echo ""
+fi
 
 # ---------------------------------------------------------------------------
 # Terminal summary
