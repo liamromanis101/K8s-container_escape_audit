@@ -1,6 +1,6 @@
 ![Logo](k8s_logo.png)
 
-![Version](https://img.shields.io/badge/version-4.3-blue)
+![Version](https://img.shields.io/badge/version-4.6-blue)
 ![Checks](https://img.shields.io/badge/checks-52-blue)
 ![CVEs tracked](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fliamromanis101%2FK8s-container_escape_audit%2Fmain%2F.github%2Fbadges%2Fcve-count.json)
 ![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)
@@ -13,6 +13,7 @@ A bash script that runs inside a Docker or Kubernetes container and checks for e
 
 > For authorised security assessments only. Do not run this on systems you don't have explicit written permission to test.
 
+> There will be frequent updates to the script and the CVE database, so ensure you come back regularly to check or visit the website: https://liamromanis101.github.io/K8s-container_escape_audit/
 
 ## Designed for
 
@@ -36,7 +37,7 @@ Kubernetes Container Escape Audit focuses on exploitability:
 
 ## What it does
 
-`container_escape_audit.sh` v4.5 performs **52 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture (including SELinux/AppArmor enforcement), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64), container runtime version detection, and an updateable database of recent kernel and runtime CVEs. The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system.
+`container_escape_audit.sh` v4.6 performs **52 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture (including SELinux/AppArmor enforcement), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64), container runtime version detection, and an updateable database of recent kernel and runtime CVEs. The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system.
 
 Each finding comes with a structured report entry:
 
@@ -59,6 +60,17 @@ One note on running as root: checks 1, 2, and 27 (privileged mode, dangerous cap
 Releases are published on GitHub with **SLSA Build Level 3 provenance**. Each release carries a signed `multiple.intoto.jsonl` attestation covering both `container_escape_audit.sh` and `cve_checks.conf`, so you can cryptographically confirm that the files you're about to run as root were built by this repository's release workflow and have not been tampered with. See [Verifying the download](#verifying-the-download) below. Because this tool is intended to run with elevated privileges during assessments, verifying provenance before each use is strongly recommended.
 
 ## Latest updates
+
+### v4.6 — bug-fix pass, five new CVEs, and Container OS support
+
+This release fixes three detection-accuracy bugs found during review, adds five newly-disclosed CVEs, and hardens distribution coverage so the engine works correctly across the container OS landscape, not just Ubuntu.
+
+- **Severity synthesis no longer discards a confirmed module blacklist.** In `check_type=compound`, a module fully blacklisted in `/etc/modprobe.d` was previously silently overridden to CRITICAL whenever the CVE's socket-family check succeeded — even though that check only proves the generic socket *family* (e.g. AF_ALG core) is reachable, not that the specific blacklisted transform can load. The synthesis logic now recognizes four distinct states (module loaded / socket open with no gate / socket open but module blacklisted / fully mitigated) and downgrades to HIGH rather than CRITICAL when a blacklist is confirmed in place but can't be independently verified at bind()-level precision.
+- **Two broken `printf` mitigation commands fixed.** The `rec` fields for CVE-2026-43284 (Dirty Frag) and CVE-2026-43503 (DirtyClone) duplicated the correctly-quoted command from `mitigation` — but without the quotes and with a doubled backslash, so `\n` was stripped and word-split by the shell before `printf` ever saw it, silently truncating a two/three-line `modprobe.d` blacklist to the single word `install`. Fixed both, removed the duplication (rec now points to the mitigation field instead of re-stating it, closing the drift risk), and added a config-lint check that flags any future unquoted `printf` in `rec`/`mitigation` at load time.
+- **runc CVEs (CVE-2019-5736, CVE-2024-21626) now use check 52's live detection instead of a static advisory.** Previously, check 52 (`check_runtime_versions`) correctly probed the host's actual runc binary, but the CVE-database `manual` entries for these two CVEs never consulted its result — they always rendered the conf's static `component_fixed=1.0-rc7` text at CRITICAL regardless of the real installed version. Check 52 now caches its verdict globally, and the `manual` dispatch renders a **definitive** finding (CRITICAL if genuinely behind the fix, confirmed-not-vulnerable otherwise) whenever a runc binary was reachable, falling back to the original three-state advisory only when it wasn't.
+- **Five new CVE database entries** (2026-07 disclosures): **Januscape (CVE-2026-53359)**, a KVM/x86 shadow-MMU guest-to-host UAF, tracked alongside its required companion fix **CVE-2026-46113** (patching one without the other leaves the host exposed); **CVE-2026-53362**, an IPv6 fragmentation container escape; **Bad Epoll (CVE-2026-46242)**, an epoll `ep_remove()` race UAF that also roots Android v6.6+; and **GhostLock (CVE-2026-43499)**, a ~15-year-old futex priority-inheritance UAF (watch for the regression it introduced, CVE-2026-53166, in the first upstream fix attempt). None are CISA KEV-listed or confirmed exploited in the wild yet; several carry `VERIFY` markers where NVD had not published a CPE configuration at the time of writing — confirm against the vendor tracker before relying on them for automated severity scoring. Database total: 27 → 32 entries.
+- **Container OS support fixed for Amazon Linux, SUSE, and OpenShift/RHCOS.** The distro-ID normalization that feeds `distro_status`/`vendor_defer` matching previously used `/etc/os-release`'s `ID=` field verbatim, so real hosts silently failed to match the conf's vendor tokens: Amazon Linux 2/2023 report `ID=amzn` (conf uses `amazon`), SUSE reports `ID=sles` (conf uses `suse`), and OpenShift nodes (RHCOS) report `ID=rhcos` with no direct token at all despite the conf already carrying an `openshift|...` advisory row. All three now normalize correctly; RHCOS is dual-matched against both `openshift`-specific and general `rhel` rows, since it's genuinely RHEL-based (`ID_LIKE="rhel fedora"`) but also carries its own advisories. See [Container OS / distribution support](#container-os--distribution-support) for full coverage and known gaps (Alpine, Bottlerocket, Talos, Flatcar).
+- **Heuristic fallback for distro kernels with no matching conf data.** Previously, a distro-packaged kernel with no `distro_status`/`vendor_defer` row for its distribution returned a bare "unknown" with zero supporting signal. The engine now also compares the running kernel's base version against the CVE's NVD upstream ranges and surfaces that as clearly-labeled, non-authoritative context — never promoted to a verdict, since distro backports can move independently of the base version string in either direction, but useful evidence while a proper `distro_status` row is added. Also added the missing `ubuntu|24.04|...` row for Copy Fail (CVE-2026-31431), which is what surfaced this gap.
 
 ### v4.5 — accurate version verdicts (NVD-backed CVE engine)
 
@@ -197,11 +209,11 @@ Read-only reachability probes for container-escape and LPE attack surfaces flagg
 
 > Check 51 is architecture-aware: on x86_64 it reports "not applicable"; on arm64 it distinguishes a KVM host (`/dev/kvm` present) from a guest vantage point (GICv3/ITS present, no `/dev/kvm`) and adjusts severity accordingly.
 
-> Check 52 reads any reachable runc / containerd / cri-o binary and runs `<binary> --version` (never executing untrusted output, never writing). Because a container usually cannot see the host runtime binary, it uses a three-state verdict: a reachable version is compared directly; if none is reachable but the process is unmapped in-container root, it reports the runc-escape preconditions as *potentially exposed*; otherwise the version is *unknown* — never silently *safe*.
+> Check 52 reads any reachable runc / containerd / cri-o binary and runs `<binary> --version` (never executing untrusted output, never writing). Because a container usually cannot see the host runtime binary, it uses a three-state verdict: a reachable version is compared directly; if none is reachable but the process is unmapped in-container root, it reports the runc-escape preconditions as *potentially exposed*; otherwise the version is *unknown* — never silently *safe*. Its runc verdict is also cached and consulted directly by the CVE-database `manual` entries for CVE-2019-5736 and CVE-2024-21626 (see [Config-driven CVE checks](#config-driven-cve-checks)), so a reachable binary produces a definitive per-CVE finding rather than a static advisory.
 
 ### Config-driven CVE checks
 
-CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with twenty-seven entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
+CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with thirty-two entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
 
 Kernel-CVE entries carry authoritative NVD version data in an enriched schema: `upstream_ranges` (NVD CPE affected/fixed ranges for vanilla kernels), `distro_status` (per-distribution-release fixed / not-affected / vulnerable, with exact package versions for Debian and Ubuntu), and `vendor_defer` (distributions such as RHEL / Amazon / SUSE whose back-ports can't be judged from a version string). The engine reads these to produce a **vulnerable / not-affected / defer / unknown** verdict appropriate to the running system, rather than a naive comparison.
 
@@ -234,8 +246,15 @@ Kernel-CVE entries carry authoritative NVD version data in an enriched schema: `
 | CVE-2019-5736 | runc /proc/self/exe Host Binary Overwrite | 8.6 | ✓ | ✓ |
 | CVE-2024-21626 | runc process.cwd Leaked-FD Container Breakout (Leaky Vessels) | 8.6 | | |
 | CVE-2022-0492 | cgroup release_agent Escape | 7.0 | ✓ | ✓ |
+| CVE-2026-53359 | Januscape (KVM/x86 shadow-MMU guest-to-host UAF) | 8.8 | | |
+| CVE-2026-46113 | KVM Shadow-MMU UAF (Januscape companion) | VERIFY | | |
+| CVE-2026-53362 | IPv6 Fragmentation Container Escape | VERIFY | | |
+| CVE-2026-46242 | Bad Epoll (epoll `ep_remove()` race UAF) | VERIFY | | |
+| CVE-2026-43499 | GhostLock (futex priority-inheritance UAF) | VERIFY | | |
 
-> **Kernel CVEs** use the `kernel_version` or `compound` check types and are judged by the NVD-backed version engine (vulnerable / not-affected / defer / unknown). **Runtime / userspace CVEs** (CVE-2026-41326 Kata, CVE-2026-46680 containerd, CVE-2026-55686 Podman, CVE-2026-41579 / CVE-2019-5736 / CVE-2024-21626 runc, CVE-2022-0492 cgroup) use `check_type=manual` — they do not reduce to a kernel version or module test, so the engine emits a tracking finding with the component fix recorded in `component_fixed`, while live detection is done by a dedicated script check (e.g. check 52's runtime-version probe for runc). CVE-2022-0492 (cgroup) is a dual-nature entry: it is `manual` (its exploitability depends on the behavioural cgroup-v1 / CAP_SYS_ADMIN check) but also carries NVD `upstream_ranges` that the engine surfaces as a supporting version signal. For the historical runc escapes (CVE-2019-5736, CVE-2024-21626), the host runc version is usually not visible from inside a container, so a clean result is read as *unknown* rather than *safe* absent the check-52 runtime-version signal or host-side inspection.
+> **2026-07 sweep (CVE-2026-53359, -46113, -53362, -46242, -43499).** None are CISA KEV-listed or confirmed exploited in the wild as of this pass. Several fields carry `VERIFY` markers (CVSS, some `fixed_versions`, the CVE-2026-53362 ↔ pre-CVE "ipv6_frag_escape" identity correlation) where NVD had not published a CPE configuration at the time of writing — confirm against the vendor tracker before relying on them for automated severity scoring. Januscape (CVE-2026-53359) requires its companion fix, CVE-2026-46113, to be applied at the same time — the two patch separate use-after-frees disclosed months apart in the same shared Intel/AMD shadow-MMU code path, and patching only one leaves the host exploitable. Januscape is **x86_64-only** (`arch=x86_64`) — arm64 KVM has its own, unrelated bug (ITScape, CVE-2026-46316). GhostLock introduced a regression bug in its first upstream fix attempt, tracked separately as CVE-2026-53166 — confirm the *final* fix is present, not just any patch labelled as fixing GhostLock.
+
+> **Kernel CVEs** use the `kernel_version` or `compound` check types and are judged by the NVD-backed version engine (vulnerable / not-affected / defer / unknown). **Runtime / userspace CVEs** (CVE-2026-41326 Kata, CVE-2026-46680 containerd, CVE-2026-55686 Podman, CVE-2026-41579 / CVE-2019-5736 / CVE-2024-21626 runc, CVE-2022-0492 cgroup) use `check_type=manual` — they do not reduce to a kernel version or module test, so the engine emits a tracking finding with the component fix recorded in `component_fixed`, while live detection is done by a dedicated script check (e.g. check 52's runtime-version probe for runc). CVE-2022-0492 (cgroup) is a dual-nature entry: it is `manual` (its exploitability depends on the behavioural cgroup-v1 / CAP_SYS_ADMIN check) but also carries NVD `upstream_ranges` that the engine surfaces as a supporting version signal. For the historical runc escapes (CVE-2019-5736, CVE-2024-21626), the `manual` dispatch now consults check 52's cached runc-version result directly: if a runc binary was reachable anywhere in the run, these entries render a **definitive** verdict (confirmed vulnerable or confirmed patched) instead of the generic advisory; only when no runc binary was reachable does it fall back to the original *unknown-rather-than-safe* three-state advisory.
 
 > **DirtyFrag family.** CVE-2026-43503 (DirtyClone), CVE-2026-46300 (Fragnesia), and CVE-2026-43284 / CVE-2026-43500 (Dirty Frag) are sibling page-cache-write LPEs sharing one primitive: file-backed page-cache memory treated as a writable network buffer because the `SKBFL_SHARED_FRAG` marker is dropped along some skb path. **Important:** CVE-2026-46300 and CVE-2026-43503 are a single upstream remediation split across two CVE IDs — the kernel CNA assigned 43503 to the *second* Fragnesia commit (`48f6a5356a33`), and both ship together in the same vendor advisories (e.g. Debian DSA-6295-1). Track and patch them as a pair; a host fixed for one but not the other is not protected. The esp4/esp6/rxrpc module audit (check 46) and the kernel-version test together gate this family.
 
@@ -593,7 +612,7 @@ Checks 24-35 add coverage for more recent and less commonly checked vectors: Cop
 
 Checks 48-51 extend coverage to recently disclosed container-escape and LPE attack surfaces: io_uring reachability (CVE-2026-43121 zcrx out-of-bounds write and the broader io_uring LPE class), kTLS/sockmap ULP attach surface (the "Reverse Order" and `tls_sk_proto_close()` use-after-free reports), Kata Containers agent-socket exposure (CVE-2026-41326 CopyFile symlink subversion), and arm64 KVM/vGIC-ITS guest-to-host exposure (CVE-2026-46316 ITScape — the first public KVM/arm64 escape).
 
-The config-driven CVE engine additionally covers the most recent kernel privilege-escalation and container-escape issues, including ptrace credential hijack (CVE-2026-46333), nf_tables anonymous-set use-after-free (CVE-2026-23111), Fragnesia ESP (CVE-2026-46300), ITScape KVM/arm64 escape (CVE-2026-46316), the io_uring zcrx OOB write (CVE-2026-43121), the ksmbd remote kernel UAF (CVE-2022-47939), and a set of container-runtime CVEs tracked as advisory entries (Kata CVE-2026-41326, containerd CVE-2026-46680, Podman CVE-2026-55686, runc CVE-2026-41579 plus the historical runc escapes CVE-2019-5736 and CVE-2024-21626 "Leaky Vessels", and the classic cgroup release_agent escape CVE-2022-0492 / CISA KEV). See the [Recent CVEs](#recent-cves) detail section below.
+The config-driven CVE engine additionally covers the most recent kernel privilege-escalation and container-escape issues, including ptrace credential hijack (CVE-2026-46333), nf_tables anonymous-set use-after-free (CVE-2026-23111), Fragnesia ESP (CVE-2026-46300), ITScape KVM/arm64 escape (CVE-2026-46316), Januscape KVM/x86 shadow-MMU escape (CVE-2026-53359, with its required companion fix CVE-2026-46113), an IPv6 fragmentation container escape (CVE-2026-53362), the epoll `ep_remove()` race UAF Bad Epoll (CVE-2026-46242), the futex priority-inheritance UAF GhostLock (CVE-2026-43499), the io_uring zcrx OOB write (CVE-2026-43121), the ksmbd remote kernel UAF (CVE-2022-47939), and a set of container-runtime CVEs tracked as advisory entries (Kata CVE-2026-41326, containerd CVE-2026-46680, Podman CVE-2026-55686, runc CVE-2026-41579 plus the historical runc escapes CVE-2019-5736 and CVE-2024-21626 "Leaky Vessels", and the classic cgroup release_agent escape CVE-2022-0492 / CISA KEV). See the [Recent CVEs](#recent-cves) detail section below.
 
 ## Exploitation reference
 
@@ -950,6 +969,295 @@ Remediation:
 - Apply the distribution kernel update
 - The Dirty Frag mitigation (disabling/blacklisting the `esp4` and `esp6` modules) also protects against this issue where those modules aren't required
 
+#### CVE-2026-53359 -- Januscape (CRITICAL)
+
+Disclosed July 6 2026 by Hyunwoo Kim (V4bel) via Google's kvmCTF. A use-after-free in the Linux kernel's KVM hypervisor, in the legacy shadow-MMU code shared between the Intel and AMD backends — the first publicly known guest-to-host KVM escape triggerable on both vendors. The vulnerable code dates to 2010 and is normally bypassed by modern hardware-assisted paging (EPT/NPT), but any guest that enables nested virtualization forces the host back through the shadow MMU, exposing the bug. The public PoC reliably panics the host; the researcher states an unreleased exploit achieves host code execution. x86_64-only — arm64 KVM is unaffected (see ITScape, CVE-2026-46316, for the arm64 equivalent). **Must be patched alongside its companion, CVE-2026-46113** — a separate UAF disclosed months earlier in the same shared code path; patching only one CVE leaves the host exploitable via the other.
+
+The engine runs a `kernel_version` check gated `arch=x86_64` against the 2026-07-04 stable kernel batch.
+
+Remediation:
+- Patch to a kernel containing commit `81ccda30b4e8` (7.1.3, 6.18.38, 6.12.95, 6.6.144, 6.1.177, 5.15.211, or 5.10.260) **and** confirm commit `0cb2af2ea66a` (CVE-2026-46113) is also present
+- Interim: disable nested virtualization for untrusted guests (`options kvm_intel nested=0` / `options kvm_amd nested=0` in `/etc/modprobe.d/`, requires a module reload/reboot to take effect) — this is a host-hypervisor mitigation, not something reachable from inside a guest
+- Priority patch target: any host offering nested virtualization or "bring your own hypervisor" to untrusted tenants
+
+#### CVE-2026-53362 -- IPv6 Fragmentation Container Escape (CRITICAL)
+
+Fixed across the 2026-07-04 stable kernel batch. A bounds-check failure in `__ip6_append_data()`, the kernel function that assembles outgoing IPv6 fragments — building fragmented IPv6 traffic via a UDP socket using `MSG_SPLICE_PAGES` can write past the end of the socket buffer into adjacent `skb_shared_info`, chainable into arbitrary kernel read/write, credential overwrite, and container-to-host escape. Exploitation requires the ability to create network namespaces, which default RHEL 10-style configurations grant to unprivileged users via user namespaces. Likely — but not independently confirmed — the same bug Red Hat (RHSB-2026-009) and Finland's NCSC tracked pre-CVE-assignment as "ipv6_frag_escape".
+
+The engine runs a `kernel_version` check against the affected range (introduced 6.0).
+
+Remediation:
+- Apply the distribution kernel update from the 2026-07-04 batch
+- Interim: restrict unprivileged user-namespace creation (`kernel.unprivileged_userns_clone=0` on Debian/Ubuntu, `user.max_user_namespaces=0` on RHEL) — evaluate impact on rootless container workloads first
+- Priority patch target: CI runners, shared developer systems, and multi-tenant Kubernetes nodes on an affected kernel lineage
+
+#### CVE-2026-46242 -- Bad Epoll (CRITICAL)
+
+Disclosed July 3 2026 by Jaeyoung Chung (Seoul National University) via kernelCTF. A race-condition use-after-free in the epoll subsystem's `ep_remove()` cleanup path — winning a ~6-instruction race lets an unprivileged local process turn an 8-byte UAF write into full root via a cross-cache attack. Public PoC reports 99% reliability on a 6.12 kernel. Introduced in ~v6.4 (kernels based on v6.1 and earlier are not affected); the fix (commit `a6dc643c6931`) landed upstream in April 2026, before public disclosure. Reachable from inside Chrome's renderer sandbox, and also roots Android devices on kernel v6.6+. Sibling of CVE-2026-43074, an earlier race in the same code path that Anthropic's Mythos model reportedly found and which was already fixed with lower urgency — Mythos did not find this one.
+
+The engine runs a `kernel_version` check against the v6.4+ affected range. epoll is core kernel infrastructure with no module to blacklist and no runtime toggle.
+
+Remediation:
+- Apply the distribution kernel update containing commit `a6dc643c6931` — verify via package changelog, not `uname -r` alone
+- No configuration-level workaround exists; patching is the only remediation
+- Priority patch target: multi-tenant hosts, CI runners, and Android fleets on kernel v6.6+
+
+#### CVE-2026-43499 -- GhostLock (CRITICAL)
+
+Disclosed ~July 8 2026 by Nebula Security (team VEGA) via kernelCTF ($92,337 award). A ~15-year-old use-after-free in the kernel's futex priority-inheritance handling, triggerable via ordinary threading calls from any local unprivileged process — no special permission, configuration, or network access required. Working exploit reported 97% reliable and also escapes containers. Distro rollout was uneven at disclosure (some newest-release and cloud kernels patched, several LTS lines still vulnerable or in progress). **The original upstream fix introduced a separate regression bug, CVE-2026-53166** — confirm the final, cleaned-up fix is present, not just any patch labelled as fixing GhostLock. Documented by Nebula as the second half of an exploit chain ("IonStack") paired with a Firefox sandbox-escape bug (CVE-2026-10702, out of this database's kernel-only scope).
+
+The engine runs a `kernel_version` check; `fixed_versions` is intentionally left `VERIFY` pending confirmed per-distro backport versions rather than guessed.
+
+Remediation:
+- Install your distribution's *current* kernel build and explicitly confirm the advisory/package version — do not assume the first kernel labelled as containing a GhostLock fix is the final one
+- No complete interim workaround exists; `RANDOMIZE_KSTACK_OFFSET` and `STATIC_USERMODE_HELPER` build options raise exploit difficulty only, they do not close the hole
+- Priority patch target: shared/multi-tenant machines, cloud servers, containers, and CI runners — the triggering conditions are routine local-process behaviour
+
+#### CVE-2026-43494 -- PinTheft (HIGH)
+
+A reference-count flaw in the kernel's RDS (Reliable Datagram Sockets) zerocopy send path: a failed zerocopy send drops a pinned page reference it shouldn't, and the public exploit chains this with `io_uring` fixed buffers to make the kernel believe it still holds a valid page after that page has been freed and reused by the page cache — yielding the same controlled page-cache overwrite primitive as Copy Fail, reached through a different subsystem. The underlying bug dates to kernel 4.17 (2018); the working PoC additionally needs `io_uring` features present in roughly 6.6+. Two independent gates must both be open: the `rds`/`rds_tcp` modules loadable, and `io_uring` reachable — many distributions (Ubuntu included) already blacklist RDS by default, which alone breaks the chain.
+
+The engine runs a `compound` check cross-referencing the RDS module audit (check 47) with the `io_uring` reachability probe (check 48); a finding is most actionable when both gates are present.
+
+Remediation:
+- Apply the distribution kernel update backporting the RDS zerocopy fix — confirm the exact fixed package version against your vendor tracker, as backports vary
+- If RDS is not in use (rare outside Oracle RAC/InfiniBand HPC clusters), blacklist `rds`/`rds_tcp`; on 6.6+ also disable `io_uring` for unprivileged tasks (`kernel.io_uring_disabled=2`) to close the second half of the chain
+- Either control alone breaks the documented exploit — you don't need both, but confirm at least one is genuinely in place
+
+#### CVE-2026-43503 -- DirtyClone (CRITICAL)
+
+Disclosed by JFrog Security Research on June 25 2026, found while auditing the earlier Dirty Frag fixes. The fourth member of the DirtyFrag family: `__pskb_copy_fclone()` (and `skb_shift()`) drop the `SKBFL_SHARED_FRAG` safety marker during internal packet cloning — the same flag the original Dirty Frag mitigation introduced to mark file-backed page-cache memory shared into a socket buffer. With the marker lost, an attacker-controlled cloned packet routed through an IPsec/XFRM tunnel undergoes in-place decryption that writes attacker-chosen bytes into the page cache of a privileged binary. **Critically, a kernel patched only for the original Dirty Frag CVEs (CVE-2026-43284/-43500) remains exploitable via this path** — full protection needs the entire patch series. CVE-2026-43503 and CVE-2026-46300 (Fragnesia) are one upstream remediation split across two CVE IDs (the CNA assigned 43503 to the *second* commit) and ship together in vendor advisories — treat them as a pair.
+
+The engine runs a `compound` check: kernel version before the per-series fix, plus presence/loadability of the `esp4`/`esp6`/`rxrpc` in-place-decryption modules. The core vulnerable code (`__pskb_copy_fclone`, `skb_shift`) is in core `skbuff` and isn't module-gated, so kernel version is the authoritative signal.
+
+Remediation:
+- Apply the distribution kernel update (mainline fix commit `48f6a5356a33`, first fixed tag v7.1-rc5) and **reboot** — verify `uname -r` reflects the patched kernel
+- Interim: blacklist `esp4`/`esp6`/`rxrpc` and drop caches (WARNING: breaks IPsec/VPN and AFS where used)
+- Defence-in-depth: disable unprivileged user namespaces to cut the `CAP_NET_ADMIN` acquisition path
+- Do not rely on file-integrity tooling — the on-disk binary is never modified
+
+#### CVE-2026-46243 -- CIFSwitch (HIGH)
+
+Disclosed by Asim Manizada on May 28 2026; the bug itself dates to 2007. The kernel's CIFS client registers the `cifs.spnego` key type without validating that key-creation requests actually originate from kernel CIFS. Any unprivileged process can forge a `request_key("cifs.spnego", ...)` call with attacker-controlled fields, and because the default `cifs.spnego` request-key rule launches the `cifs.upcall` helper as root, that rootful helper runs with attacker-supplied parameters — including a target process namespace to pivot into before performing a privileged NSS lookup, which can be hijacked to load an attacker-controlled NSS module as root. Exploitability requires three things together: an unpatched kernel, `cifs-utils` installed with default config, and unprivileged user namespaces enabled — the researcher confirmed it across roughly 30 distro/edition combinations meeting those conditions.
+
+The engine runs a `compound` check (kernel version plus `cifs` module presence), with a supporting `kallsyms_sym` check for `cifs_spnego_key_type` where `/proc/kallsyms` is readable.
+
+Remediation:
+- Apply the distribution kernel update (upstream fix commit `3da1fdf4efbc`)
+- Interim options: remove `cifs-utils` if SMB mounts aren't needed; delete `/etc/request-key.d/cifs.spnego.conf` (breaks Kerberos-authenticated CIFS mounts only); blacklist the `cifs` module (breaks all CIFS/SMB mounts); or disable unprivileged user namespaces, which removes the namespace-pivot step without affecting CIFS mounts
+- SELinux enforcing mode is an effective mitigation even on an unpatched kernel — confirm enforcement status (check 11)
+
+#### CVE-2026-43284 -- Dirty Frag ESP (CRITICAL)
+
+Disclosed May 2026 by Hyunwoo Kim. The IPsec ESP half of the Dirty Frag chain: the xfrm-ESP receive fast path performs in-place decryption over paged fragments (attached via `splice`/`sendfile`/`MSG_SPLICE_PAGES`) that the kernel does not privately own, letting a local user write attacker-controlled plaintext at any chosen offset in the page cache in a single deterministic operation — no race window. Confirmed active in-the-wild exploitation across Ubuntu 24.04, RHEL 10, Debian 12, Amazon Linux 2023, and SUSE 16.
+
+The engine runs a `compound` check (kernel version plus `esp4`/`esp6` module reachability); a single `socket(AF_INET, SOCK_RAW, IPPROTO_ESP)` call auto-loads the module, so "not currently loaded" is not evidence of safety without a blacklist entry.
+
+Remediation:
+- Apply the kernel patch immediately (fixed in 6.18.25+, 6.19.14+, or 7.0+)
+- Interim: blacklist `esp4`/`esp6` (WARNING: breaks IPsec/VPN tunnels — evaluate operational impact first)
+- If IPsec is in active use, prioritise the kernel patch over module blacklisting
+
+#### CVE-2026-43500 -- Dirty Frag RxRPC (CRITICAL)
+
+The RxRPC half of the Dirty Frag chain (used by the AFS filesystem client protocol), performing the same unauthorized in-place decryption over pages it doesn't own as CVE-2026-43284, through a different code path that handles the ESP path's edge cases — the two CVEs together produce a substantially more reliable combined exploit than either alone. **As of disclosure, no distro had shipped a kernel patch for this specific CVE** — module blacklisting was the only available mitigation.
+
+The engine runs a `compound` check (kernel version plus `rxrpc` module reachability), same auto-load caveat as the ESP variant.
+
+Remediation:
+- Blacklist `rxrpc` immediately (NOTE: breaks AFS filesystem client if in use — verify before deploying)
+- Apply the kernel patch once available for your distribution
+- Applying the CVE-2026-43284 (esp4/esp6) mitigation alone is **not sufficient** — this path is independently exploitable
+
+#### CVE-2026-46331 -- pedit COW (HIGH)
+
+A partial copy-on-write page-cache corruption flaw in the kernel's `net/sched` `act_pedit` traffic-control action: `tcf_pedit_act()` derives its writable-range check from a static hint that omits a runtime header offset, so writes inside the per-key loop can land outside the COW'd region and mutate bytes still shared with the page cache. A public, author-verified PoC ("packet_edit_meme") appeared on GitHub within 24 hours of CVE assignment and poisons the page-cached image of setuid-root `/bin/su` directly to a root shell — deterministic, no race. Requires `CAP_NET_ADMIN`, which unprivileged users can obtain via namespace-local capabilities where unprivileged user namespaces are enabled (default on Debian/Ubuntu). Same page-cache-poisoning outcome as Copy Fail and the DirtyFrag family, but a separate subsystem and module gate, so it's tracked as its own entry.
+
+The engine runs a `compound` check (kernel version plus `act_pedit` module presence/loadability).
+
+Remediation:
+- Install the patched distribution kernel (upstream fixed in v7.1-rc7) and reboot; confirm against your vendor advisory
+- Interim: `act_pedit` auto-loads the moment a pedit rule is referenced, so a plain blacklist is insufficient — use an install override (`install act_pedit /bin/true`) plus `rmmod` if currently loaded. Most hosts run no tc pedit rules and can disable it safely
+- Defence-in-depth: disable unprivileged user namespaces to remove the namespace-local `CAP_NET_ADMIN` path (breaks rootless containers and browser sandboxes — evaluate first)
+- Treat any host suspected of running the exploit as fully compromised regardless of file-integrity results — the on-disk binary is never touched
+
+#### CVE-2024-1086 -- Flipping Pages (CRITICAL)
+
+A use-after-free in the kernel's `nf_tables` netfilter component: `nft_verdict_init()` allows positive values as a drop error within the hook verdict, causing `nf_hook_slow()` to double-free the associated memory. Present in the kernel for over a decade before discovery. Weaponised in RansomHub and Akira ransomware campaigns (confirmed by CISA) for post-compromise privilege escalation, and a public PoC achieves root with 99.4% reliability on Debian, Ubuntu, and kernelCTF images. Requires unprivileged user namespaces and `nf_tables` loaded — both common defaults.
+
+The engine runs a `compound` check (kernel version plus `nf_tables` module reachability).
+
+Remediation:
+- Patch the kernel immediately (fixed in 5.15.149+, 6.1.76+, or 6.6.15+)
+- Interim: blacklist `nf_tables` (WARNING: removes nftables firewall support — verify your firewall/NAT setup before applying; see the worked example earlier in this README on checking for an active ruleset first)
+- Additional hardening: `kernel.unprivileged_userns_clone=0` removes the exploit's namespace prerequisite
+- Note: the exploit does not work on v6.4+ kernels with `CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y` (e.g. Ubuntu 6.5+) — check your kernel's build config as a partial-mitigation signal while patching is scheduled
+
+#### CVE-2025-21756 -- Attack of the Vsock (HIGH)
+
+A use-after-free in the kernel's vsock (Virtual Socket) subsystem: during transport reassignment, `transport->release()` calls `vsock_remove_bound()` without checking whether the socket was actually bound, causing a reference count to hit zero and the vsock object to be freed prematurely — a subsequent `vsock_bind()` then touches freed memory. The public exploit uses `vsock_diag_dump` (not confined by AppArmor) to defeat KASLR by brute-forcing kernel addresses, then crafts fake kernel structures to hijack control flow. Vsock is the VM-to-host communication channel in cloud/hypervisor deployments — a broken trust boundary there is significant; in containers where vsock is exposed it also yields root and potential escape.
+
+The engine runs a `compound` check (kernel version plus `vsock`/`vmw_vsock_vmci_transport` module reachability).
+
+Remediation:
+- Patch to v6.6.82+, v6.12.19+, v6.1.134+, or your distribution's equivalent
+- If vsock isn't required, blacklist `vmw_vsock_vmci_transport` and `vsock`
+- On hypervisor hosts, evaluate whether guest-to-host vsock channels are actually necessary and restrict accordingly
+
+#### CVE-2025-38352 -- Chronomaly (HIGH)
+
+A race condition in the kernel's POSIX CPU timer handling: an exiting task that has already passed `exit_notify()` can call `handle_posix_cpu_timers()` from IRQ context while being reaped concurrently by its parent or a debugger; a concurrent `posix_cpu_timer_del()` fails to detect the in-flight timer state, producing a use-after-free. CISA confirmed exploitation against Android devices; a full working PoC ("Chronomaly" by farazsth98) was published against Linux 6.6-series kernels in January 2026. No root or special capabilities needed to trigger — any container user can attempt the race.
+
+The engine runs a `kernel_version` check against the affected range.
+
+Remediation:
+- Patch to 6.16.0+ or your distribution's backport for the 5.15/6.1/6.6/6.12 series
+- No effective module-level interim mitigation exists for this one — patching is the only remediation
+- Prioritise multi-tenant container hosts and CI/CD nodes running untrusted code
+
+#### CVE-2025-38617 -- Packet Socket Race (HIGH)
+
+A use-after-free in the kernel's packet socket subsystem (`net/packet`): a race between `packet_set_ring()` and `packet_notifier()` around a released lock lets a `NETDEV_UP` event be processed against ring-buffer structures that are being torn down. Present since Linux 2.6.12 (2005); the fix is a two-line lock-window closure. The kernelCTF submission's exploit chain specifically defeats `CONFIG_RANDOM_KMALLOC_CACHES` and `CONFIG_SLAB_VIRTUAL` — modern kernel heap-hardening mitigations — through a four-stage exploit building increasingly powerful primitives, and demonstrates container escape directly. Requires `CAP_NET_RAW`, obtainable via unprivileged user namespaces (default on Debian/Ubuntu).
+
+The engine runs a `compound` check against the affected version range with an `AF_PACKET` socket reachability signal.
+
+Remediation:
+- Patch to kernel 6.16+
+- As a prerequisite control, disable unprivileged user namespaces to block the `CAP_NET_RAW` elevation path — this doesn't patch the bug but removes the primary unprivileged access route
+- Monitor for backports on your 5.15/6.1/6.6/6.12 LTS series
+
+#### CVE-2023-0386 -- OverlayFS SetUID Copy-Up (FUSE) Privilege Escalation (HIGH)
+
+An improper-ownership-management flaw in OverlayFS: copying a setuid file with capabilities from a `nosuid`-mounted lower layer into an upper layer that permits setuid execution mishandles the UID mapping, letting a local user execute the resulting setuid binary with privileges they shouldn't have. OverlayFS is the default storage driver for Docker, containerd, and most container runtimes, so this affects essentially every container deployment using overlay storage. On the CISA KEV list with confirmed active exploitation.
+
+The engine runs a `kernel_version` check against the affected range plus `overlay` module context.
+
+Remediation:
+- Patch to the fixed kernel version for your series
+- Run containers as non-root (`runAsNonRoot: true`) with `allowPrivilegeEscalation: false` — this limits the blast radius of the setuid escalation even pre-patch
+- Apply `readOnlyRootFilesystem: true` where feasible
+- Check the CISA KEV entry for the latest confirmed exploitation details
+
+> **Note on CVE ID history:** this entry shares its CVE identifier's history with a data-quality fix made during the v4.5 pass — CVE-2025-38352 was previously mis-tagged onto this OverlayFS entry; the OverlayFS bug's correct identifier is CVE-2023-0386, and CVE-2025-38352 belongs to the unrelated Chronomaly POSIX-CPU-timer entry above. Verify against NVD if you maintain external references to the old tagging.
+
+#### CVE-2022-0847 -- DirtyPipe (HIGH)
+
+The direct ancestor of Copy Fail and the Dirty Frag family: an unprivileged process can overwrite read-only page-cache entries backed by files — including files reachable only via a read-only bind mount — by splicing pipe pages with the `PIPE_BUF_FLAG_CAN_MERGE` flag left unset. A public PoC was published within 24 hours of disclosure, and in-container exploitation against Kubernetes was demonstrated publicly; this was one of the most widely weaponised container-escape bugs of 2022-2023.
+
+The engine runs a `kernel_version` check against the affected range (5.8 through 5.16.10 / 5.15.24 / 5.10.101).
+
+Remediation:
+- Patch to 5.15.25+, 5.16.11+, or 5.10.102+
+- This CVE is now several years old — if a host is still in the affected range, treat it as behind on security updates generally, not just exposed to this one issue
+
+#### CVE-2016-5195 -- DirtyCOW (CRITICAL)
+
+A race condition in the kernel's copy-on-write handling allowing an unprivileged user to write to read-only memory mappings — present for nine years before discovery, affecting any kernel below 4.8.3. Weaponised in real-world attacks including the DirtyCow Android rootkit, and included in virtually every container-escape toolkit (deepce, CDK) as a standard technique.
+
+The engine runs a `kernel_version` check against the affected range.
+
+Remediation:
+- Update the kernel immediately if below 4.8.3
+- A kernel this far behind is very likely also vulnerable to numerous other critical CVEs — treat the host as fully compromised and prioritise a full patch cycle, not just this one CVE
+
+#### CVE-2026-43121 -- io_uring zcrx Freelist OOB (HIGH)
+
+A race condition in the kernel's `io_uring` zero-copy-receive (zcrx) subsystem: `io_zcrx_put_niov_uref()` uses a non-atomic read-then-decrement on a reference counter serialized by a lock that a concurrent scrub path (`io_zcrx_scrub()`) doesn't hold, letting a network I/O vector be pushed onto the freelist twice — subsequent freelist pushes then write out of bounds past the allocated array into adjacent slab memory. The `oss-security` disclosure thread mixed confirmed technical analysis with a disputed, unverified exploitation write-up — treat the underlying race and OOB write as real, but "working public LPE PoC" as unconfirmed pending independent verification.
+
+The engine runs a `kernel_version` check against the affected range, complemented by the general `io_uring` reachability probe (check 48).
+
+Remediation:
+- Update to a kernel containing the fix (stable 6.18.16+, commit `003049b1c4fb`) — verify the post-reboot running kernel is the fixed build rather than trusting a blog-post date
+- Reduce `io_uring` attack surface where it isn't required: `kernel.io_uring_disabled=2`, or block `io_uring_setup`/`io_uring_enter`/`io_uring_register` via seccomp
+
+#### CVE-2022-47939 -- ksmbd Tree-Disconnect UAF (CRITICAL)
+
+A use-after-free in the kernel's in-tree SMB3 server (`ksmbd`): handling an `SMB2_TREE_DISCONNECT` request terminates the tree connection without clearing the associated pointer, which is later dereferenced — triggerable **remotely, without authentication**, by causing tree-disconnect commands to be reprocessed. ZDI scored this 10.0 (NVD 9.8). `ksmbd` is not enabled by default on most distributions, so exposed systems are relatively rare, but where it is enabled and network-reachable this is unauthenticated remote kernel code execution.
+
+The engine runs a `compound` check: kernel in the affected 5.15-5.19 range **and** the `ksmbd` module loaded; kernels ≥ 6.x clear the version check regardless of module state.
+
+Remediation:
+- Update the kernel to 5.15.61+ or 5.19.2+ (any later series is unaffected)
+- If in-kernel SMB serving isn't required, unload and blacklist `ksmbd`; prefer userspace Samba where an SMB server is actually needed
+- Restrict TCP/445 exposure via host firewalling and network policy; verify `ksmbd` isn't auto-loaded in container images
+
+#### CVE-2026-41326 -- Kata CopyFile Symlink Subversion (HIGH)
+
+An authorization-bypass and symlink-following flaw (CWE-61) in the `CopyFile` API of the Kata Containers `kata-agent` — the guest-side interface the host shim uses to manage container lifecycle and transfer files. The agent's policy engine validates the destination *path* of a write but ignores file type and payload: an attacker with host-level access to the `kata-agent` socket creates a symlink via one `CopyFile` call, then writes through it via a second, and the agent blindly follows it — overwriting a target inside the guest. This is a **host-to-guest** integrity violation, most severe for Confidential VMs whose entire security model assumes the guest is isolated from an untrusted host.
+
+The engine tracks this as `check_type=manual`; live detection is `check_kata_agent_socket` (check 50), which flags presence/accessibility of the agent socket from the current context.
+
+Remediation:
+- Upgrade Kata Containers to ≥ 3.29.0 (also shipped in OpenShift 4.19.34 and equivalent vendor releases)
+- Restrict and authenticate access to the `kata-agent` socket so only the trusted shim can reach it
+- Where a custom agent policy is used, validate symlink targets and reject `CopyFile` writes whose resolved path escapes the permitted directory
+- Treat any pre-3.29.0 agent as integrity-compromised for CVM deployments specifically
+
+#### CVE-2026-46680 -- containerd runAsNonRoot Bypass (HIGH)
+
+An input-validation bug in containerd: a container launched with a numeric `User` directive too large to parse as a 32-bit integer gets that value treated as a *username* instead and resolved against the image's `/etc/passwd` — a crafted image mapping that oversized numeric string to root (UID 0) causes the container to run as root despite Kubernetes' `runAsNonRoot` control being set. Closely related to the earlier CVE-2024-40635 (same overflow/wraparound class). No public exploit code, but the mechanism is simple and requires only a crafted image.
+
+The engine tracks this as `check_type=manual`; the observable end-state (running as UID 0 without userns remapping) is caught by check 27.
+
+Remediation:
+- Upgrade containerd to ≥ 1.7.32, 2.0.9, 2.2.4, or 2.3.1 (2.1.x is end-of-life with no fix — migrate off it)
+- Enforce a specific numeric `runAsUser` in the Pod securityContext — this overrides the image `USER` directive and prevents the bypass regardless of containerd version
+- Kubernetes ≥ 1.34 enforces `runAsNonRoot` correctly regardless of this bug
+- Admit only trusted images; use policy (OPA/Kyverno) to reject `USER` values ≥ 2147483647
+
+#### CVE-2026-55686 -- Podman WORKDIR Symlink Host Write (MEDIUM)
+
+A symlink-following flaw in Podman/libpod: a malicious image whose `WORKDIR` path contains a symlink can cause Podman, during host-side working-directory creation, to create a directory at the symlink's target on the host filesystem. A race-dependent variant can also modify ownership of an existing host path. Impact is bounded — the attacker controls the target path but not arbitrary file contents — and no weaponised PoC is public.
+
+The engine tracks this as `check_type=manual`; `component_fixed` is marked `VERIFY` pending confirmation of the exact fixed Podman version from GHSA-q6r4-3wmg-fwcq.
+
+Remediation:
+- Upgrade Podman/libpod to the fixed release (confirm the version from the GHSA once published)
+- Run only trusted images; treat images with a symlinked `WORKDIR` as suspicious
+- Covered behaviourally by the existing symlink/masked-path race checks and the writable-mount checks in this tool
+
+#### CVE-2026-41579 -- runc /dev Symlink Limited Host Write (MEDIUM)
+
+A low-severity flaw in runc's rootfs preparation: `setupPtmx` and `setupDevSymlinks` create `/dev` symlinks during container setup, and a malicious image supplying a crafted symlink could obtain limited host filesystem write access — the same bug class as the November 2025 runc masked-path/symlink CVEs, missed during that hardening pass. Runc's own analysis considers the resulting write access too narrow to be an arbitrary host-file overwrite; released without an embargo specifically because severity is low.
+
+The engine tracks this as `check_type=manual`; the broader vulnerable-runc-version condition and related masked-path CVEs are caught by check 26.
+
+Remediation:
+- Update runc to ≥ 1.4.3 or ≥ 1.5.0-rc3, and ensure containerd/Docker actually ship the patched binary
+- Run only trusted images
+
+#### CVE-2019-5736 -- runc /proc/self/exe Host Binary Overwrite (CRITICAL)
+
+The original runc container escape, and still on the CISA KEV list. Because runc did not open its own executable with `O_CLOEXEC`, a container process running as root can open `/proc/self/exe` — a magic-link back to the host runc binary — and use the leaked, still-open file descriptor to overwrite the host binary from inside the container. Triggerable either via a malicious image run with `runc run`, or by an attacker with write access inside a container later attached via `runc exec`. Once the host runc binary is replaced, the next container start/exec on that host executes attacker code as root. Public PoCs and a Metasploit module exist.
+
+Detection is a three-state model, not a version compare, since host runc is normally invisible from inside a container: check 52's live version probe gives a definitive verdict when reachable; absent that, check 27's user-namespace-remapping signal shows whether the escape *precondition* (in-container root mapping to host root) is present. A remapped root blocks this specific overwrite regardless of runc version, and downgrades the finding accordingly.
+
+Remediation:
+- Upgrade runc to ≥ 1.0-rc7 and confirm the host's Docker/containerd/CRI-O ship the patched binary (Docker ≥ 18.09.2) — verify with `runc --version` on the host, not inside a container
+- Strongest available control short of upgrading: user-namespace remapping, which makes this specific overwrite path fail regardless of runc version
+- Avoid `exec` into untrusted running containers; run only trusted images
+
+#### CVE-2024-21626 -- runc process.cwd Leaked-FD Container Breakout (Leaky Vessels) (CRITICAL)
+
+An order-of-operations breakout in runc ≤ 1.1.11: an internal file-descriptor leak lets a newly spawned container process inherit a working directory that resolves into the host filesystem namespace, because runc didn't verify the final working directory stayed inside the container mount namespace after `chdir`. Triggerable via a malicious image on `runc run`/`docker build` (including via `FROM`/`ONBUILD`), or from inside a running container via `runc exec`; variant attacks extend this to overwriting semi-arbitrary host binaries for a complete escape. Public PoCs exist for both vectors; not CISA KEV-listed. The Leaky Vessels BuildKit sibling CVEs (CVE-2024-23651/23652/23653) are intentionally out of scope — they're image-build tooling, not the container runtime.
+
+Like CVE-2019-5736, this uses a three-state model. Its one genuinely useful in-container signal: runc 1.1.12's actual fix is a check that a process's working directory stays inside the container root, so a `/proc/*/cwd` symlink resolving onto the host filesystem is strong evidence of an in-progress or successful breakout — though a clean result there means "no active breakout observed," not "patched," since a fresh malicious image can still trigger the underlying leak.
+
+Remediation:
+- Upgrade runc to ≥ 1.1.12 and rebuild/re-pull anything that bundles it (Docker, containerd, CRI-O); apply managed-Kubernetes node updates per your provider; verify with `runc --version` on the host
+- Interim/defence-in-depth: treat `FROM`/`ONBUILD` base images as untrusted input; disabling unprivileged user namespaces shrinks the surrounding escalation surface without fixing the underlying fd leak
+
+#### CVE-2022-0492 -- cgroup release_agent Escape (HIGH)
+
+An improper-authentication flaw in cgroup v1's `release_agent` mechanism: `cgroup_release_agent_write()` didn't verify the writing process actually had the privilege normally required to set the `release_agent` program. A process with `CAP_SYS_ADMIN` — including one obtained inside a new user+cgroup namespace on a misconfigured system — can point `release_agent` at an attacker-controlled program, which the kernel then executes on the **host**, outside all container namespaces, when the last task in the cgroup exits. On the CISA KEV list; the release-agent escape is a one-click technique implemented in both CDK and deepce and is one of the most widely documented container escapes in existence.
+
+This is a dual-nature entry: primary detection is behavioural (the writable-`release_agent` probe, check 12, plus the `/sys` mount logic in check 19), but the engine also surfaces NVD kernel version data as a supporting signal since the upstream fix was itself a hardening change.
+
+Remediation:
+- Migrate workloads to cgroup v2, which has no `release_agent`
+- Mount cgroupfs read-only inside containers; drop `CAP_SYS_ADMIN` from application containers
+- Apply seccomp to block `mount(2)`/`unshare(2)`/`clone(2)` with namespace flags; enforce Pod Security Admission at `restricted`
+
 </details>
 
 <details>
@@ -1185,18 +1493,41 @@ To disable an entry without removing it, prefix its `cve_id` line with `#`.
 | `kernel_version` | Judges the running kernel against the entry's `upstream_ranges` / `distro_status` / `vendor_defer` (falling back to legacy `fixed_versions`) and returns a **vulnerable / not-affected / defer / unknown** verdict, using the detected distro, release, flavour and installed package version with the correct per-scheme comparator. Absent or unmatched data ⇒ *unknown*, never a silent pass. |
 | `module_loaded` | Checks `/proc/modules` for the listed `module_names` |
 | `socket_family` | Attempts to open a socket with the given `socket_af` / `socket_type` / `socket_proto` |
-| `compound` | Runs the version verdict plus module and socket checks and synthesises a combined severity; a *defer*/*unknown* version verdict yields a "verify" finding rather than a clean pass |
-| `manual` | Advisory/tracking entry for runtime or userspace CVEs that do not reduce to a kernel test. Emits a finding at the configured `severity` for inventory; live detection is handled by a dedicated script check named in the entry's `rec`/`notes`. Optional `component` / `component_affected` / `component_fixed` keys document the affected package version. A `manual` entry may also carry version fields (e.g. cgroup CVE-2022-0492), which the engine surfaces as a **supporting** signal alongside the behavioural verdict. |
+| `compound` | Runs the version verdict plus module and socket checks and synthesises a combined severity across four states: module currently loaded ⇒ CRITICAL regardless of blacklist; socket reachable with no effective module gate (no module test configured, or the module isn't blacklisted) ⇒ CRITICAL; socket reachable but the module is *confirmed* blacklisted ⇒ HIGH, not CRITICAL — the socket check only proves the socket family is reachable (e.g. AF_ALG core), not that the specific blacklisted transform can load, so a real blacklist is recognised as a genuine (if not bind()-level-verified) mitigation rather than discarded; otherwise HIGH/MEDIUM as before. A *defer*/*unknown* version verdict yields a "verify" finding rather than a clean pass. |
+| `manual` | Advisory/tracking entry for runtime or userspace CVEs that do not reduce to a kernel test. Emits a finding at the configured `severity` for inventory; live detection is handled by a dedicated script check named in the entry's `rec`/`notes`. Optional `component` / `component_affected` / `component_fixed` keys document the affected package version. A `manual` entry may also carry version fields (e.g. cgroup CVE-2022-0492), which the engine surfaces as a **supporting** signal alongside the behavioural verdict. For `component=runc` entries specifically (CVE-2019-5736, CVE-2024-21626), the dispatch first checks whether check 52 already established a live runc version elsewhere in the run and, if so, renders a **definitive** verdict instead of the static advisory. |
 
 ### Architecture-specific CVEs
 
-Some CVEs only affect one CPU architecture — for example **ITScape (CVE-2026-46316)** is arm64-only. Add an `arch=` key to gate the entry:
+Some CVEs only affect one CPU architecture — for example **ITScape (CVE-2026-46316)** is arm64-only, and **Januscape (CVE-2026-53359)** is x86_64-only (it lives in KVM's Intel/AMD shadow-MMU code path, which arm64 KVM doesn't share). Add an `arch=` key to gate the entry:
 
 ```ini
 arch=arm64    # or x86_64, etc.  Aliases (aarch64/arm64, amd64/x86_64) are normalised.
 ```
 
 When `arch=` is present and does not match `uname -m`, the engine reports the CVE as **N/A (INFO)** on that host instead of running the version/module/socket test — preventing a false positive on kernel version alone. Entries without an `arch=` key (or with `arch=any`) are tested on every architecture, as before. The companion script check 51 performs a complementary architecture-aware probe that further distinguishes an arm64 KVM *host* from a *guest* vantage point.
+
+### Container OS / distribution support
+
+The version-verdict engine detects the running distribution from `/etc/os-release`'s `ID=` field and normalizes it against the vendor tokens used in `distro_status` / `vendor_defer`. Coverage as of v4.6:
+
+| `/etc/os-release` `ID=` | Resolves to | Notes |
+|---|---|---|
+| `ubuntu` | `ubuntu` | Direct match; `ABI.upload` version comparator |
+| `debian` | `debian` | Direct match; release resolved via `VERSION_CODENAME` (bookworm/bullseye/trixie), `dpkg`-correct comparator |
+| `rhel` | `rhel` | Direct match |
+| `fedora` | `fedora` | Direct match (also covers Fedora CoreOS, which reports `ID=fedora`) |
+| `almalinux` | `almalinux` | Direct match |
+| `amzn` | `amazon` | Normalized — Amazon Linux 2 and 2023 both report `ID=amzn`, not `amazon`, which previously made every `amazon\|...` row silently unreachable |
+| `sles`, `sled`, `opensuse-leap`, `opensuse-tumbleweed` | `suse` | Normalized |
+| `ol` | `oracle` | Normalized (no `oracle\|...` conf rows exist yet; ready when added) |
+| `rhcos` (OpenShift nodes) | `openshift`, aliased to `rhel` | Dual-matched: an `openshift\|...` row is checked first, falling back to a plain `rhel\|...` row, since RHCOS is genuinely RHEL-based (`ID_LIKE="rhel fedora"`, confirmed against Red Hat's own documentation) but also carries OpenShift-specific advisories in the conf. **Caveat:** `distro_status` rows that key on release number are not reliably matched for RHCOS, since its `VERSION_ID` is the OpenShift version (e.g. `4.18`), not a RHEL release number — mapping OCP versions to underlying RHEL majors isn't derivable from `/etc/os-release` alone. `vendor_defer` rows (id-only, no release check) are unaffected by this and match correctly. |
+
+**Known gaps — flagged rather than silently assumed to work:**
+- **Alpine** — kernel-version comparison should function (it only reads `uname -r`), but this hasn't been verified end-to-end against a real Alpine host, and any recommendation text assuming `apt`/`yum`/`dnf` package managers won't apply (Alpine uses `apk`).
+- **Bottlerocket, Talos** — intentionally immutable, container-only host OSes with no general-purpose shell or package manager by design. The `rmmod` / `/etc/modprobe.d` mitigation commands this tool recommends **do not apply** on these hosts — they need an image-level or admin-container remediation path that this version does not generate. Treat any finding on these platforms as "patch the kernel," not "apply the interim mitigation."
+- **Flatcar, Photon OS, Rocky Linux, CentOS Stream** — no `distro_status`/`vendor_defer` rows reference these distributions yet in `cve_checks.conf`, and their `ID=` values have not been individually verified against the normalization map (Rocky/CentOS report `ID=rocky`/`ID=centos` and should pass through unnormalized/unmatched rather than mis-map to another distro, but this hasn't been tested on a real host). Distro-kernel version checks on these fall through to the heuristic fallback below rather than a distro-specific verdict.
+
+**Heuristic fallback for unmatched distro kernels.** When a distro-packaged kernel has no matching `distro_status`/`vendor_defer` row — whether because the distro genuinely isn't covered yet, or a specific release is missing (this is how the missing `ubuntu|24.04|...` row for Copy Fail, CVE-2026-31431, was found) — the engine no longer returns a bare `unknown` with zero supporting signal. It also compares the running kernel's base version (e.g. `6.17.0`, stripped of the distro suffix) against the CVE's NVD `upstream_ranges` and surfaces that as clearly-labeled, non-authoritative context. This is never promoted to a verdict: distro backports can move independently of the base version string in either direction, so it's supporting evidence for the operator, not a substitute for a proper `distro_status` row or the vendor's own advisory.
 
 ### Keeping the database current
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# container_escape_audit.sh  —  v4.5
+# container_escape_audit.sh  —  v4.6
 # Copyright (c) 2026 Liam Romanis
 #
 # Licence: Creative Commons Attribution-NonCommercial 4.0 International
@@ -2737,21 +2737,39 @@ check_runtime_versions() {
     if runc_ver=$(_rt_version_of "$p" 2>/dev/null); then runc_bin="$p"; break; fi
   done
 
+  # Cache globally so the CVE-database 'manual' check_type dispatch (used by
+  # CVE-2019-5736 and CVE-2024-21626) can consult the ALREADY-established host
+  # runc version instead of independently rendering a static advisory as if
+  # no detection had happened. Empty string means "not reachable here" —
+  # callers must treat that as unknown, not as evidence of anything.
+  RUNC_DETECTED_VERSION="$runc_ver"
+  RUNC_DETECTED_PATH="$runc_bin"
+  RUNC_VERDICT_CVE_2019_5736=""
+  RUNC_VERDICT_CVE_2024_21626=""
+
   if [[ -n "$runc_ver" ]]; then
     found_any=true
     # 1.1.12 fixes CVE-2024-21626; 1.0.0-rc7 fixes CVE-2019-5736 (both < 1.1.12).
     local runc_verdicts=""
-    _ver_lt "$runc_ver" "1.1.12" && runc_verdicts+="CVE-2024-21626 (Leaky Vessels, fixed 1.1.12); "
+    if _ver_lt "$runc_ver" "1.1.12"; then
+      runc_verdicts+="CVE-2024-21626 (Leaky Vessels, fixed 1.1.12); "
+      RUNC_VERDICT_CVE_2024_21626="vulnerable"
+    else
+      RUNC_VERDICT_CVE_2024_21626="fixed"
+    fi
     # 5736 practically only matters on ancient runc (<= 1.0.0-rc6, fixed in 1.0.0-rc7).
     # NB: `sort -V` ranks "1.0.0-rc6" ABOVE "1.0.0", so do not use _ver_lt for the rc
     # boundary — detect the pre-release/pre-1.0 case explicitly instead.
     local runc_major_minor_patch="${runc_ver%%-*}"   # strip any -rcN / -dev suffix
+    RUNC_VERDICT_CVE_2019_5736="fixed"
     if _ver_lt "$runc_major_minor_patch" "1.0.0"; then
       # e.g. 0.9.x — unambiguously pre-1.0
       runc_verdicts+="CVE-2019-5736 (/proc/self/exe overwrite, fixed 1.0.0-rc7); "
+      RUNC_VERDICT_CVE_2019_5736="vulnerable"
     elif [[ "$runc_major_minor_patch" == "1.0.0" && "$runc_ver" =~ -rc([0-6])([^0-9]|$) ]]; then
       # 1.0.0-rc0 .. 1.0.0-rc6 are vulnerable; 1.0.0-rc7+ and 1.0.0 are fixed
       runc_verdicts+="CVE-2019-5736 (/proc/self/exe overwrite, fixed 1.0.0-rc7); "
+      RUNC_VERDICT_CVE_2019_5736="vulnerable"
     fi
     if [[ -n "$runc_verdicts" ]]; then
       crit "runc ${runc_ver} at ${runc_bin} is affected by: ${runc_verdicts%; }"
@@ -2801,7 +2819,9 @@ check_runtime_versions() {
     fi
   fi
 
-  unset -f _rt_version_of _ver_lt
+  # NB: _rt_version_of/_ver_lt are intentionally NOT unset here — the CVE-database
+  # 'manual' check_type dispatch (CVE-2019-5736/CVE-2024-21626) reuses _ver_lt
+  # against the RUNC_DETECTED_VERSION cached above.
 }
 # =============================================================================
 # cve_check_engine.sh  —  Config-driven CVE check engine
@@ -2994,8 +3014,45 @@ _ver_cmp_ubuntu() {
   echo 0
 }
 
+# ---------------------------------------------------------------------------
+# _normalize_distro_id
+# /etc/os-release's ID= field is a machine identifier and frequently does NOT
+# match the vendor token cve_checks.conf's distro_status/vendor_defer fields
+# use (those were written with the vendor's common name). Left unmapped, this
+# silently breaks the match — e.g. Amazon Linux 2/2023 report ID="amzn", but
+# every vendor_defer/distro_status row in the conf uses "amazon", so the
+# comparison at cve_kernel_verdict()'s `[[ "$d" == "$RUN_DISTRO_ID" ]]` never
+# succeeds on a real Amazon Linux host (a common EKS node OS). That vendor's
+# rows become dead code and the engine silently falls through to the generic
+# 'unknown' verdict instead of the more specific "consult ALAS" guidance.
+# Same class of mismatch applies to SUSE (ID="sles", conf token "suse").
+# Normalize known aliases in ONE place so new distros only need one entry.
+# ---------------------------------------------------------------------------
+_normalize_distro_id() {
+  local id="$1"
+  case "$id" in
+    amzn)                                         echo "amazon" ;;
+    sles|sled|opensuse-leap|opensuse-tumbleweed)   echo "suse" ;;
+    ol)                                            echo "oracle" ;;
+    *)                                             echo "$id" ;;
+  esac
+}
+
 # --- running-system detection (sets RUN_* globals; run once) ---------------
 RUN_DISTRO_ID=""; RUN_DISTRO_REL=""; RUN_KFLAVOUR=""; RUN_KVER_RAW=""; RUN_KPKG_VER=""
+# Populated by check_runtime_versions (check 52); consulted by the CVE-database
+# 'manual' check_type dispatch so CVE-2019-5736/CVE-2024-21626 don't render a
+# static advisory when the host runc version was already established elsewhere
+# in the same run. Empty string = not reachable from this context (unknown).
+RUNC_DETECTED_VERSION=""; RUNC_DETECTED_PATH=""
+RUNC_VERDICT_CVE_2019_5736=""; RUNC_VERDICT_CVE_2024_21626=""
+# Secondary distro-id alias for hosts whose OS is legitimately covered by
+# TWO vendor tokens in cve_checks.conf at once (e.g. RHCOS reports ID=rhcos,
+# but is RHEL-based (ID_LIKE="rhel fedora") AND has its own OpenShift-specific
+# advisories). A single RUN_DISTRO_ID string can't match both an
+# "openshift|..." row and a "rhel|..." row, so cve_kernel_verdict() also
+# checks this alias when the primary ID doesn't match. Empty = no alias.
+RUN_DISTRO_ID_ALIAS=""
 detect_running_system() {
   RUN_KVER_RAW="$(uname -r 2>/dev/null || echo unknown)"
   local suffix="${RUN_KVER_RAW##*-}"
@@ -3006,9 +3063,20 @@ detect_running_system() {
   fi
   [[ ! "$RUN_KVER_RAW" =~ - ]] && RUN_KFLAVOUR="vanilla"
 
-  RUN_DISTRO_ID="unknown"; RUN_DISTRO_REL="unknown"
+  RUN_DISTRO_ID="unknown"; RUN_DISTRO_REL="unknown"; RUN_DISTRO_ID_ALIAS=""
   if [[ -r /etc/os-release ]]; then
     RUN_DISTRO_ID="$(awk -F= '/^ID=/{gsub(/"/,"",$2); print $2; exit}' /etc/os-release 2>/dev/null)"
+    # RHCOS (OpenShift's node OS) is RHEL-based (ID_LIKE="rhel fedora") but also
+    # has its own OpenShift-specific vendor advisories in the conf — surface it
+    # as "openshift" (so an openshift|... row matches) while keeping "rhel" as
+    # a fallback alias (so a plain rhel|... row still matches when no
+    # OpenShift-specific row exists for a given CVE).
+    if [[ "$RUN_DISTRO_ID" == "rhcos" ]]; then
+      RUN_DISTRO_ID="openshift"
+      RUN_DISTRO_ID_ALIAS="rhel"
+    else
+      RUN_DISTRO_ID="$(_normalize_distro_id "$RUN_DISTRO_ID")"
+    fi
     RUN_DISTRO_REL="$(awk -F= '/^VERSION_ID=/{gsub(/"/,"",$2); print $2; exit}' /etc/os-release 2>/dev/null)"
     if [[ "$RUN_DISTRO_ID" == "debian" ]]; then
       local cn; cn="$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2; exit}' /etc/os-release 2>/dev/null)"
@@ -3082,7 +3150,7 @@ cve_kernel_verdict() {
         fixed|not-affected|vulnerable) flavour=""; status="${f[2]}"; version="${f[3]:-}" ;;
         *) flavour="${f[2]}"; status="${f[3]}"; version="${f[4]:-}" ;;
       esac
-      [[ "$d" == "$RUN_DISTRO_ID" ]] || continue
+      [[ "$d" == "$RUN_DISTRO_ID" || ( -n "$RUN_DISTRO_ID_ALIAS" && "$d" == "$RUN_DISTRO_ID_ALIAS" ) ]] || continue
       [[ "$rel" == "$RUN_DISTRO_REL" ]] || continue
       [[ -n "$flavour" && "$flavour" != "$RUN_KFLAVOUR" ]] && continue
       case "$status" in
@@ -3110,7 +3178,7 @@ cve_kernel_verdict() {
     for tok in $vd; do
       local IFS='|'; local -a f=($tok); unset IFS
       local d="${f[0]}" adv="${f[1]:-vendor advisory}"
-      [[ "$d" == "$RUN_DISTRO_ID" ]] && { echo "defer|${d}: consult ${adv} — backport status not derivable from version string"; return; }
+      [[ "$d" == "$RUN_DISTRO_ID" || ( -n "$RUN_DISTRO_ID_ALIAS" && "$d" == "$RUN_DISTRO_ID_ALIAS" ) ]] && { echo "defer|${d}: consult ${adv} — backport status not derivable from version string"; return; }
     done
   fi
 
@@ -3148,7 +3216,41 @@ cve_kernel_verdict() {
     [[ "$cmp" == "-1" ]] && { echo "not-affected|vanilla ${RUN_KVER_RAW} predates introduced ${intro}"; return; }
   fi
 
-  echo "unknown|no matching fixed-version data for ${RUN_DISTRO_ID}/${RUN_DISTRO_REL} flavour=${RUN_KFLAVOUR} (running ${RUN_KVER_RAW}); cannot assert patched — verify against vendor tracker"
+  # --- Heuristic fallback (non-distro kernels with no matching data) --------
+  # No distro_status row, no vendor_defer row, and (if flavour != vanilla)
+  # the vanilla-only NVD/upstream_fixed branches above were skipped entirely.
+  # We deliberately do NOT let this promote the verdict to fixed/not-affected/
+  # vulnerable — distro backports can move independently of the upstream
+  # x.y.z string, so that would risk a confidently WRONG verdict in either
+  # direction. But leaving the operator with zero signal is also unhelpful
+  # when, e.g., a distro simply has no cve_checks.conf row yet. Compute the
+  # upstream-only comparison (base version vs NVD ranges / upstream_fixed)
+  # and surface it as an explicitly-labeled, non-authoritative heuristic
+  # appended to the unknown verdict's evidence — never as its own verdict.
+  local heuristic=""
+  local base_ver="${RUN_KVER_RAW%%-*}"
+  if [[ -n "$ur" ]]; then
+    local hv; hv="$(nvd_vanilla_verdict "$base_ver" "$ur")"
+    heuristic=" Heuristic only (base kernel version vs NVD upstream ranges, NOT distro-backport-aware): ${hv#*|}."
+  elif [[ -n "$up" ]]; then
+    local run_series="${base_ver%.*}"
+    local tok matched_ver="" mainline_ver=""
+    for tok in $up; do
+      local s="${tok%%:*}" v="${tok#*:}"
+      [[ "$s" == "mainline" ]] && { mainline_ver="$v"; continue; }
+      [[ "$s" == "$run_series" ]] && matched_ver="$v"
+    done
+    local ref_ver="${matched_ver:-$mainline_ver}"
+    if [[ -n "$ref_ver" ]]; then
+      local cmp; cmp=$(_ver_cmp_upstream "$base_ver" "$ref_ver")
+      if [[ "$cmp" == "-1" ]]; then
+        heuristic=" Heuristic only (base kernel version vs upstream-stable fix, NOT distro-backport-aware): ${base_ver} < ${ref_ver}, i.e. base version looks pre-fix."
+      else
+        heuristic=" Heuristic only (base kernel version vs upstream-stable fix, NOT distro-backport-aware): ${base_ver} >= ${ref_ver}, i.e. base version looks post-fix."
+      fi
+    fi
+  fi
+  echo "unknown|no matching fixed-version data for ${RUN_DISTRO_ID}/${RUN_DISTRO_REL} flavour=${RUN_KFLAVOUR} (running ${RUN_KVER_RAW}); cannot assert patched — verify against vendor tracker.${heuristic} Distributions routinely backport fixes without changing the upstream version string, so this heuristic can be wrong in either direction — it is supporting context only, never a substitute for the vendor advisory."
 }
 
 # ---------------------------------------------------------------------------
@@ -3560,6 +3662,19 @@ _run_single_cve_check() {
   if [[ -z "${CVE_FIELD[mitigation]+x}" ]]; then
     info "${cve} (${name}): config entry has no 'mitigation' field — add one (use 'mitigation=none' if no interim control exists)"
   fi
+  # Lint: an embedded 'printf' invocation whose format-string argument isn't
+  # quoted will have its \n escapes stripped and word-split by the shell
+  # BEFORE printf ever sees them, silently truncating multi-line modprobe
+  # blacklist commands to a single word (e.g. just "install") when copied
+  # from the report and run. Only a quote character immediately after
+  # 'printf ' protects against this. Flag any field where that's missing so
+  # a broken copy-paste command surfaces at load time, not when a user runs it.
+  for _lint_field in rec mitigation; do
+    local _lint_val="${CVE_FIELD[$_lint_field]:-}"
+    if [[ "$_lint_val" == *"printf "* && ! "$_lint_val" =~ printf[[:space:]]+[\'\"] ]]; then
+      info "${cve} (${name}): '${_lint_field}' field contains an unquoted 'printf' invocation — its format-string argument must be wrapped in quotes (e.g. printf 'install foo /bin/false\\n...') or the shell will strip/word-split the \\n escapes before printf sees them, silently truncating the command. Verify before publishing."
+    fi
+  done
   # Build a unique, stable finding ID for this CVE (subsystem slug prevents
   # collisions when two entries share a CVE number, e.g. CVE-2025-38352)
   local _sub_slug
@@ -3750,12 +3865,37 @@ _run_single_cve_check() {
         _check_socket_accessible && socket_accessible=true
       fi
 
+      # Whether a module gate even applies to this CVE (module_names != none),
+      # and whether that gate is fully closed (module not currently loaded AND
+      # confirmed blacklisted in /etc/modprobe.d).
+      local mod_check_applicable=false
+      [[ "${CVE_FIELD[module_names]:-none}" != "none" ]] && mod_check_applicable=true
+      local mod_fully_blacklisted=false
+      [[ "$mod_check_applicable" == true && -z "$mod_loaded_list" && -z "$mod_not_blacklisted" ]] && mod_fully_blacklisted=true
+
       # Severity logic:
-      # CRITICAL: kernel affected + (module loaded OR socket accessible)
-      # HIGH:     kernel affected + module not blacklisted (auto-load possible)
-      #           OR kernel possibly affected + socket accessible (no version data)
-      # MEDIUM:   kernel affected but no module/socket info, or inconclusive
-      # INFO:     kernel not in affected range
+      #   CRITICAL: kernel affected AND module currently loaded (blacklist is
+      #             moot once it's already loaded)
+      #   CRITICAL: kernel affected AND socket accessible AND (no module gate
+      #             exists for this CVE, OR the module is confirmed NOT
+      #             blacklisted — i.e. nothing stands between reachability and
+      #             the vulnerable code)
+      #   HIGH:     kernel affected AND socket accessible AND the module IS
+      #             fully blacklisted. NOT downgraded to MEDIUM: the socket
+      #             check only proves the socket *family* is reachable
+      #             (e.g. AF_ALG core), not that the specific vulnerable
+      #             transform/module can be loaded — a blacklist entry should
+      #             block that at request_module() time, but this check
+      #             cannot independently confirm the blacklist covers the
+      #             exact code path exercised at bind()/use time, so the
+      #             blacklist is treated as a real but UNVERIFIED-at-this-
+      #             precision mitigation rather than a full clear.
+      #   HIGH:     kernel affected AND module not loaded but NOT blacklisted
+      #             (auto-load on use remains possible), regardless of socket
+      #   MEDIUM:   kernel affected, no socket/module signal indicates active
+      #             exposure (module fully blacklisted and socket not
+      #             accessible/not applicable), or inconclusive
+      #   INFO:     kernel not in affected range
 
       if [[ "$kver_affected" == true ]]; then
         local _cfx="${CVE_FIELD[fixed_versions]:-none}"
@@ -3764,15 +3904,33 @@ _run_single_cve_check() {
           VERIFY|verify) _cfx_tag=" [fixed version UNCONFIRMED]" ;;
           none)          _cfx_tag=" [no fixed version recorded]" ;;
         esac
-        if [[ -n "$mod_loaded_list" || "$socket_accessible" == true ]]; then
+        if [[ -n "$mod_loaded_list" ]]; then
           overall_sev="${CVE_FIELD[severity]:-CRITICAL}"
           _ev FLAG "Severity synthesis" \
-            "kernel affected AND (module loaded='${mod_loaded_list:-none}' OR socket accessible=${socket_accessible}) -> ${overall_sev}"
-          crit "${cve} (${name}): LIKELY VULNERABLE — kernel ${kver} in range; module(s) loaded / socket accessible${_cfx_tag}"
+            "kernel affected AND module currently loaded ('${mod_loaded_list}') -> ${overall_sev} (blacklist is moot once already loaded)"
+          crit "${cve} (${name}): LIKELY VULNERABLE — kernel ${kver} in range; module(s) loaded: ${mod_loaded_list}${_cfx_tag}"
           _ev_print_stdout
           _emit_cve_finding \
-            "kernel in affected range; loaded modules: ${mod_loaded_list:-none}; socket AF=${CVE_FIELD[socket_af]:-N/A} accessible: ${socket_accessible}; non-blacklisted: ${mod_not_blacklisted:-none}" \
+            "kernel in affected range; loaded modules: ${mod_loaded_list}; socket AF=${CVE_FIELD[socket_af]:-N/A} accessible: ${socket_accessible}" \
             "$overall_sev"
+        elif [[ "$socket_accessible" == true && ( "$mod_check_applicable" == false || -n "$mod_not_blacklisted" ) ]]; then
+          overall_sev="${CVE_FIELD[severity]:-CRITICAL}"
+          _ev FLAG "Severity synthesis" \
+            "kernel affected AND socket accessible AND module gate not closed (module_names=${CVE_FIELD[module_names]:-none}, not-blacklisted='${mod_not_blacklisted:-n/a}') -> ${overall_sev}"
+          crit "${cve} (${name}): LIKELY VULNERABLE — kernel ${kver} in range; socket accessible and no effective module gate${_cfx_tag}"
+          _ev_print_stdout
+          _emit_cve_finding \
+            "kernel in affected range; socket AF=${CVE_FIELD[socket_af]:-N/A} accessible: ${socket_accessible}; modules not blacklisted: ${mod_not_blacklisted:-n/a (no module gate for this CVE)}" \
+            "$overall_sev"
+        elif [[ "$socket_accessible" == true && "$mod_fully_blacklisted" == true ]]; then
+          overall_sev="HIGH"
+          _ev FLAG "Severity synthesis" \
+            "kernel affected; socket family reachable BUT module(s) confirmed blacklisted (${CVE_FIELD[module_names]:-none}) -> HIGH, not CRITICAL — socket check only confirms family-level reachability (e.g. AF_ALG core), not that the specific blacklisted transform can load; blacklist is a real but not fully-verified-at-this-precision mitigation"
+          warn "${cve} (${name}): kernel ${kver} in affected range; socket family reachable but module(s) blacklisted — downgraded from CRITICAL, verify blacklist covers the exact code path${_cfx_tag}"
+          _ev_print_stdout
+          _emit_cve_finding \
+            "kernel in affected range; socket AF=${CVE_FIELD[socket_af]:-N/A} family is reachable, but module(s) ${CVE_FIELD[module_names]:-none} are confirmed blacklisted in /etc/modprobe.d — this blocks auto-load of the specific vulnerable transform at request_module() time, though this check cannot independently confirm the blacklist covers every code path the socket check's family-level probe does not exercise (e.g. bind()-time algorithm lookup)" \
+            "HIGH"
         elif [[ -n "$mod_not_blacklisted" ]]; then
           overall_sev="HIGH"
           _ev FLAG "Severity synthesis" \
@@ -3785,11 +3943,11 @@ _run_single_cve_check() {
         else
           overall_sev="MEDIUM"
           _ev FLAG "Severity synthesis" \
-            "kernel affected; modules not loaded and appear blacklisted/absent — interim mitigation likely, patch still required -> MEDIUM"
+            "kernel affected; modules not loaded and appear blacklisted/absent, socket not accessible/not applicable — interim mitigation likely, patch still required -> MEDIUM"
           warn "${cve} (${name}): kernel ${kver} in affected range; modules appear blacklisted or absent${_cfx_tag}"
           _ev_print_stdout
           _emit_cve_finding \
-            "kernel in affected range; modules not loaded and appear blacklisted — interim mitigation may be in effect, but kernel patch is still required" \
+            "kernel in affected range; modules not loaded and appear blacklisted, socket not accessible or not applicable — interim mitigation may be in effect, but kernel patch is still required" \
             "MEDIUM"
         fi
       else
@@ -3837,6 +3995,42 @@ _run_single_cve_check() {
       [[ -n "$comp" ]] && ctx="${ctx}; affected component: ${comp}"
       [[ -n "$comp_fixed" ]] && ctx="${ctx}; fixed in ${comp}: ${comp_fixed}"
 
+      # --- Check-52 cross-reference (runc only) --------------------------
+      # check_runtime_versions (check 52) runs earlier in this script and
+      # actively probes for a reachable runc binary. If it found one, its
+      # verdict is authoritative for this specific CVE and MUST be used
+      # instead of falling through to the generic advisory below — otherwise
+      # this entry silently ignores a detection result that already exists
+      # in the same run, and always renders as CRITICAL with the conf's
+      # static component_fixed= text even when the installed version is
+      # years newer than the fix.
+      local runc_verdict=""
+      case "$cve" in
+        CVE-2019-5736)  runc_verdict="$RUNC_VERDICT_CVE_2019_5736" ;;
+        CVE-2024-21626) runc_verdict="$RUNC_VERDICT_CVE_2024_21626" ;;
+      esac
+      if [[ "$comp" == "runc" && -n "$runc_verdict" ]]; then
+        if [[ "$runc_verdict" == "vulnerable" ]]; then
+          crit "${cve} (${name}): CONFIRMED — runc ${RUNC_DETECTED_VERSION} at ${RUNC_DETECTED_PATH} predates the fix (${comp_fixed})"
+          _ev FLAG "Check 52 cross-reference" \
+            "runc ${RUNC_DETECTED_VERSION} detected at ${RUNC_DETECTED_PATH}; predates ${comp}'s fix (${comp_fixed}) — confirmed vulnerable, not advisory-only"
+          _ev_print_stdout
+          _emit_cve_finding \
+            "runc ${RUNC_DETECTED_VERSION} detected at ${RUNC_DETECTED_PATH} (via check 52) — predates the ${comp_fixed} fix for this CVE. This is a definitive verdict from an actually-reachable binary, not an inventory-only advisory." \
+            "$msev"
+        else
+          ok "${cve} (${name}): runc ${RUNC_DETECTED_VERSION} at ${RUNC_DETECTED_PATH} is at or above the ${comp_fixed} fix — not vulnerable"
+          _ev PASS "Check 52 cross-reference" \
+            "runc ${RUNC_DETECTED_VERSION} detected at ${RUNC_DETECTED_PATH}; at or above ${comp}'s fix (${comp_fixed})"
+          _ev_print_stdout
+          _emit_cve_finding \
+            "runc ${RUNC_DETECTED_VERSION} detected at ${RUNC_DETECTED_PATH} (via check 52) — at or above the ${comp_fixed} fix for this CVE. Confirmed not vulnerable, not merely 'no signal'." \
+            "INFO"
+        fi
+        return
+      fi
+
+      # --- Fallback: no check-52 detection available here -----------------
       # Dual-nature entries (e.g. CVE-2022-0492 cgroup release_agent) carry
       # enriched version data as a SUPPORTING signal even though the primary
       # verdict is behavioural. If any version field is present, run the verdict
@@ -3971,7 +4165,7 @@ run_cve_checks() {
 if [[ "$OUTPUT_JSON" == false ]]; then
   echo -e "${BOLD}${CYAN}"
   echo "========================================================"
-  echo "  container_escape_audit.sh v4.4"
+  echo "  container_escape_audit.sh v4.6"
   echo "  Container escape vector detection"
   echo "  FOR AUTHORISED SECURITY ASSESSMENTS ONLY"
   echo "========================================================"
