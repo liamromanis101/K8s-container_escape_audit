@@ -20,13 +20,34 @@
 #   ./container_escape_audit.sh [options]
 #
 # Options:
-#   --report <file>   Write a detailed human-readable report to <file>
-#                     (default: container_escape_report_<timestamp>.txt)
+#   --report <file>      Write a detailed human-readable report to <file>,
+#                         used EXACTLY as given — no timestamp is appended.
+#                         (default: container_escape_report_<timestamp>.txt)
+#   --report-name <name> Use <name> as the report file's base name, with the
+#                         same "_<timestamp>.txt" suffix the default uses —
+#                         e.g. --report-name prod-node-07 produces
+#                         prod-node-07_20260714_153000.txt. If --report is
+#                         ALSO given, --report is used verbatim and
+#                         --report-name is ignored (a warning is printed).
+#                         If neither is given, the original default name
+#                         (container_escape_report_<timestamp>.txt) is used
+#                         unchanged.
 #   --json            Also emit a machine-readable JSON summary to stdout
 #   --quiet           Suppress info lines; print only WARN/CRITICAL to terminal
 #   --no-report       Skip writing the report file entirely
 #   --cve-conf <file> Path to CVE check config file
 #                     (default: same directory as this script / cve_checks.conf)
+#   --check-updates   Check github.com/liamromanis101/K8s-container_escape_audit
+#                     for a newer script release (release.txt) and a newer CVE
+#                     database (cve_release.txt vs. this cve_checks.conf's own
+#                     "Last updated" line). Completely opt-in — no network call
+#                     is made at all unless this flag is given. Prints:
+#                       ## Update Check:
+#                       [Script]: Yes|No
+#                       [CVEs]: Yes|No
+#                     If GitHub can't be reached, prints that plainly and
+#                     tells you to check the repo manually — never fails or
+#                     blocks the rest of the audit.
 #
 # Each finding in the report includes:
 #   - What it is
@@ -44,21 +65,55 @@ OUTPUT_JSON=false
 QUIET=false
 NO_REPORT=false
 DUMP_STATE=false
-REPORT_FILE="container_escape_report_$(date +%Y%m%d_%H%M%S).txt"
+CHECK_UPDATES=false
+SCRIPT_VERSION="4.6"
+REPORT_NAME_BASE="container_escape_report"   # default base name; overridable via --report-name
+REPORT_FILE=""                                 # left empty until after arg parsing unless --report is given explicitly
+REPORT_FILE_EXPLICIT=false                     # true only if --report set the filename verbatim
+CVE_CONF_ENV="${CVE_CONF:-}"                   # capture env var BEFORE the next line clears it
 CVE_CONF=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --json)       OUTPUT_JSON=true ;;
-    --quiet)      QUIET=true ;;
-    --no-report)  NO_REPORT=true ;;
-    --report)     shift; REPORT_FILE="$1" ;;
-    --cve-conf)   shift; CVE_CONF="$1" ;;
-    --dump-state) DUMP_STATE=true ;;
+    --json)          OUTPUT_JSON=true ;;
+    --quiet)         QUIET=true ;;
+    --no-report)     NO_REPORT=true ;;
+    --report)        shift; REPORT_FILE="$1"; REPORT_FILE_EXPLICIT=true ;;
+    --report-name)   shift; REPORT_NAME_BASE="$1" ;;
+    --cve-conf)      shift; CVE_CONF="$1" ;;
+    --dump-state)    DUMP_STATE=true ;;
+    --check-updates) CHECK_UPDATES=true ;;
     *) echo "Unknown option: $1" >&2 ;;
   esac
   shift
 done
+
+# Resolve the CVE conf path here (CLI flag > environment variable > script
+# directory) rather than just before run_cve_checks — the update-check
+# (below, if --check-updates is given) also needs to know which conf file's
+# "Last updated" line to compare, so both need this resolved early.
+if [[ -z "$CVE_CONF" ]]; then
+  CVE_CONF="${CVE_CONF_ENV:-}"
+fi
+if [[ -z "$CVE_CONF" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  CVE_CONF="${SCRIPT_DIR}/cve_checks.conf"
+fi
+
+# --report always wins if both are given — it's a complete, verbatim filename
+# and there's no sensible way to also honour a base name on top of it.
+if [[ "$REPORT_FILE_EXPLICIT" == true && "$REPORT_NAME_BASE" != "container_escape_report" ]]; then
+  echo "Note: --report was given a full filename; --report-name is ignored (using --report as-is)." >&2
+fi
+
+# Only compute the base-name + timestamp filename if --report did NOT already
+# set one explicitly — this is what makes --report-name's "continue with the
+# existing method if unset" behaviour work: an unset --report-name leaves
+# REPORT_NAME_BASE at its original default, reproducing the exact filename
+# the script always used, just via this variable instead of a literal.
+if [[ "$REPORT_FILE_EXPLICIT" == false ]]; then
+  REPORT_FILE="${REPORT_NAME_BASE}_$(date +%Y%m%d_%H%M%S).txt"
+fi
 
 # ---------------------------------------------------------------------------
 # Colour helpers (disabled when JSON mode or non-TTY)
@@ -69,6 +124,99 @@ if [[ "$OUTPUT_JSON" == false && -t 1 ]]; then
 else
   RED=''; YELLOW=''; GREEN=''; CYAN=''; BOLD=''; RESET=''
 fi
+
+# ---------------------------------------------------------------------------
+# Update check (opt-in via --check-updates only — this tool otherwise makes
+# NO network calls at all; nothing here runs unless explicitly requested).
+#
+# Checks two independent things against two small files in the repo:
+#   release.txt      - just the latest script version, e.g. "4.7"
+#   cve_release.txt  - just the date cve_checks.conf was last updated,
+#                      e.g. "2026-07-20", compared against the LOCAL conf
+#                      file's own "# Last updated: YYYY-MM-DD" trailer line
+#                      (so it reflects whatever cve_checks.conf is actually
+#                      in use, not an assumption baked into the script).
+#
+# Self-contained on purpose (its own version comparator, no dependency on
+# functions defined later in the file) so it can run immediately after the
+# banner, before any checks, rather than waiting on the CVE engine to load.
+# ---------------------------------------------------------------------------
+_update_ver_lt() {
+  local a="$1" b="$2"
+  [[ "$a" == "$b" ]] && return 1
+  [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -1)" == "$a" ]]
+}
+
+check_for_updates() {
+  [[ "$CHECK_UPDATES" == false ]] && return
+  [[ "$OUTPUT_JSON" == true ]] && return  # plain-text output would corrupt the JSON stream on stdout
+
+  local repo_raw="https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_audit/main"
+  local have_fetch=true
+  _uc_fetch() { :; }
+  if command -v curl >/dev/null 2>&1; then
+    _uc_fetch() { curl -fsSL --max-time 4 --connect-timeout 2 "$1" 2>/dev/null; }
+  elif command -v wget >/dev/null 2>&1; then
+    _uc_fetch() { wget -qO- --timeout=4 "$1" 2>/dev/null; }
+  else
+    have_fetch=false
+  fi
+
+  echo ""
+  echo "## Update Check:"
+
+  if [[ "$have_fetch" == false ]]; then
+    echo "Could not check for updates: neither curl nor wget is available on this system."
+    echo "Please check https://github.com/liamromanis101/K8s-container_escape_audit manually."
+    echo ""
+    return
+  fi
+
+  local remote_script_ver remote_cve_date
+  remote_script_ver="$(_uc_fetch "${repo_raw}/release.txt" | tr -d '[:space:]')"
+  remote_cve_date="$(_uc_fetch "${repo_raw}/cve_release.txt" | tr -d '[:space:]')"
+
+  if [[ -z "$remote_script_ver" && -z "$remote_cve_date" ]]; then
+    echo "Could not reach GitHub — no network access, blocked egress, or the"
+    echo "repository was temporarily unreachable. Please check"
+    echo "https://github.com/liamromanis101/K8s-container_escape_audit manually."
+    echo ""
+    return
+  fi
+
+  local script_status="Unknown"
+  if [[ "$remote_script_ver" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    if _update_ver_lt "$SCRIPT_VERSION" "$remote_script_ver"; then
+      script_status="Yes"
+    else
+      script_status="No"
+    fi
+  fi
+
+  local local_cve_date=""
+  if [[ -f "$CVE_CONF" ]]; then
+    local_cve_date="$(grep -oE '^# Last updated: [0-9]{4}-[0-9]{2}-[0-9]{2}' "$CVE_CONF" 2>/dev/null | head -1 | awk '{print $NF}')"
+  fi
+  local cve_status="Unknown"
+  if [[ "$remote_cve_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    if [[ -n "$local_cve_date" ]]; then
+      if [[ "$local_cve_date" < "$remote_cve_date" ]]; then
+        cve_status="Yes"
+      else
+        cve_status="No"
+      fi
+    fi
+  fi
+
+  echo "[Script]: ${script_status}"
+  echo "[CVEs]: ${cve_status}"
+  if [[ "$script_status" == "Yes" || "$cve_status" == "Yes" ]]; then
+    echo "See: https://github.com/liamromanis101/K8s-container_escape_audit/releases"
+  fi
+  [[ "$script_status" == "Unknown" || "$cve_status" == "Unknown" ]] && \
+    echo "(An 'Unknown' result means the corresponding remote file was missing or unreadable — check the repo manually.)"
+  echo ""
+}
 
 # ---------------------------------------------------------------------------
 # Findings store
@@ -3034,6 +3182,7 @@ _normalize_distro_id() {
     amzn)                                         echo "amazon" ;;
     sles|sled|opensuse-leap|opensuse-tumbleweed)   echo "suse" ;;
     ol)                                            echo "oracle" ;;
+    mariner)                                        echo "azurelinux" ;;   # legacy CBL-Mariner 1.0/2.0 ID; Azure Linux 3.0+ already reports ID=azurelinux directly (confirmed against a real /etc/os-release: NAME="Microsoft Azure Linux", VERSION="3.0.20240824", ID=azurelinux)
     *)                                             echo "$id" ;;
   esac
 }
@@ -3219,19 +3368,51 @@ cve_kernel_verdict() {
   # --- Heuristic fallback (non-distro kernels with no matching data) --------
   # No distro_status row, no vendor_defer row, and (if flavour != vanilla)
   # the vanilla-only NVD/upstream_fixed branches above were skipped entirely.
-  # We deliberately do NOT let this promote the verdict to fixed/not-affected/
+  # By default we do NOT let this promote the verdict to fixed/not-affected/
   # vulnerable — distro backports can move independently of the upstream
-  # x.y.z string, so that would risk a confidently WRONG verdict in either
-  # direction. But leaving the operator with zero signal is also unhelpful
-  # when, e.g., a distro simply has no cve_checks.conf row yet. Compute the
-  # upstream-only comparison (base version vs NVD ranges / upstream_fixed)
-  # and surface it as an explicitly-labeled, non-authoritative heuristic
-  # appended to the unknown verdict's evidence — never as its own verdict.
-  local heuristic=""
+  # x.y.z string within the SAME mainline series, so that comparison alone
+  # would risk a confidently WRONG verdict in either direction.
+  #
+  # ONE exception, below: if the running kernel's base series is a full
+  # mainline release series (not just a later point release) past the
+  # highest known fix boundary — e.g. running 6.17.x when the fix landed in
+  # the 6.16 series — that IS safe to promote to a confident not-affected.
+  # kernel.org mainline releases are strictly cumulative: v6.17 is built on
+  # top of, and therefore necessarily contains, every fix already in v6.16.
+  # Distro packagers build FROM an upstream tag and layer patches on top of
+  # it; they do not fork away from upstream history or drop prior mainline
+  # fixes when moving to a newer base series. This is categorically
+  # different from same-series proximity (e.g. running 6.16.50 vs a fix at
+  # 6.16.45 upstream), where distro point-release numbering is independent
+  # of upstream stable's and the comparison stays an unpromoted heuristic.
+  local heuristic="" promote_verdict="" promote_evidence=""
   local base_ver="${RUN_KVER_RAW%%-*}"
   if [[ -n "$ur" ]]; then
     local hv; hv="$(nvd_vanilla_verdict "$base_ver" "$ur")"
+    local hv_verdict="${hv%%|*}"
     heuristic=" Heuristic only (base kernel version vs NVD upstream ranges, NOT distro-backport-aware): ${hv#*|}."
+    if [[ "$hv_verdict" == "not-affected" ]]; then
+      local tok rest r_hi max_upper=""
+      for tok in $ur; do
+        case "$tok" in
+          range\|*)
+            rest="${tok#range|}"; r_hi="${rest#*|}"
+            if [[ -z "$max_upper" ]] || [[ "$(_ver_cmp_upstream "$r_hi" "$max_upper")" == "1" ]]; then
+              max_upper="$r_hi"
+            fi
+            ;;
+        esac
+      done
+      if [[ -n "$max_upper" ]]; then
+        local run_series fix_series
+        run_series="$(cut -d. -f1,2 <<<"$base_ver")"
+        fix_series="$(cut -d. -f1,2 <<<"$max_upper")"
+        if [[ "$(_ver_cmp_upstream "$run_series" "$fix_series")" == "1" ]]; then
+          promote_verdict="not-affected"
+          promote_evidence="running series ${run_series} is a full mainline release series past the highest fix boundary (${max_upper}, series ${fix_series}) for this CVE — kernel.org mainline releases are strictly cumulative, so ${run_series} necessarily contains this fix regardless of distro packaging (this differs from same-series version-number proximity, which stays heuristic-only and unpromoted)"
+        fi
+      fi
+    fi
   elif [[ -n "$up" ]]; then
     local run_series="${base_ver%.*}"
     local tok matched_ver="" mainline_ver=""
@@ -3247,10 +3428,24 @@ cve_kernel_verdict() {
         heuristic=" Heuristic only (base kernel version vs upstream-stable fix, NOT distro-backport-aware): ${base_ver} < ${ref_ver}, i.e. base version looks pre-fix."
       else
         heuristic=" Heuristic only (base kernel version vs upstream-stable fix, NOT distro-backport-aware): ${base_ver} >= ${ref_ver}, i.e. base version looks post-fix."
+        # Same full-series-past-the-fix promotion as the upstream_ranges path above.
+        if [[ -n "$mainline_ver" ]]; then
+          local run_series2 fix_series2
+          run_series2="$(cut -d. -f1,2 <<<"$base_ver")"
+          fix_series2="$(cut -d. -f1,2 <<<"$mainline_ver")"
+          if [[ "$(_ver_cmp_upstream "$run_series2" "$fix_series2")" == "1" ]]; then
+            promote_verdict="not-affected"
+            promote_evidence="running series ${run_series2} is a full mainline release series past the fix's mainline series (${mainline_ver}, series ${fix_series2}) — kernel.org mainline releases are strictly cumulative, so ${run_series2} necessarily contains this fix regardless of distro packaging"
+          fi
+        fi
       fi
     fi
   fi
-  echo "unknown|no matching fixed-version data for ${RUN_DISTRO_ID}/${RUN_DISTRO_REL} flavour=${RUN_KFLAVOUR} (running ${RUN_KVER_RAW}); cannot assert patched — verify against vendor tracker.${heuristic} Distributions routinely backport fixes without changing the upstream version string, so this heuristic can be wrong in either direction — it is supporting context only, never a substitute for the vendor advisory."
+  if [[ -n "$promote_verdict" ]]; then
+    echo "${promote_verdict}|${RUN_DISTRO_ID}/${RUN_DISTRO_REL} flavour=${RUN_KFLAVOUR} (running ${RUN_KVER_RAW}) has no distro-specific tracking data, but ${promote_evidence} — treated as ${promote_verdict} on that basis rather than left unknown. If this distro backports fixes highly unusually (e.g. deliberately reverting an upstream commit), that would be exceptional and should be independently verified; this is not blanket confirmation of every CVE at once, only this one."
+  else
+    echo "unknown|no matching fixed-version data for ${RUN_DISTRO_ID}/${RUN_DISTRO_REL} flavour=${RUN_KFLAVOUR} (running ${RUN_KVER_RAW}); cannot assert patched — verify against vendor tracker.${heuristic} Distributions routinely backport fixes without changing the upstream version string, so this heuristic can be wrong in either direction — it is supporting context only, never a substitute for the vendor advisory."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -3896,6 +4091,55 @@ _run_single_cve_check() {
       #             exposure (module fully blacklisted and socket not
       #             accessible/not applicable), or inconclusive
       #   INFO:     kernel not in affected range
+      #
+      # NOTE: "CRITICAL"/"HIGH" above are this branch's DEFAULT ceiling, not a
+      # fixed value — overall_sev is taken from CVE_FIELD[severity] where the
+      # conf specifies one lower (e.g. HIGH), so the printed [CRIT]/[WARN] tag
+      # MUST be chosen from $overall_sev via _log_severity_tag, never
+      # hardcoded to crit()/warn() directly — a hardcoded call here
+      # previously caused the console tag to read [CRIT] while the actual
+      # finding severity (and the "Severity synthesis" evidence line right
+      # above it) correctly said HIGH.
+      #
+      # _log_severity_tag additionally renders [MITIGATED] instead of the
+      # plain severity word — in the downgraded severity's own colour, not
+      # a separate "mitigated" colour — when a branch explicitly marks
+      # itself as a genuine detected control (module blacklisted), so the
+      # operator can see at a glance that HIGH/MEDIUM here means "actively
+      # downgraded by something we found" rather than "this CVE is
+      # inherently HIGH" or "we simply have no better signal." The
+      # mitigated flag is passed EXPLICITLY per branch rather than inferred
+      # from "overall_sev < ceiling" — the auto-load-risk branch below also
+      # computes a value below the CVE's ceiling, but found NO mitigating
+      # control at all (module simply isn't loaded yet), so labelling that
+      # one MITIGATED would be actively wrong/dangerous. The structured
+      # finding severity passed to _emit_cve_finding is intentionally left
+      # as the plain CRITICAL/HIGH/MEDIUM value in all cases — MITIGATED is
+      # a console-display label only, so JSON output, --fail-on thresholds,
+      # and severity aggregation elsewhere in the script are unaffected.
+      _log_severity_tag() {
+        local sev="$1" mitigated="$2"; shift 2
+        local label="$sev"
+        [[ "$mitigated" == true ]] && label="MITIGATED"
+        case "$sev" in
+          CRITICAL) [[ "$OUTPUT_JSON" == false ]] && echo -e "${RED}[${label}]${RESET}  $*" ;;
+          HIGH|MEDIUM) [[ "$OUTPUT_JSON" == false ]] && echo -e "${YELLOW}[${label}]${RESET}  $*" ;;
+          *) [[ "$QUIET" == false && "$OUTPUT_JSON" == false ]] && echo -e "${CYAN}[${label}]${RESET}  $*" ;;
+        esac
+      }
+
+      # Phrase the kernel-version clause according to what KVER_VERDICT
+      # actually established — "in range" implies a confirmed NVD/distro
+      # range hit (KVER_VERDICT=vulnerable); when the real verdict is
+      # unknown/defer (no matching distro_status/vendor_defer row), say so
+      # explicitly rather than borrowing the confident "in range" phrasing
+      # for what is actually a conservative default.
+      local kver_clause
+      case "$KVER_VERDICT" in
+        vulnerable) kver_clause="kernel ${kver} confirmed in affected range" ;;
+        defer)      kver_clause="kernel ${kver} version could not be cleared (deferred to vendor advisory) — treated conservatively as affected" ;;
+        *)          kver_clause="kernel ${kver} version unknown for this distro/release — no matching distro_status/vendor_defer row; treated conservatively as affected, NOT a confirmed range hit" ;;
+      esac
 
       if [[ "$kver_affected" == true ]]; then
         local _cfx="${CVE_FIELD[fixed_versions]:-none}"
@@ -3908,47 +4152,47 @@ _run_single_cve_check() {
           overall_sev="${CVE_FIELD[severity]:-CRITICAL}"
           _ev FLAG "Severity synthesis" \
             "kernel affected AND module currently loaded ('${mod_loaded_list}') -> ${overall_sev} (blacklist is moot once already loaded)"
-          crit "${cve} (${name}): LIKELY VULNERABLE — kernel ${kver} in range; module(s) loaded: ${mod_loaded_list}${_cfx_tag}"
+          _log_severity_tag "$overall_sev" false "${cve} (${name}): LIKELY VULNERABLE — ${kver_clause}; module(s) loaded: ${mod_loaded_list}${_cfx_tag}"
           _ev_print_stdout
           _emit_cve_finding \
-            "kernel in affected range; loaded modules: ${mod_loaded_list}; socket AF=${CVE_FIELD[socket_af]:-N/A} accessible: ${socket_accessible}" \
+            "${kver_clause}; loaded modules: ${mod_loaded_list}; socket AF=${CVE_FIELD[socket_af]:-N/A} accessible: ${socket_accessible}" \
             "$overall_sev"
         elif [[ "$socket_accessible" == true && ( "$mod_check_applicable" == false || -n "$mod_not_blacklisted" ) ]]; then
           overall_sev="${CVE_FIELD[severity]:-CRITICAL}"
           _ev FLAG "Severity synthesis" \
             "kernel affected AND socket accessible AND module gate not closed (module_names=${CVE_FIELD[module_names]:-none}, not-blacklisted='${mod_not_blacklisted:-n/a}') -> ${overall_sev}"
-          crit "${cve} (${name}): LIKELY VULNERABLE — kernel ${kver} in range; socket accessible and no effective module gate${_cfx_tag}"
+          _log_severity_tag "$overall_sev" false "${cve} (${name}): LIKELY VULNERABLE — ${kver_clause}; socket accessible and no effective module gate${_cfx_tag}"
           _ev_print_stdout
           _emit_cve_finding \
-            "kernel in affected range; socket AF=${CVE_FIELD[socket_af]:-N/A} accessible: ${socket_accessible}; modules not blacklisted: ${mod_not_blacklisted:-n/a (no module gate for this CVE)}" \
+            "${kver_clause}; socket AF=${CVE_FIELD[socket_af]:-N/A} accessible: ${socket_accessible}; modules not blacklisted: ${mod_not_blacklisted:-n/a (no module gate for this CVE)}" \
             "$overall_sev"
         elif [[ "$socket_accessible" == true && "$mod_fully_blacklisted" == true ]]; then
           overall_sev="HIGH"
           _ev FLAG "Severity synthesis" \
             "kernel affected; socket family reachable BUT module(s) confirmed blacklisted (${CVE_FIELD[module_names]:-none}) -> HIGH, not CRITICAL — socket check only confirms family-level reachability (e.g. AF_ALG core), not that the specific blacklisted transform can load; blacklist is a real but not fully-verified-at-this-precision mitigation"
-          warn "${cve} (${name}): kernel ${kver} in affected range; socket family reachable but module(s) blacklisted — downgraded from CRITICAL, verify blacklist covers the exact code path${_cfx_tag}"
+          _log_severity_tag "$overall_sev" true "${cve} (${name}): ${kver_clause}; socket family reachable but module(s) blacklisted — downgraded from CRITICAL, verify blacklist covers the exact code path${_cfx_tag}"
           _ev_print_stdout
           _emit_cve_finding \
-            "kernel in affected range; socket AF=${CVE_FIELD[socket_af]:-N/A} family is reachable, but module(s) ${CVE_FIELD[module_names]:-none} are confirmed blacklisted in /etc/modprobe.d — this blocks auto-load of the specific vulnerable transform at request_module() time, though this check cannot independently confirm the blacklist covers every code path the socket check's family-level probe does not exercise (e.g. bind()-time algorithm lookup)" \
-            "HIGH"
+            "${kver_clause}; socket AF=${CVE_FIELD[socket_af]:-N/A} family is reachable, but module(s) ${CVE_FIELD[module_names]:-none} are confirmed blacklisted in /etc/modprobe.d — this blocks auto-load of the specific vulnerable transform at request_module() time, though this check cannot independently confirm the blacklist covers every code path the socket check's family-level probe does not exercise (e.g. bind()-time algorithm lookup)" \
+            "$overall_sev"
         elif [[ -n "$mod_not_blacklisted" ]]; then
           overall_sev="HIGH"
           _ev FLAG "Severity synthesis" \
             "kernel affected; modules not loaded but not blacklisted (${mod_not_blacklisted}) — auto-load possible -> HIGH"
-          warn "${cve} (${name}): kernel ${kver} in affected range; module(s) not loaded but NOT blacklisted (auto-load risk): ${mod_not_blacklisted}${_cfx_tag}"
+          _log_severity_tag "$overall_sev" false "${cve} (${name}): ${kver_clause}; module(s) not loaded but NOT blacklisted (auto-load risk): ${mod_not_blacklisted}${_cfx_tag}"
           _ev_print_stdout
           _emit_cve_finding \
-            "kernel in affected range; modules not currently loaded but not blacklisted — auto-load on socket creation is possible: ${mod_not_blacklisted}" \
-            "HIGH"
+            "${kver_clause}; modules not currently loaded but not blacklisted — auto-load on socket creation is possible: ${mod_not_blacklisted}" \
+            "$overall_sev"
         else
           overall_sev="MEDIUM"
           _ev FLAG "Severity synthesis" \
             "kernel affected; modules not loaded and appear blacklisted/absent, socket not accessible/not applicable — interim mitigation likely, patch still required -> MEDIUM"
-          warn "${cve} (${name}): kernel ${kver} in affected range; modules appear blacklisted or absent${_cfx_tag}"
+          _log_severity_tag "$overall_sev" true "${cve} (${name}): ${kver_clause}; modules appear blacklisted or absent${_cfx_tag}"
           _ev_print_stdout
           _emit_cve_finding \
-            "kernel in affected range; modules not loaded and appear blacklisted, socket not accessible or not applicable — interim mitigation may be in effect, but kernel patch is still required" \
-            "MEDIUM"
+            "${kver_clause}; modules not loaded and appear blacklisted, socket not accessible or not applicable — interim mitigation may be in effect, but kernel patch is still required" \
+            "$overall_sev"
         fi
       else
         # kver_affected is false, but the five-state verdict distinguishes a
@@ -4165,13 +4409,15 @@ run_cve_checks() {
 if [[ "$OUTPUT_JSON" == false ]]; then
   echo -e "${BOLD}${CYAN}"
   echo "========================================================"
-  echo "  container_escape_audit.sh v4.6"
+  echo "  container_escape_audit.sh v${SCRIPT_VERSION}"
   echo "  Container escape vector detection"
   echo "  FOR AUTHORISED SECURITY ASSESSMENTS ONLY"
   echo "========================================================"
   echo -e "${RESET}"
   [[ "$NO_REPORT" == false ]] && echo -e "  Report will be written to: ${BOLD}${REPORT_FILE}${RESET}\n"
 fi
+
+check_for_updates
 
 # ---------------------------------------------------------------------------
 # Checks 1-23: original container escape checks
@@ -4249,14 +4495,8 @@ check_runtime_versions
 # ---------------------------------------------------------------------------
 # Config-driven CVE checks (reads cve_checks.conf)
 # ---------------------------------------------------------------------------
-# Resolve config file path: CLI flag > environment variable > script directory
-if [[ -z "$CVE_CONF" ]]; then
-  CVE_CONF="${CVE_CONF_ENV:-}"
-fi
-if [[ -z "$CVE_CONF" ]]; then
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  CVE_CONF="${SCRIPT_DIR}/cve_checks.conf"
-fi
+# CVE_CONF was already resolved earlier (CLI flag > environment variable >
+# script directory), right after argument parsing — see there.
 run_cve_checks "$CVE_CONF"
 
 # ---------------------------------------------------------------------------

@@ -63,14 +63,18 @@ Releases are published on GitHub with **SLSA Build Level 3 provenance**. Each re
 
 ### v4.6 — bug-fix pass, five new CVEs, and Container OS support
 
-This release fixes three detection-accuracy bugs found during review, adds five newly-disclosed CVEs, and hardens distribution coverage so the engine works correctly across the container OS landscape, not just Ubuntu.
+This release fixes four detection-accuracy bugs found during review and a follow-up audit, adds five newly-disclosed CVEs, hardens distribution coverage so the engine works correctly across the container OS landscape (not just Ubuntu), and adds two small usability improvements (`[MITIGATED]` console labeling and a `--report-name` flag).
 
 - **Severity synthesis no longer discards a confirmed module blacklist.** In `check_type=compound`, a module fully blacklisted in `/etc/modprobe.d` was previously silently overridden to CRITICAL whenever the CVE's socket-family check succeeded — even though that check only proves the generic socket *family* (e.g. AF_ALG core) is reachable, not that the specific blacklisted transform can load. The synthesis logic now recognizes four distinct states (module loaded / socket open with no gate / socket open but module blacklisted / fully mitigated) and downgrades to HIGH rather than CRITICAL when a blacklist is confirmed in place but can't be independently verified at bind()-level precision.
 - **Two broken `printf` mitigation commands fixed.** The `rec` fields for CVE-2026-43284 (Dirty Frag) and CVE-2026-43503 (DirtyClone) duplicated the correctly-quoted command from `mitigation` — but without the quotes and with a doubled backslash, so `\n` was stripped and word-split by the shell before `printf` ever saw it, silently truncating a two/three-line `modprobe.d` blacklist to the single word `install`. Fixed both, removed the duplication (rec now points to the mitigation field instead of re-stating it, closing the drift risk), and added a config-lint check that flags any future unquoted `printf` in `rec`/`mitigation` at load time.
 - **runc CVEs (CVE-2019-5736, CVE-2024-21626) now use check 52's live detection instead of a static advisory.** Previously, check 52 (`check_runtime_versions`) correctly probed the host's actual runc binary, but the CVE-database `manual` entries for these two CVEs never consulted its result — they always rendered the conf's static `component_fixed=1.0-rc7` text at CRITICAL regardless of the real installed version. Check 52 now caches its verdict globally, and the `manual` dispatch renders a **definitive** finding (CRITICAL if genuinely behind the fix, confirmed-not-vulnerable otherwise) whenever a runc binary was reachable, falling back to the original three-state advisory only when it wasn't.
 - **Five new CVE database entries** (2026-07 disclosures): **Januscape (CVE-2026-53359)**, a KVM/x86 shadow-MMU guest-to-host UAF, tracked alongside its required companion fix **CVE-2026-46113** (patching one without the other leaves the host exposed); **CVE-2026-53362**, an IPv6 fragmentation container escape; **Bad Epoll (CVE-2026-46242)**, an epoll `ep_remove()` race UAF that also roots Android v6.6+; and **GhostLock (CVE-2026-43499)**, a ~15-year-old futex priority-inheritance UAF (watch for the regression it introduced, CVE-2026-53166, in the first upstream fix attempt). None are CISA KEV-listed or confirmed exploited in the wild yet; several carry `VERIFY` markers where NVD had not published a CPE configuration at the time of writing — confirm against the vendor tracker before relying on them for automated severity scoring. Database total: 27 → 32 entries.
-- **Container OS support fixed for Amazon Linux, SUSE, and OpenShift/RHCOS.** The distro-ID normalization that feeds `distro_status`/`vendor_defer` matching previously used `/etc/os-release`'s `ID=` field verbatim, so real hosts silently failed to match the conf's vendor tokens: Amazon Linux 2/2023 report `ID=amzn` (conf uses `amazon`), SUSE reports `ID=sles` (conf uses `suse`), and OpenShift nodes (RHCOS) report `ID=rhcos` with no direct token at all despite the conf already carrying an `openshift|...` advisory row. All three now normalize correctly; RHCOS is dual-matched against both `openshift`-specific and general `rhel` rows, since it's genuinely RHEL-based (`ID_LIKE="rhel fedora"`) but also carries its own advisories. See [Container OS / distribution support](#container-os--distribution-support) for full coverage and known gaps (Alpine, Bottlerocket, Talos, Flatcar).
+- **Container OS support fixed for Amazon Linux, SUSE, OpenShift/RHCOS, and Azure Linux.** The distro-ID normalization that feeds `distro_status`/`vendor_defer` matching previously used `/etc/os-release`'s `ID=` field verbatim, so real hosts silently failed to match the conf's vendor tokens: Amazon Linux 2/2023 report `ID=amzn` (conf uses `amazon`), SUSE reports `ID=sles` (conf uses `suse`), OpenShift nodes (RHCOS) report `ID=rhcos` with no direct token at all despite the conf already carrying an `openshift|...` advisory row, and Azure Linux (AKS's node OS) wasn't recognized at all — legacy CBL-Mariner reports `ID=mariner`, current Azure Linux 3.0+ reports `ID=azurelinux` (confirmed against a real `/etc/os-release`, both now normalize to one token). RHCOS is additionally dual-matched against both `openshift`-specific and general `rhel` rows, since it's genuinely RHEL-based (`ID_LIKE="rhel fedora"`) but also carries its own advisories. See [Container OS / distribution support](#container-os--distribution-support) for full coverage and known gaps (Alpine, Bottlerocket, Talos, Flatcar).
 - **Heuristic fallback for distro kernels with no matching conf data.** Previously, a distro-packaged kernel with no `distro_status`/`vendor_defer` row for its distribution returned a bare "unknown" with zero supporting signal. The engine now also compares the running kernel's base version against the CVE's NVD upstream ranges and surfaces that as clearly-labeled, non-authoritative context — never promoted to a verdict, since distro backports can move independently of the base version string in either direction, but useful evidence while a proper `distro_status` row is added. Also added the missing `ubuntu|24.04|...` row for Copy Fail (CVE-2026-31431), which is what surfaced this gap.
+- **Full-mainline-series promotion for the heuristic fallback.** Refined the above: when a distro kernel's base version is only in the *same* mainline series as a CVE's fix (e.g. `6.16.50` vs. a fix at `6.16.1`), the comparison correctly stays an unpromoted heuristic — distro point-release numbering doesn't track upstream 1:1 within a series. But when it's a *full series* past the fix (e.g. `6.17.x` vs. a fix in the `6.16` series), it's now promoted to a confident `not-affected` verdict rather than left at a conservative "unknown" — kernel.org releases are strictly cumulative, so this isn't really a guess. A follow-up audit this surfaced also found three old CVEs (DirtyCOW, Flipping Pages, OverlayFS SetUID) with a dangling `vendor_defer` reference to a `distro_status` field that didn't exist, which — because `vendor_defer` is checked *before* the heuristic fallback — silently blocked this promotion from ever running for those CVEs on Ubuntu/Debian. Fixed.
+- **`[MITIGATED]` console tag.** When a `compound` CVE's severity is genuinely downgraded by a confirmed control (a fully blacklisted module), the terminal now shows `[MITIGATED]` in that downgraded severity's own colour instead of a plain severity word that didn't distinguish "actively downgraded by something we found" from "this CVE is just inherently this severity." A closely related state — module not loaded but also *not* blacklisted, so it could auto-load at any time — deliberately keeps the plain severity word rather than `MITIGATED`, since no real control was found there. Console-display only; JSON/structured severity values are unchanged.
+- **`--report-name` flag.** Lets you set the report file's base name (e.g. `--report-name prod-node-07`) while keeping the automatic `_<timestamp>.txt` suffix the default filename has always used, without needing to construct the full timestamped filename yourself the way `--report` requires. `--report` itself is unchanged — it still takes a complete filename verbatim, with nothing appended.
+- **`--check-updates` flag.** Fully opt-in (no network call is ever made otherwise) check against the GitHub repo for a newer script release (`release.txt`, a bare version string) and a newer CVE database (`cve_release.txt`, a bare date, compared against the local `cve_checks.conf`'s own `# Last updated:` line — so it reflects whatever conf file you're actually using). Prints a simple `[Script]: Yes|No` / `[CVEs]: Yes|No` summary; if GitHub can't be reached, says so plainly and points you at the repo instead of failing or blocking the rest of the audit.
 
 ### v4.5 — accurate version verdicts (NVD-backed CVE engine)
 
@@ -329,13 +333,29 @@ The provenance file is named `multiple.intoto.jsonl` because each release attest
 ### Options
 
 ```
---report <file>    Write detailed report to <file>
+--report <file>    Write detailed report to <file> exactly as given (no
+                   timestamp appended)
                    Default: container_escape_report_<timestamp>.txt
+--report-name <n>  Use <n> as the report file's base name, with the same
+                   "_<timestamp>.txt" suffix the default uses (e.g.
+                   --report-name prod-node-07 -> prod-node-07_20260714_153000.txt).
+                   Ignored (with a warning) if --report is also given, since
+                   --report already specifies a complete filename.
 --json             Emit JSON summary to stdout
 --quiet            Suppress info lines, print only WARN/CRITICAL to terminal
 --no-report        Skip writing the report file
 --cve-conf <file>  Path to CVE database file
                    Default: cve_checks.conf in the same directory as the script
+--check-updates    Check the GitHub repo for a newer script release and a
+                   newer CVE database. Completely opt-in — no network call
+                   is made unless this flag is given. Prints:
+                     ## Update Check:
+                     [Script]: Yes|No
+                     [CVEs]: Yes|No
+                   If GitHub can't be reached, prints that plainly and tells
+                   you to check the repo manually — never fails or blocks
+                   the rest of the audit. See "Checking for updates" below
+                   for exactly what it compares.
 --dump-state       Print the internal system-state registry (MAC/userns/proc-sys
                    signals) after the run — useful for debugging CVE verdicts
 ```
@@ -346,8 +366,15 @@ The provenance file is named `multiple.intoto.jsonl` because each release attest
 # Standard run
 ./container_escape_audit.sh
 
-# Custom report path
+# Custom report path (used exactly as given, no timestamp added)
 ./container_escape_audit.sh --report /tmp/audit_$(hostname).txt
+
+# Custom report NAME (timestamp still appended automatically)
+./container_escape_audit.sh --report-name "$(hostname)"
+# -> e.g. prod-node-07_20260714_153000.txt
+
+# Check whether a newer script version or CVE database is available
+./container_escape_audit.sh --check-updates --no-report
 
 # JSON output, filter CRITICAL findings
 ./container_escape_audit.sh --json --no-report | jq '.findings[] | select(.severity=="CRITICAL")'
@@ -358,6 +385,19 @@ The provenance file is named `multiple.intoto.jsonl` because each release attest
 # Use a centralised or updated CVE database
 ./container_escape_audit.sh --cve-conf /etc/audit/cve_checks.conf
 ```
+
+### Checking for updates
+
+`--check-updates` compares two things independently, since the script and the CVE database can each be updated on their own schedule:
+
+| What | Compared against | How |
+|---|---|---|
+| Script version | `release.txt` in the repo root (just a bare version string, e.g. `4.7`) | Semantic-version comparison against this script's own `SCRIPT_VERSION` constant |
+| CVE database | `cve_release.txt` in the repo root (just a bare date, e.g. `2026-07-20`) | Date comparison against the **local** `cve_checks.conf`'s own `# Last updated: YYYY-MM-DD` trailer line — so it reflects whichever conf file you're actually running with, not an assumption baked into the script |
+
+No network call of any kind is made unless `--check-updates` is explicitly passed — this tool otherwise makes none. If GitHub can't be reached (no network, blocked egress, or the files are temporarily unavailable), it prints that plainly and tells you to check the repository manually rather than guessing or failing silently. A result of `Unknown` for either line means the corresponding remote file was missing or unreadable, not that you're up to date — treat it the same as "couldn't check."
+
+**Maintainers:** `release.txt` and `cve_release.txt` need to be kept current as part of the release process — see [Releasing (maintainers)](#releasing-maintainers).
 
 ### Running inside a Kubernetes pod
 
@@ -603,6 +643,8 @@ For verifying releases (Option A): `gh` (GitHub CLI) and `slsa-verifier`. Both a
 | INFO | Recorded for context and cross-referencing |
 
 A single CRITICAL finding is generally enough for a complete host compromise. Multiple findings in combination can elevate lower-severity issues -- a MEDIUM seccomp finding combined with a HIGH capability finding can together constitute a practical escape path.
+
+**`[MITIGATED]` console tag.** For `check_type=compound` CVEs, when the kernel is affected but a real control was actually found and confirmed in place (specifically: the vulnerable module is confirmed blacklisted in `/etc/modprobe.d`), the terminal tag reads `[MITIGATED]` instead of the plain severity word — but rendered in *that downgraded severity's own colour* (e.g. yellow for a CRITICAL-ceiling CVE downgraded to HIGH), not a separate colour, so its urgency at a glance still matches its actual risk level. This is deliberately narrower than "severity is lower than the CVE's default" — a related state (module simply not yet loaded, but *not* blacklisted, so it could auto-load at any time) also computes below the CVE's ceiling but is **not** labelled `MITIGATED`, since no protective control was actually found there; it still shows the plain severity word. This distinction exists specifically so `MITIGATED` never overstates protection that isn't really there. Note this is a console-display label only — the structured severity value used in JSON output, `--fail-on`-style thresholds, and severity counts is always the plain CRITICAL/HIGH/MEDIUM value, unaffected by this label.
 
 ## Escape techniques covered
 
@@ -1521,13 +1563,19 @@ The version-verdict engine detects the running distribution from `/etc/os-releas
 | `sles`, `sled`, `opensuse-leap`, `opensuse-tumbleweed` | `suse` | Normalized |
 | `ol` | `oracle` | Normalized (no `oracle\|...` conf rows exist yet; ready when added) |
 | `rhcos` (OpenShift nodes) | `openshift`, aliased to `rhel` | Dual-matched: an `openshift\|...` row is checked first, falling back to a plain `rhel\|...` row, since RHCOS is genuinely RHEL-based (`ID_LIKE="rhel fedora"`, confirmed against Red Hat's own documentation) but also carries OpenShift-specific advisories in the conf. **Caveat:** `distro_status` rows that key on release number are not reliably matched for RHCOS, since its `VERSION_ID` is the OpenShift version (e.g. `4.18`), not a RHEL release number — mapping OCP versions to underlying RHEL majors isn't derivable from `/etc/os-release` alone. `vendor_defer` rows (id-only, no release check) are unaffected by this and match correctly. |
+| `azurelinux` (AKS nodes, Azure Linux 3.0+), `mariner` (legacy CBL-Mariner 1.0/2.0) | `azurelinux` | Both normalize to one token. Confirmed directly against a real `/etc/os-release` (via a systemd/mkosi bug report): Azure Linux 3.0+ reports `ID=azurelinux`; older CBL-Mariner releases reported `ID=mariner`. RPM-based (`tdnf`), Fedora-derived from v4.0 onward, with a general-purpose shell — unlike Bottlerocket/Talos below, the `rmmod`/`modprobe.d` mitigation commands in this conf should work on it. No `distro_status`/`vendor_defer` rows reference `azurelinux` yet, so version checks fall through to the heuristic upstream-version fallback described below until distro-specific data is added. |
 
 **Known gaps — flagged rather than silently assumed to work:**
 - **Alpine** — kernel-version comparison should function (it only reads `uname -r`), but this hasn't been verified end-to-end against a real Alpine host, and any recommendation text assuming `apt`/`yum`/`dnf` package managers won't apply (Alpine uses `apk`).
 - **Bottlerocket, Talos** — intentionally immutable, container-only host OSes with no general-purpose shell or package manager by design. The `rmmod` / `/etc/modprobe.d` mitigation commands this tool recommends **do not apply** on these hosts — they need an image-level or admin-container remediation path that this version does not generate. Treat any finding on these platforms as "patch the kernel," not "apply the interim mitigation."
 - **Flatcar, Photon OS, Rocky Linux, CentOS Stream** — no `distro_status`/`vendor_defer` rows reference these distributions yet in `cve_checks.conf`, and their `ID=` values have not been individually verified against the normalization map (Rocky/CentOS report `ID=rocky`/`ID=centos` and should pass through unnormalized/unmatched rather than mis-map to another distro, but this hasn't been tested on a real host). Distro-kernel version checks on these fall through to the heuristic fallback below rather than a distro-specific verdict.
 
-**Heuristic fallback for unmatched distro kernels.** When a distro-packaged kernel has no matching `distro_status`/`vendor_defer` row — whether because the distro genuinely isn't covered yet, or a specific release is missing (this is how the missing `ubuntu|24.04|...` row for Copy Fail, CVE-2026-31431, was found) — the engine no longer returns a bare `unknown` with zero supporting signal. It also compares the running kernel's base version (e.g. `6.17.0`, stripped of the distro suffix) against the CVE's NVD `upstream_ranges` and surfaces that as clearly-labeled, non-authoritative context. This is never promoted to a verdict: distro backports can move independently of the base version string in either direction, so it's supporting evidence for the operator, not a substitute for a proper `distro_status` row or the vendor's own advisory.
+**Heuristic fallback for unmatched distro kernels.** When a distro-packaged kernel has no matching `distro_status`/`vendor_defer` row — whether because the distro genuinely isn't covered yet, or a specific release is missing (this is how the missing `ubuntu|24.04|...` row for Copy Fail, CVE-2026-31431, was found) — the engine no longer returns a bare `unknown` with zero supporting signal. It compares the running kernel's base version (e.g. `6.17.0`, stripped of the distro suffix) against the CVE's NVD `upstream_ranges` and, depending on how far past the fix it is, does one of two things:
+
+- **Same mainline series as the fix** (e.g. running `6.16.50` when the fix landed at `6.16.1`): surfaced as clearly-labeled, non-authoritative context only, never promoted to a verdict. Distro point-release numbering doesn't track upstream stable's 1:1 within a series, so this genuinely is just a heuristic that can be wrong in either direction.
+- **A full mainline series past the fix** (e.g. running `6.17.x` when the fix landed in the `6.16` series): promoted to a confident `not-affected` verdict, not just an annotated `unknown`. kernel.org mainline releases are strictly cumulative — a distro's `6.17`-based kernel is necessarily built on top of everything already in `6.16`, since packagers build from an upstream tag and layer patches on top rather than forking away from upstream history. This is categorically different from same-series proximity and is safe to treat as a real answer rather than a guess.
+
+A follow-up audit across all kernel-testable CVEs after adding this also found three long-standing entries — **DirtyCOW (CVE-2016-5195)**, **Flipping Pages (CVE-2024-1086)**, and **OverlayFS SetUID Copy-Up (CVE-2023-0386)** — whose `vendor_defer` fields pointed Ubuntu/Debian at a `see-distro_status` placeholder that didn't actually exist in those entries. Because `vendor_defer` is checked *before* this heuristic fallback, that dead-end silently prevented the promotion logic above from ever running for those three CVEs on Ubuntu/Debian, regardless of how far past the (very old) fix the kernel actually was. The dangling tokens have been removed so those hosts now correctly fall through to the heuristic/promotion path.
 
 ### Keeping the database current
 
@@ -1541,6 +1589,21 @@ curl -sO https://raw.githubusercontent.com/liamromanis101/K8s-container_escape_a
 ## Releasing (maintainers)
 
 Releases are cut as Git tags matching `v*`, which triggers the SLSA provenance workflow. The workflow hashes both release artifacts, generates a signed `multiple.intoto.jsonl` attestation, and attaches it to the GitHub release.
+
+**Before tagging**, update the two small files `--check-updates` reads (both live at the repo root):
+
+```bash
+# release.txt: bare script version, matching SCRIPT_VERSION in container_escape_audit.sh
+echo "4.7" > release.txt
+
+# cve_release.txt: bare date, matching the "# Last updated:" trailer in cve_checks.conf
+echo "2026-07-20" > cve_release.txt
+
+git add release.txt cve_release.txt
+git commit -m "Bump release.txt and cve_release.txt for vX.Y"
+```
+
+If either file is forgotten, `--check-updates` will under- or over-report what's available — e.g. `release.txt` left at the old version makes every subsequent run report `[Script]: No` even after a real release ships. There's no automated check for this drift yet; treat it as a manual step alongside bumping `SCRIPT_VERSION` in the script itself.
 
 ```bash
 # Cut a new release from main (creates the tag, the release, and fires provenance)
