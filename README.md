@@ -1,6 +1,6 @@
 ![Logo](k8s_logo.png)
 
-![Version](https://img.shields.io/badge/version-4.6-blue)
+![Version](https://img.shields.io/badge/version-4.7.2-blue)
 ![Checks](https://img.shields.io/badge/checks-52-blue)
 ![CVEs tracked](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fliamromanis101%2FK8s-container_escape_audit%2Fmain%2F.github%2Fbadges%2Fcve-count.json)
 ![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)
@@ -37,7 +37,7 @@ Kubernetes Container Escape Audit focuses on exploitability:
 
 ## What it does
 
-`container_escape_audit.sh` v4.6 performs **52 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture (including SELinux/AppArmor enforcement), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64), container runtime version detection, and an updateable database of recent kernel and runtime CVEs. The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system.
+`container_escape_audit.sh` v4.7.2 performs **52 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture (including SELinux/AppArmor enforcement), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64), container runtime version detection, and an updateable database of recent kernel and runtime CVEs. The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system.
 
 Each finding comes with a structured report entry:
 
@@ -61,9 +61,9 @@ Releases are published on GitHub with **SLSA Build Level 3 provenance**. Each re
 
 ## Latest updates
 
-### v4.6 — bug-fix pass, five new CVEs, and Container OS support
+### v4.7.2 — bug-fix pass, five new CVEs, Container OS support, and update checking
 
-This release fixes four detection-accuracy bugs found during review and a follow-up audit, adds five newly-disclosed CVEs, hardens distribution coverage so the engine works correctly across the container OS landscape (not just Ubuntu), and adds two small usability improvements (`[MITIGATED]` console labeling and a `--report-name` flag).
+This release fixes five detection-accuracy bugs found during review and a follow-up audit (including a pre-existing `CVE_CONF_ENV` environment-variable bug found while wiring up update checking), adds five newly-disclosed CVEs, hardens distribution coverage so the engine works correctly across the container OS landscape (not just Ubuntu), and adds three usability improvements: `[MITIGATED]` console labeling, a `--report-name` flag, and a `--check-updates` flag.
 
 - **Severity synthesis no longer discards a confirmed module blacklist.** In `check_type=compound`, a module fully blacklisted in `/etc/modprobe.d` was previously silently overridden to CRITICAL whenever the CVE's socket-family check succeeded — even though that check only proves the generic socket *family* (e.g. AF_ALG core) is reachable, not that the specific blacklisted transform can load. The synthesis logic now recognizes four distinct states (module loaded / socket open with no gate / socket open but module blacklisted / fully mitigated) and downgrades to HIGH rather than CRITICAL when a blacklist is confirmed in place but can't be independently verified at bind()-level precision.
 - **Two broken `printf` mitigation commands fixed.** The `rec` fields for CVE-2026-43284 (Dirty Frag) and CVE-2026-43503 (DirtyClone) duplicated the correctly-quoted command from `mitigation` — but without the quotes and with a doubled backslash, so `\n` was stripped and word-split by the shell before `printf` ever saw it, silently truncating a two/three-line `modprobe.d` blacklist to the single word `install`. Fixed both, removed the duplication (rec now points to the mitigation field instead of re-stating it, closing the drift risk), and added a config-lint check that flags any future unquoted `printf` in `rec`/`mitigation` at load time.
@@ -1552,7 +1552,7 @@ When `arch=` is present and does not match `uname -m`, the engine reports the CV
 
 ### Container OS / distribution support
 
-The version-verdict engine detects the running distribution from `/etc/os-release`'s `ID=` field and normalizes it against the vendor tokens used in `distro_status` / `vendor_defer`. Coverage as of v4.6:
+The version-verdict engine detects the running distribution from `/etc/os-release`'s `ID=` field and normalizes it against the vendor tokens used in `distro_status` / `vendor_defer`. Coverage as of v4.7.2:
 
 | `/etc/os-release` `ID=` | Resolves to | Notes |
 |---|---|---|

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# container_escape_audit.sh  —  v4.6
+# container_escape_audit.sh  —  v4.7.2
 # Copyright (c) 2026 Liam Romanis
 #
 # Licence: Creative Commons Attribution-NonCommercial 4.0 International
@@ -66,7 +66,7 @@ QUIET=false
 NO_REPORT=false
 DUMP_STATE=false
 CHECK_UPDATES=false
-SCRIPT_VERSION="4.6"
+SCRIPT_VERSION="4.7.2"
 REPORT_NAME_BASE="container_escape_report"   # default base name; overridable via --report-name
 REPORT_FILE=""                                 # left empty until after arg parsing unless --report is given explicitly
 REPORT_FILE_EXPLICIT=false                     # true only if --report set the filename verbatim
@@ -185,7 +185,7 @@ check_for_updates() {
   fi
 
   local script_status="Unknown"
-  if [[ "$remote_script_ver" =~ ^[0-9]+\.[0-9]+$ ]]; then
+  if [[ "$remote_script_ver" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
     if _update_ver_lt "$SCRIPT_VERSION" "$remote_script_ver"; then
       script_status="Yes"
     else
