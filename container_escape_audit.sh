@@ -4414,10 +4414,16 @@ if [[ "$OUTPUT_JSON" == false ]]; then
   echo "  FOR AUTHORISED SECURITY ASSESSMENTS ONLY"
   echo "========================================================"
   echo -e "${RESET}"
-  [[ "$NO_REPORT" == false ]] && echo -e "  Report will be written to: ${BOLD}${REPORT_FILE}${RESET}\n"
+  [[ "$NO_REPORT" == false && "$CHECK_UPDATES" == false ]] && echo -e "  Report will be written to: ${BOLD}${REPORT_FILE}${RESET}\n"
 fi
 
 check_for_updates
+
+# --check-updates is a standalone mode: run the check, then exit — never
+# fall through into the full audit as well.
+if [[ "$CHECK_UPDATES" == true ]]; then
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Checks 1-23: original container escape checks

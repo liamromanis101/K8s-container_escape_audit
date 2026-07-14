@@ -74,7 +74,7 @@ This release fixes four detection-accuracy bugs found during review and a follow
 - **Full-mainline-series promotion for the heuristic fallback.** Refined the above: when a distro kernel's base version is only in the *same* mainline series as a CVE's fix (e.g. `6.16.50` vs. a fix at `6.16.1`), the comparison correctly stays an unpromoted heuristic — distro point-release numbering doesn't track upstream 1:1 within a series. But when it's a *full series* past the fix (e.g. `6.17.x` vs. a fix in the `6.16` series), it's now promoted to a confident `not-affected` verdict rather than left at a conservative "unknown" — kernel.org releases are strictly cumulative, so this isn't really a guess. A follow-up audit this surfaced also found three old CVEs (DirtyCOW, Flipping Pages, OverlayFS SetUID) with a dangling `vendor_defer` reference to a `distro_status` field that didn't exist, which — because `vendor_defer` is checked *before* the heuristic fallback — silently blocked this promotion from ever running for those CVEs on Ubuntu/Debian. Fixed.
 - **`[MITIGATED]` console tag.** When a `compound` CVE's severity is genuinely downgraded by a confirmed control (a fully blacklisted module), the terminal now shows `[MITIGATED]` in that downgraded severity's own colour instead of a plain severity word that didn't distinguish "actively downgraded by something we found" from "this CVE is just inherently this severity." A closely related state — module not loaded but also *not* blacklisted, so it could auto-load at any time — deliberately keeps the plain severity word rather than `MITIGATED`, since no real control was found there. Console-display only; JSON/structured severity values are unchanged.
 - **`--report-name` flag.** Lets you set the report file's base name (e.g. `--report-name prod-node-07`) while keeping the automatic `_<timestamp>.txt` suffix the default filename has always used, without needing to construct the full timestamped filename yourself the way `--report` requires. `--report` itself is unchanged — it still takes a complete filename verbatim, with nothing appended.
-- **`--check-updates` flag.** Fully opt-in (no network call is ever made otherwise) check against the GitHub repo for a newer script release (`release.txt`, a bare version string) and a newer CVE database (`cve_release.txt`, a bare date, compared against the local `cve_checks.conf`'s own `# Last updated:` line — so it reflects whatever conf file you're actually using). Prints a simple `[Script]: Yes|No` / `[CVEs]: Yes|No` summary; if GitHub can't be reached, says so plainly and points you at the repo instead of failing or blocking the rest of the audit.
+- **`--check-updates` flag.** Fully opt-in (no network call is ever made otherwise), and a standalone mode: it runs the check, prints the result, and exits — it does **not** also run the full audit. Checks the GitHub repo for a newer script release (`release.txt`, a bare version string) and a newer CVE database (`cve_release.txt`, a bare date, compared against the local `cve_checks.conf`'s own `# Last updated:` line — so it reflects whatever conf file you're actually using). Prints a simple `[Script]: Yes|No` / `[CVEs]: Yes|No` summary; if GitHub can't be reached, says so plainly and points you at the repo instead of failing or blocking. Note: combined with `--json`, it currently produces no output at all (JSON mode suppresses the plain-text update summary, and there's no JSON-formatted equivalent yet) — use it without `--json` if you want to see the result.
 
 ### v4.5 — accurate version verdicts (NVD-backed CVE engine)
 
@@ -347,15 +347,17 @@ The provenance file is named `multiple.intoto.jsonl` because each release attest
 --cve-conf <file>  Path to CVE database file
                    Default: cve_checks.conf in the same directory as the script
 --check-updates    Check the GitHub repo for a newer script release and a
-                   newer CVE database. Completely opt-in — no network call
-                   is made unless this flag is given. Prints:
+                   newer CVE database, print the result, and EXIT — this is
+                   a standalone mode; it does not also run the full audit.
+                   Completely opt-in — no network call is made unless this
+                   flag is given. Prints:
                      ## Update Check:
                      [Script]: Yes|No
                      [CVEs]: Yes|No
                    If GitHub can't be reached, prints that plainly and tells
-                   you to check the repo manually — never fails or blocks
-                   the rest of the audit. See "Checking for updates" below
-                   for exactly what it compares.
+                   you to check the repo manually. Combined with --json,
+                   currently produces no output (see "Checking for updates"
+                   below). See that section for exactly what it compares.
 --dump-state       Print the internal system-state registry (MAC/userns/proc-sys
                    signals) after the run — useful for debugging CVE verdicts
 ```
