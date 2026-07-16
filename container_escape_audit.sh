@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# container_escape_audit.sh  —  v4.7.2
+# container_escape_audit.sh  —  v4.7.3
 # Copyright (c) 2026 Liam Romanis
 #
 # Licence: Creative Commons Attribution-NonCommercial 4.0 International
@@ -66,7 +66,7 @@ QUIET=false
 NO_REPORT=false
 DUMP_STATE=false
 CHECK_UPDATES=false
-SCRIPT_VERSION="4.7.2"
+SCRIPT_VERSION="4.7.3"
 REPORT_NAME_BASE="container_escape_report"   # default base name; overridable via --report-name
 REPORT_FILE=""                                 # left empty until after arg parsing unless --report is given explicitly
 REPORT_FILE_EXPLICIT=false                     # true only if --report set the filename verbatim
@@ -2971,6 +2971,111 @@ check_runtime_versions() {
   # 'manual' check_type dispatch (CVE-2019-5736/CVE-2024-21626) reuses _ver_lt
   # against the RUNC_DETECTED_VERSION cached above.
 }
+
+check_docker_authz_bypass() {
+  hdr "53. Docker Engine AuthZ plugin bypass (CVE-2026-34040)"
+
+  # Self-contained version comparator, per this script's convention of
+  # runtime/update probes carrying their own comparator rather than depending
+  # on another check having already run and defined one.
+  _da_ver_lt() { [[ "$1" == "$2" ]] && return 1; [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$1" ]]; }
+
+  local -a docker_sockets=(
+    /var/run/docker.sock /run/docker.sock
+    /host/var/run/docker.sock /host/run/docker.sock
+  )
+  local -a dockerd_paths=(
+    /usr/bin/dockerd /usr/local/bin/dockerd /usr/sbin/dockerd
+    /host/usr/bin/dockerd /host/usr/sbin/dockerd
+  )
+
+  local docker_sock="" have_curl=false
+  command -v curl &>/dev/null && have_curl=true
+  for s in "${docker_sockets[@]}"; do
+    [[ -S "$s" ]] && { docker_sock="$s"; break; }
+  done
+
+  # --- Preferred path: query the daemon API directly over the socket. This
+  # is the only way to also observe whether an AuthZ plugin is configured,
+  # which is the precondition for CVE-2026-34040 to actually matter (a
+  # vanilla Docker install with no AuthZ plugin is not affected). ----------
+  local server_ver="" authz_plugins="" query_ok=false
+  if [[ -n "$docker_sock" && "$have_curl" == true ]]; then
+    local version_json info_json
+    version_json=$(curl -fsS --max-time 3 --unix-socket "$docker_sock" http://localhost/version 2>/dev/null)
+    info_json=$(curl -fsS --max-time 3 --unix-socket "$docker_sock" http://localhost/info 2>/dev/null)
+    if [[ -n "$version_json" ]]; then
+      query_ok=true
+      server_ver=$(printf '%s' "$version_json" | grep -oE '"Version":"[0-9]+\.[0-9]+\.[0-9]+"' | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+    fi
+    if [[ -n "$info_json" ]]; then
+      # Plugins.Authorization is an array; treat "[]" as none configured.
+      authz_plugins=$(printf '%s' "$info_json" | grep -oE '"Authorization":\[[^]]*\]' | head -1)
+      [[ "$authz_plugins" == '"Authorization":[]' ]] && authz_plugins=""
+    fi
+  fi
+
+  # --- Fallback: a dockerd binary reachable via a host-mounted path. This
+  # confirms the engine build version but NOT the AuthZ plugin configuration
+  # (that lives in daemon runtime state, not the binary), so the verdict
+  # here is necessarily weaker than the socket-query path above. -----------
+  local dockerd_bin="" dockerd_ver=""
+  if [[ "$query_ok" == false ]]; then
+    for p in "${dockerd_paths[@]}"; do
+      if [[ -x "$p" ]]; then
+        dockerd_ver=$("$p" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        [[ -n "$dockerd_ver" ]] && { dockerd_bin="$p"; break; }
+      fi
+    done
+  fi
+
+  local effective_ver="${server_ver:-$dockerd_ver}"
+  local vulnerable=false
+  [[ -n "$effective_ver" ]] && _da_ver_lt "$effective_ver" "29.3.1" && vulnerable=true
+
+  if [[ "$query_ok" == true && "$vulnerable" == true && -n "$authz_plugins" ]]; then
+    crit "VULNERABLE: Docker Engine ${effective_ver} at ${docker_sock} with AuthZ plugin(s) configured (CVE-2026-34040)"
+    add_finding "cve_2026_34040_docker_authz" "CRITICAL" \
+      "Docker Engine ${effective_ver} vulnerable to AuthZ bypass with plugin(s) configured (CVE-2026-34040)" \
+      "The Docker daemon reachable at ${docker_sock} reports Server Version ${effective_ver} (< 29.3.1) and at least one Authorization plugin is configured (${authz_plugins}). The 2024 fix for CVE-2024-41110 only handled zero-length request bodies; a request body padded past 1MB is silently truncated before it reaches the AuthZ plugin, but the daemon itself still processes the full, untruncated request." \
+      "Any principal whose Docker API access is gated by this AuthZ plugin can pad a container-creation request past 1MB so the plugin sees an empty body and approves it, while the daemon creates a privileged container with a full host filesystem mount — full host compromise, silently bypassing whatever policy (OPA, Prisma Cloud, a custom plugin) was meant to enforce it." \
+      "Trivial. A single HTTP request with no race conditions or timing dependencies; no exploit tooling is required beyond padding the request body past 1MB." \
+      "Upgrade Docker Engine to >= 29.3.1 (and Docker Desktop to >= 4.66.1) immediately. Until patched: do not rely on AuthZ plugins that inspect request bodies for security decisions, restrict Docker API access to trusted parties only, or run Docker in rootless mode / with --userns-remap to cap the blast radius if a bypass does occur."
+  elif [[ "$query_ok" == true && "$vulnerable" == true ]]; then
+    warn "Docker Engine ${effective_ver} at ${docker_sock} is pre-29.3.1 (CVE-2026-34040) but no AuthZ plugin detected"
+    add_finding "cve_2026_34040_docker_authz" "MEDIUM" \
+      "Docker Engine ${effective_ver} pre-29.3.1 (CVE-2026-34040) — no AuthZ plugin detected" \
+      "Docker Engine ${effective_ver} at ${docker_sock} predates the CVE-2026-34040 fix, but /info reports no configured Authorization plugin. This specific bypass only matters where an AuthZ plugin makes access-control decisions based on request body content — a vanilla Docker install is not affected by this particular CVE." \
+      "None from this CVE specifically while no AuthZ plugin is configured. The daemon socket itself remains a full administrative interface regardless — see the runtime-socket finding (check 4) for that separate, unconditional risk." \
+      "N/A for this CVE without an AuthZ plugin present." \
+      "Upgrade to >= 29.3.1 as routine hygiene, and re-check this finding if an AuthZ plugin is introduced later."
+  elif [[ "$query_ok" == true ]]; then
+    ok "Docker Engine ${effective_ver} at ${docker_sock} is >= 29.3.1 — patched for CVE-2026-34040"
+    add_finding "cve_2026_34040_docker_authz" "INFO" \
+      "Docker Engine ${effective_ver} — patched for CVE-2026-34040" \
+      "Docker Engine ${effective_ver} at ${docker_sock} is at or above the fixed version 29.3.1." \
+      "N/A — version appears patched." "N/A" \
+      "Confirm Docker Desktop (if used for local image builds) is also >= 4.66.1."
+  elif [[ -n "$dockerd_ver" ]]; then
+    if [[ "$vulnerable" == true ]]; then
+      warn "dockerd binary ${dockerd_ver} reachable at ${dockerd_bin} predates 29.3.1 (CVE-2026-34040) — AuthZ plugin status not observable from here"
+      add_finding "cve_2026_34040_docker_authz_binary" "MEDIUM" \
+        "dockerd ${dockerd_ver} (${dockerd_bin}) predates CVE-2026-34040 fix — AuthZ status unknown" \
+        "A dockerd binary reachable from this context (likely via a host-mounted path) reports version ${dockerd_ver}, which predates 29.3.1. The daemon socket itself was not reachable from here, so whether an AuthZ plugin is configured — the precondition for this CVE to matter — could not be confirmed." \
+        "If an AuthZ plugin relying on request-body inspection is configured on this host, the bypass described in CVE-2026-34040 applies in full." \
+        "Cannot be scored without daemon-socket access to confirm AuthZ plugin configuration — treat as verify-required, not safe." \
+        "Upgrade Docker Engine to >= 29.3.1. Confirm directly on the node with: docker info --format '{{.Plugins.Authorization}}'."
+    else
+      ok "dockerd ${dockerd_ver} (${dockerd_bin}) is >= 29.3.1 — patched for CVE-2026-34040"
+      add_finding "cve_2026_34040_docker_authz_binary" "INFO" \
+        "dockerd ${dockerd_ver} — patched for CVE-2026-34040" \
+        "dockerd binary reachable at ${dockerd_bin} reports version ${dockerd_ver}, at or above the fixed 29.3.1." \
+        "N/A — version appears patched." "N/A" "N/A"
+    fi
+  else
+    info "No Docker daemon socket or dockerd binary reachable from this context — Docker Engine version UNKNOWN (not 'safe'). Confirm 'docker version --format {{.Server.Version}}' and AuthZ plugin config on the node directly."
+  fi
+}
 # =============================================================================
 # cve_check_engine.sh  —  Config-driven CVE check engine
 # Drop-in addition to container_escape_audit.sh
@@ -4497,6 +4602,11 @@ check_kvm_arm64_vgic_its
 # Provides the detection signal referenced by the manual-type runc CVE entries.
 # ---------------------------------------------------------------------------
 check_runtime_versions
+
+# ---------------------------------------------------------------------------
+# Check 53: Docker Engine AuthZ plugin bypass (CVE-2026-34040)
+# ---------------------------------------------------------------------------
+check_docker_authz_bypass
 
 # ---------------------------------------------------------------------------
 # Config-driven CVE checks (reads cve_checks.conf)
