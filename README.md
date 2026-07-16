@@ -1,7 +1,7 @@
 ![Logo](k8s_logo.png)
 
-![Version](https://img.shields.io/badge/version-4.7.2-blue)
-![Checks](https://img.shields.io/badge/checks-52-blue)
+![Version](https://img.shields.io/badge/version-4.7.3-blue)
+![Checks](https://img.shields.io/badge/checks-53-blue)
 ![CVEs tracked](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fliamromanis101%2FK8s-container_escape_audit%2Fmain%2F.github%2Fbadges%2Fcve-count.json)
 ![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)
 
@@ -37,7 +37,7 @@ Kubernetes Container Escape Audit focuses on exploitability:
 
 ## What it does
 
-`container_escape_audit.sh` v4.7.2 performs **52 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture (including SELinux/AppArmor enforcement), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64), container runtime version detection, and an updateable database of recent kernel and runtime CVEs. The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system.
+`container_escape_audit.sh` v4.7.3 performs **53 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture (including SELinux/AppArmor enforcement), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64), container runtime version detection, Docker Engine daemon-level authorization bypass detection, and an updateable database of recent kernel and runtime CVEs. The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system.
 
 Each finding comes with a structured report entry:
 
@@ -60,6 +60,14 @@ One note on running as root: checks 1, 2, and 27 (privileged mode, dangerous cap
 Releases are published on GitHub with **SLSA Build Level 3 provenance**. Each release carries a signed `multiple.intoto.jsonl` attestation covering both `container_escape_audit.sh` and `cve_checks.conf`, so you can cryptographically confirm that the files you're about to run as root were built by this repository's release workflow and have not been tampered with. See [Verifying the download](#verifying-the-download) below. Because this tool is intended to run with elevated privileges during assessments, verifying provenance before each use is strongly recommended.
 
 ## Latest updates
+
+### v4.7.3 — Docker Engine daemon-level check (CVE-2026-34040)
+
+Adds **check 53**, the first check targeting the Docker *daemon* itself rather than the container runtime binary or kernel. It closes a gap identified during a manual review of container-escape coverage: everything up to check 52 detects escape vectors reachable from inside a container or via a host-mounted runtime binary, but nothing probed the Docker Engine's own authorization layer.
+
+- **New: Docker Engine AuthZ plugin bypass detection (CVE-2026-34040, CVSS 8.8).** The 2024 fix for CVE-2024-41110 only handled zero-length request bodies; a request body padded past 1MB is silently truncated before it reaches an AuthZ plugin (OPA, Prisma Cloud, custom policies), while the daemon itself still processes the full request — letting an attacker create a privileged container with a full host mount while the plugin approves what looks like an empty request. Fixed in Docker Engine 29.3.1 / Docker Desktop 4.66.1.
+- Detection is layered like checks 25/26/52: it first queries the daemon socket directly (`/version` + `/info` over `--unix-socket`) to get both the exact Server Version *and* whether an AuthZ plugin is actually configured — the precondition for this CVE to matter, since a vanilla Docker install with no AuthZ plugin isn't affected by it. Severity is graduated accordingly: **CRITICAL** only when pre-29.3.1 *and* an AuthZ plugin is present, **MEDIUM** when pre-29.3.1 with no plugin detected (hygiene-only), **INFO** when patched. If the socket isn't reachable, it falls back to a `dockerd` binary reachable via a host-mounted path (same technique check 52 uses for runc/containerd/cri-o) and reports the version while honestly flagging that AuthZ-plugin status can't be confirmed that way — never silently "safe."
+- **Not yet in `cve_checks.conf`.** Unlike the runc CVEs (CVE-2019-5736, CVE-2024-21626), which get a `check_type=manual` tracking entry cross-referenced against check 52's cached verdict, CVE-2026-34040 isn't in the CVE database yet — check 53 is a standalone script check for now. Adding a `manual` conf entry and extending the cross-reference block to consult check 53's verdict (the same way it already does for `RUNC_VERDICT_*`) is planned for a follow-up release, so the CVE ID appears in inventory/compliance reporting as well.
 
 ### v4.7.2 — bug-fix pass, five new CVEs, Container OS support, and update checking
 
@@ -199,7 +207,7 @@ These checks read sysctl values from `/proc/sys` and compare them against the re
 | 46 | esp4 / esp6 / rxrpc modules | not loaded / blacklisted | Dirty Frag (CVE-2026-43284/43500), Fragnesia (CVE-2026-46300), DirtyClone (CVE-2026-43503) |
 | 47 | Dangerous loaded modules audit | — | 15 modules checked incl. algif_aead, ksmbd, rds, rds_tcp, nf_tables, dccp, sctp, bluetooth |
 
-### Runtime escape-surface probes (new checks 48-52)
+### Runtime escape-surface probes (new checks 48-53)
 
 Read-only reachability probes for container-escape and LPE attack surfaces flagged by the CVE monitor's gap analysis. Each tests whether a subsystem is reachable from the current context (syscall, socket, or socket-file presence) without attempting to trigger any vulnerability. They complement the version/module/socket detection done by the CVE engine.
 
@@ -210,10 +218,13 @@ Read-only reachability probes for container-escape and LPE attack surfaces flagg
 | 50 | Kata Containers agent socket / shared dir exposure | HIGH/MEDIUM | CVE-2026-41326 (CopyFile symlink subversion) |
 | 51 | KVM/arm64 vGIC-ITS guest-to-host exposure (arch-aware) | HIGH/INFO | CVE-2026-46316 (ITScape) |
 | 52 | Container runtime version probe (runc / containerd / cri-o, best-effort read-only) | CRITICAL/MEDIUM/INFO | CVE-2019-5736, CVE-2024-21626 (runc escapes) |
+| 53 | Docker Engine daemon version + AuthZ plugin configuration probe (socket API, `dockerd` binary fallback) | CRITICAL/MEDIUM/INFO | CVE-2026-34040 (Docker Engine AuthZ bypass) |
 
 > Check 51 is architecture-aware: on x86_64 it reports "not applicable"; on arm64 it distinguishes a KVM host (`/dev/kvm` present) from a guest vantage point (GICv3/ITS present, no `/dev/kvm`) and adjusts severity accordingly.
 
 > Check 52 reads any reachable runc / containerd / cri-o binary and runs `<binary> --version` (never executing untrusted output, never writing). Because a container usually cannot see the host runtime binary, it uses a three-state verdict: a reachable version is compared directly; if none is reachable but the process is unmapped in-container root, it reports the runc-escape preconditions as *potentially exposed*; otherwise the version is *unknown* — never silently *safe*. Its runc verdict is also cached and consulted directly by the CVE-database `manual` entries for CVE-2019-5736 and CVE-2024-21626 (see [Config-driven CVE checks](#config-driven-cve-checks)), so a reachable binary produces a definitive per-CVE finding rather than a static advisory.
+
+> Check 53 targets the Docker **daemon** rather than a runtime binary. It prefers querying the daemon socket directly (`/version` + `/info` over `--unix-socket`) because that's the only vantage point from which the AuthZ plugin configuration — the precondition for CVE-2026-34040 to matter — is observable at all; a vanilla Docker install with no AuthZ plugin is not affected by this specific CVE even if the version is old. When the socket isn't reachable, it falls back to a `dockerd` binary at a host-mounted path (mirroring check 52's technique) but is explicit that AuthZ-plugin status can't be confirmed that way, and marks the finding verify-required rather than assuming safety either way. Unlike check 52's runc verdict, check 53's result is not yet cross-referenced by a `cve_checks.conf` entry — see [v4.7.3 changelog](#v473--docker-engine-daemon-level-check-cve-2026-34040).
 
 ### Config-driven CVE checks
 
@@ -656,6 +667,8 @@ Checks 24-35 add coverage for more recent and less commonly checked vectors: Cop
 
 Checks 48-51 extend coverage to recently disclosed container-escape and LPE attack surfaces: io_uring reachability (CVE-2026-43121 zcrx out-of-bounds write and the broader io_uring LPE class), kTLS/sockmap ULP attach surface (the "Reverse Order" and `tls_sk_proto_close()` use-after-free reports), Kata Containers agent-socket exposure (CVE-2026-41326 CopyFile symlink subversion), and arm64 KVM/vGIC-ITS guest-to-host exposure (CVE-2026-46316 ITScape — the first public KVM/arm64 escape).
 
+Check 53 adds the first daemon-level check: Docker Engine's authorization (AuthZ) plugin bypass (CVE-2026-34040), where an oversized request body is silently dropped before an AuthZ plugin inspects it while the daemon still processes the full request, letting an attacker create a privileged, host-mounted container despite policy enforcement being in place.
+
 The config-driven CVE engine additionally covers the most recent kernel privilege-escalation and container-escape issues, including ptrace credential hijack (CVE-2026-46333), nf_tables anonymous-set use-after-free (CVE-2026-23111), Fragnesia ESP (CVE-2026-46300), ITScape KVM/arm64 escape (CVE-2026-46316), Januscape KVM/x86 shadow-MMU escape (CVE-2026-53359, with its required companion fix CVE-2026-46113), an IPv6 fragmentation container escape (CVE-2026-53362), the epoll `ep_remove()` race UAF Bad Epoll (CVE-2026-46242), the futex priority-inheritance UAF GhostLock (CVE-2026-43499), the io_uring zcrx OOB write (CVE-2026-43121), the ksmbd remote kernel UAF (CVE-2022-47939), and a set of container-runtime CVEs tracked as advisory entries (Kata CVE-2026-41326, containerd CVE-2026-46680, Podman CVE-2026-55686, runc CVE-2026-41579 plus the historical runc escapes CVE-2019-5736 and CVE-2024-21626 "Leaky Vessels", and the classic cgroup release_agent escape CVE-2022-0492 / CISA KEV). See the [Recent CVEs](#recent-cves) detail section below.
 
 ## Exploitation reference
@@ -980,6 +993,25 @@ Remediation:
 - Update runc to 1.2.8, 1.3.3, or 1.4.0-rc.3
 - Enable user namespaces for containers (host root not mapped)
 - AppArmor and SELinux provide limited protection due to CVE-2025-52881's LSM bypass
+
+#### Check 53 -- Docker Engine AuthZ plugin bypass (CVE-2026-34040) (CRITICAL)
+
+Disclosed April 2026. The 2024 fix for CVE-2024-41110 closed the zero-length-request-body AuthZ bypass but missed the opposite edge case: a request body padded past 1MB is silently truncated by Docker's middleware before an AuthZ plugin (OPA, Prisma Cloud, custom policy engines) ever sees it. The plugin approves what looks like an empty, harmless request -- but the daemon itself processes the full, untruncated body and creates the container exactly as requested. No race condition, no special tooling, a single crafted HTTP request. Only matters where an AuthZ plugin is configured to make decisions based on request-body content; a vanilla Docker install with no AuthZ plugin isn't affected by this specific CVE. Affects Docker Engine versions before 29.3.1.
+
+```bash
+# Conceptual shape of the bypass: pad a container-create request past 1MB
+# so the AuthZ plugin sees nothing to inspect, while the daemon still
+# honours the full body -- e.g. a host-root bind mount plus --privileged.
+curl -s --unix-socket /var/run/docker.sock \
+  -X POST -H 'Content-Type: application/json' \
+  --data-binary @padded_privileged_create.json \
+  http://localhost/containers/create
+```
+
+Remediation:
+- Upgrade Docker Engine to 29.3.1 or later (Docker Desktop 4.66.1 or later)
+- Interim: do not rely on AuthZ plugins that inspect request bodies for security decisions; restrict Docker API access to trusted parties; run rootless Docker or with `--userns-remap` to cap the blast radius
+- Verify with: `docker version --format '{{.Server.Version}}'` and `docker info --format '{{.Plugins.Authorization}}'`
 
 #### CVE-2026-46333 -- Ptrace Credential Hijack (HIGH)
 
@@ -1666,6 +1698,7 @@ Sponsorship does not grant exclusivity or any change to the open licence for non
 - [CVE-2024-1086 Flipping Pages](https://github.com/Notselwyn/CVE-2024-1086)
 - [CVE-2025-23266 NVIDIAScape](https://www.wiz.io/blog/nvidia-ai-vulnerability-cve-2025-23266-nvidiascape)
 - [CVE-2025-31133 runc masked path](https://www.cncf.io/blog/2025/11/28/runc-container-breakout-vulnerabilities-a-technical-overview/)
+- [CVE-2026-34040 Docker Engine AuthZ plugin bypass (Cyera Research)](https://www.cyera.com/blog/cyera-research-discovers-docker-authorization-bypass-that-silently-disables-security-policies)
 - [CVE-2026-46316 ITScape — KVM/arm64 guest-to-host escape](https://seclists.org/oss-sec/2026/q2/877)
 - [CVE-2026-43121 io_uring zcrx freelist OOB](https://seclists.org/oss-sec/2026/q2/444)
 - [CVE-2022-47939 ksmbd UAF RCE (Wiz)](https://www.wiz.io/blog/cve-2022-47939-critical-vulnerability-linux-kernel-ksmbd-module-everything-you-ne)
