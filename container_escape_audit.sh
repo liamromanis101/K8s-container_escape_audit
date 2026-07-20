@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# container_escape_audit.sh  —  v4.7.3
+# container_escape_audit.sh  —  v4.7.4
 # Copyright (c) 2026 Liam Romanis
 #
 # Licence: Creative Commons Attribution-NonCommercial 4.0 International
@@ -66,7 +66,7 @@ QUIET=false
 NO_REPORT=false
 DUMP_STATE=false
 CHECK_UPDATES=false
-SCRIPT_VERSION="4.7.3"
+SCRIPT_VERSION="4.7.4"
 REPORT_NAME_BASE="container_escape_report"   # default base name; overridable via --report-name
 REPORT_FILE=""                                 # left empty until after arg parsing unless --report is given explicitly
 REPORT_FILE_EXPLICIT=false                     # true only if --report set the filename verbatim
@@ -2937,7 +2937,47 @@ check_runtime_versions() {
   for p in "${containerd_paths[@]}"; do
     if ctr_ver=$(_rt_version_of "$p" 2>/dev/null); then ctr_bin="$p"; break; fi
   done
-  [[ -n "$ctr_ver" ]] && { found_any=true; info "containerd ${ctr_ver} reachable at ${ctr_bin} (cross-check against CVE-2026-46680 fixed 1.7.32/2.0.9/2.2.4/2.3.1)"; }
+  # Cache globally so the CVE-database 'manual' dispatch for the 2026-06
+  # containerd CRI cluster (CVE-2026-50195/53488/53492/53489/47262) and for
+  # CVE-2026-46680 can consult the ALREADY-detected containerd version rather
+  # than rendering a static advisory. Empty = not reachable here = UNKNOWN
+  # (callers must treat that as verify-required, not as evidence of safety).
+  CONTAINERD_DETECTED_VERSION="$ctr_ver"
+  CONTAINERD_DETECTED_PATH="$ctr_bin"
+  CONTAINERD_CRI_VERDICT=""
+  if [[ -n "$ctr_ver" ]]; then
+    found_any=true
+    # Branch-appropriate fix for the 2026-06 CRI cluster:
+    #   1.7 -> 1.7.33   2.0 -> 2.0.10   2.1 -> 2.1.9   2.2 -> 2.2.5   2.3 -> 2.3.2
+    # Pick the fix for THIS binary's major.minor branch and compare the patch
+    # level. Branches outside the 1.7-2.3 table are left UNKNOWN (verify), not
+    # cleared — an unrecognised/older branch is not evidence of being patched.
+    local ctr_mm="${ctr_ver%.*}" ctr_fix=""
+    case "$ctr_mm" in
+      1.7) ctr_fix="1.7.33" ;;
+      2.0) ctr_fix="2.0.10" ;;
+      2.1) ctr_fix="2.1.9"  ;;
+      2.2) ctr_fix="2.2.5"  ;;
+      2.3) ctr_fix="2.3.2"  ;;
+    esac
+    if [[ -n "$ctr_fix" ]]; then
+      if _ver_lt "$ctr_ver" "$ctr_fix"; then
+        CONTAINERD_CRI_VERDICT="vulnerable"
+        crit "containerd ${ctr_ver} at ${ctr_bin} predates the CRI-cluster fix ${ctr_fix} (CVE-2026-50195/53488/53492/53489/47262); also cross-check CVE-2026-46680 (1.7.32/2.0.9/2.2.4/2.3.1)"
+        add_finding "runtime_containerd_cri_cluster" "CRITICAL" \
+          "Vulnerable containerd detected: ${ctr_ver} (${ctr_bin})" \
+          "A containerd binary reachable from this context reports version ${ctr_ver}, which predates the ${ctr_fix} fix for its release branch. The 2026-06 containerd CRI-plugin advisory (AWS 2026-046) covers CVE-2026-50195 (checkpoint image-cache poisoning / cross-pod RCE, CVSS 8.8), CVE-2026-53488 (image LABEL host command exec, 8.3), CVE-2026-53492 (CDI annotation host-mount injection, 6.8), CVE-2026-53489 (checkpoint-restore host file read) and CVE-2026-47262 (image-triggered DoS). Because the binary was reachable, this is a definitive VERIFY-ON-HOST verdict rather than an inventory-only advisory." \
+          "Cross-pod code execution and container-to-host command execution on shared nodes — a lateral-movement and escape primitive. containerd underpins EKS/ECS/Fargate/Bottlerocket/Amazon Linux, so managed platforms are in scope until node runtimes are patched." \
+          "Definitive where the reachable binary is the one the node actually uses to run containers. If this is a leaked/host-mounted copy, confirm it matches the active runtime." \
+          "Upgrade containerd to >= 2.3.2 / 2.2.5 / 2.1.9 / 2.0.10 / 1.7.33. Disable checkpoint/restore (CRIU) and CDI if unused. Restrict pod-create RBAC and admit only trusted images. Verify with 'containerd --version' on the node."
+      else
+        CONTAINERD_CRI_VERDICT="fixed"
+        ok "containerd ${ctr_ver} (${ctr_bin}) is at or above the ${ctr_fix} CRI-cluster fix for its branch (CVE-2026-50195 et al.); cross-check CVE-2026-46680 separately"
+      fi
+    else
+      info "containerd ${ctr_ver} reachable at ${ctr_bin} — branch outside the 1.7-2.3 CRI-cluster table; verify against CVE-2026-50195 et al. and CVE-2026-46680 (fixed 1.7.32/2.0.9/2.2.4/2.3.1) manually"
+    fi
+  fi
 
   # --- cri-o --------------------------------------------------------------
   local crio_bin="" crio_ver=""
@@ -3300,6 +3340,12 @@ RUN_DISTRO_ID=""; RUN_DISTRO_REL=""; RUN_KFLAVOUR=""; RUN_KVER_RAW=""; RUN_KPKG_
 # in the same run. Empty string = not reachable from this context (unknown).
 RUNC_DETECTED_VERSION=""; RUNC_DETECTED_PATH=""
 RUNC_VERDICT_CVE_2019_5736=""; RUNC_VERDICT_CVE_2024_21626=""
+# containerd: cached by check 52 so the CVE-database 'manual' dispatch for the
+# 2026-06 containerd CRI cluster (CVE-2026-50195/53488/53492/53489/47262) can
+# consult the already-detected version. CONTAINERD_CRI_VERDICT is branch-aware:
+# vulnerable | fixed | "" (unknown / not reachable — never treated as safe).
+CONTAINERD_DETECTED_VERSION=""; CONTAINERD_DETECTED_PATH=""
+CONTAINERD_CRI_VERDICT=""
 # Secondary distro-id alias for hosts whose OS is legitimately covered by
 # TWO vendor tokens in cve_checks.conf at once (e.g. RHCOS reports ID=rhcos,
 # but is RHEL-based (ID_LIKE="rhel fedora") AND has its own OpenShift-specific
@@ -4378,6 +4424,36 @@ _run_single_cve_check() {
         fi
         return
       fi
+
+      # --- Check-52 cross-reference (containerd CRI cluster) -------------
+      # The 2026-06 containerd CRI-plugin CVEs (component=containerd) are keyed
+      # off check 52's live, branch-aware containerd probe the same way the runc
+      # CVEs are, so a reachable binary yields a definitive verdict instead of a
+      # static CRITICAL advisory. CVE-2026-46680 keeps its own (behavioural)
+      # handling and is intentionally NOT in this list.
+      case "$cve" in
+        CVE-2026-50195|CVE-2026-53488|CVE-2026-53492|CVE-2026-53489|CVE-2026-47262)
+          if [[ "$comp" == "containerd" && -n "$CONTAINERD_CRI_VERDICT" ]]; then
+            if [[ "$CONTAINERD_CRI_VERDICT" == "vulnerable" ]]; then
+              crit "${cve} (${name}): CONFIRMED — containerd ${CONTAINERD_DETECTED_VERSION} at ${CONTAINERD_DETECTED_PATH} predates its branch fix (CRI cluster: 2.3.2/2.2.5/2.1.9/2.0.10/1.7.33)"
+              _ev FLAG "Check 52 cross-reference" \
+                "containerd ${CONTAINERD_DETECTED_VERSION} detected at ${CONTAINERD_DETECTED_PATH}; predates the CRI-cluster branch fix — confirmed vulnerable, not advisory-only"
+              _ev_print_stdout
+              _emit_cve_finding \
+                "containerd ${CONTAINERD_DETECTED_VERSION} detected at ${CONTAINERD_DETECTED_PATH} (via check 52) — predates the branch fix for the 2026-06 CRI cluster. Definitive verdict from an actually-reachable binary, not an inventory-only advisory." \
+                "$msev"
+            else
+              ok "${cve} (${name}): containerd ${CONTAINERD_DETECTED_VERSION} at ${CONTAINERD_DETECTED_PATH} is at or above its branch fix — not vulnerable"
+              _ev PASS "Check 52 cross-reference" \
+                "containerd ${CONTAINERD_DETECTED_VERSION} detected at ${CONTAINERD_DETECTED_PATH}; at or above the CRI-cluster branch fix"
+              _ev_print_stdout
+              _emit_cve_finding \
+                "containerd ${CONTAINERD_DETECTED_VERSION} detected at ${CONTAINERD_DETECTED_PATH} (via check 52) — at or above the branch fix for this CVE. Confirmed not vulnerable, not merely 'no signal'." \
+                "INFO"
+            fi
+            return
+          fi ;;
+      esac
 
       # --- Fallback: no check-52 detection available here -----------------
       # Dual-nature entries (e.g. CVE-2022-0492 cgroup release_agent) carry
