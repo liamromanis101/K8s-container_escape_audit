@@ -1,7 +1,7 @@
 ![Logo](k8s_logo.png)
 
-![Version](https://img.shields.io/badge/version-4.7.4-blue)
-![Checks](https://img.shields.io/badge/checks-53-blue)
+![Version](https://img.shields.io/badge/version-4.7.5-blue)
+![Checks](https://img.shields.io/badge/checks-54-blue)
 ![CVEs tracked](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fliamromanis101%2FK8s-container_escape_audit%2Fmain%2F.github%2Fbadges%2Fcve-count.json)
 ![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)
 
@@ -37,7 +37,7 @@ Kubernetes Container Escape Audit focuses on exploitability:
 
 ## What it does
 
-`container_escape_audit.sh` v4.7.3 performs **53 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture (including SELinux/AppArmor enforcement), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64), container runtime version detection, Docker Engine daemon-level authorization bypass detection, and an updateable database of recent kernel and runtime CVEs. The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system.
+`container_escape_audit.sh` v4.7.5 performs **54 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture (including SELinux/AppArmor enforcement), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64, DRM/GPU render nodes), container runtime version detection, Docker Engine daemon-level authorization bypass detection, and an updateable database of recent kernel and runtime CVEs. The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system.
 
 Each finding comes with a structured report entry:
 
@@ -60,6 +60,14 @@ One note on running as root: checks 1, 2, and 27 (privileged mode, dangerous cap
 Releases are published on GitHub with **SLSA Build Level 3 provenance**. Each release carries a signed `multiple.intoto.jsonl` attestation covering both `container_escape_audit.sh` and `cve_checks.conf`, so you can cryptographically confirm that the files you're about to run as root were built by this repository's release workflow and have not been tampered with. See [Verifying the download](#verifying-the-download) below. Because this tool is intended to run with elevated privileges during assessments, verifying provenance before each use is strongly recommended.
 
 ## Latest updates
+
+### v4.7.5 — DRM render-node escape (CVE-2026-46215) + new check 54
+
+Adds coverage for a newly disclosed local-root / render-node container-escape flaw. CVE database: **38 → 39 entries**; check count **53 → 54**.
+
+- **New: CVE-2026-46215 — DRM GEM `change_handle` use-after-free.** A UAF / TOCTTOU in the `DRM_IOCTL_GEM_CHANGE_HANDLE` ioctl, added in v6.18-rc1 for AMD's CRIU checkpoint/restore work: the ioctl briefly leaves one GEM object with two IDR entries while its handle count still reads 1, and a concurrent `gem_close` leaves a dangling handle to dereference. Any process that can open a render node (`/dev/dri/renderD*`) can reach it; on desktop distros systemd-logind grants that to the active session, and a public PoC reaches passwordless root (bypassing the 2022 DirtyPipe mitigation along the way). Encoded as a `kernel_version` entry — **narrow range**: introduced v6.18, fixed **6.18.32 / 7.0.9 / 7.1-rc3** (the ioctl is removed entirely in 7.1), so the common container-host LTS kernels (5.15 / 6.1 / 6.6 / 6.12) are *not* affected.
+- **New check 54 — `check_drm_render_node_escape` (behavioural precondition probe).** The container-escape relevance of this CVE is conditional on a render node being exposed into the container (GPU passthrough for AI/ML or media workloads), so check 54 probes whether `/dev/dri/renderD*` (or a `card*` / `/host`-mounted node) is reachable from the audited context — read-only, listing and stat-ing nodes without opening them. It gates on the ≥6.18 kernel floor (pre-6.18 → INFO/not-applicable), reports HIGH when a node is reachable on an in-range kernel (MEDIUM if the node exists but isn't accessible to the current user), and defers the authoritative patched/unpatched verdict to the CVE engine. This is the same behavioural-probe-plus-version-entry pairing already used by check 48 ↔ CVE-2026-43121 (io_uring) and check 51 ↔ CVE-2026-46316 (KVM/arm64).
+- **No `vendor_defer` on this entry, by design.** Because the fix floor is v6.18, a blanket defer would mislabel the many unaffected pre-6.18 distro kernels as "consult advisory"; instead the vanilla path marks pre-6.18 not-affected and check 54 provides the practical signal. Add `distro_status=<distro>|<rel>|not-affected` rows if you want the engine itself to clear specific pre-6.18 distro releases.
 
 ### v4.7.4 — containerd CRI-plugin cluster + CrackArmor (six new CVEs)
 
@@ -216,7 +224,7 @@ These checks read sysctl values from `/proc/sys` and compare them against the re
 | 46 | esp4 / esp6 / rxrpc modules | not loaded / blacklisted | Dirty Frag (CVE-2026-43284/43500), Fragnesia (CVE-2026-46300), DirtyClone (CVE-2026-43503) |
 | 47 | Dangerous loaded modules audit | — | 15 modules checked incl. algif_aead, ksmbd, rds, rds_tcp, nf_tables, dccp, sctp, bluetooth |
 
-### Runtime escape-surface probes (new checks 48-53)
+### Runtime escape-surface probes (new checks 48-54)
 
 Read-only reachability probes for container-escape and LPE attack surfaces flagged by the CVE monitor's gap analysis. Each tests whether a subsystem is reachable from the current context (syscall, socket, or socket-file presence) without attempting to trigger any vulnerability. They complement the version/module/socket detection done by the CVE engine.
 
@@ -228,6 +236,7 @@ Read-only reachability probes for container-escape and LPE attack surfaces flagg
 | 51 | KVM/arm64 vGIC-ITS guest-to-host exposure (arch-aware) | HIGH/INFO | CVE-2026-46316 (ITScape) |
 | 52 | Container runtime version probe (runc / containerd / cri-o, best-effort read-only) | CRITICAL/MEDIUM/INFO | CVE-2019-5736, CVE-2024-21626 (runc escapes) |
 | 53 | Docker Engine daemon version + AuthZ plugin configuration probe (socket API, `dockerd` binary fallback) | CRITICAL/MEDIUM/INFO | CVE-2026-34040 (Docker Engine AuthZ bypass) |
+| 54 | DRM render-node reachability (`/dev/dri/renderD*` / `card*`, read-only; ≥6.18 kernel gate) | HIGH/MEDIUM/INFO | CVE-2026-46215 (GEM `change_handle` UAF) |
 
 > Check 51 is architecture-aware: on x86_64 it reports "not applicable"; on arm64 it distinguishes a KVM host (`/dev/kvm` present) from a guest vantage point (GICv3/ITS present, no `/dev/kvm`) and adjusts severity accordingly.
 
@@ -237,7 +246,7 @@ Read-only reachability probes for container-escape and LPE attack surfaces flagg
 
 ### Config-driven CVE checks
 
-CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with thirty-eight entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
+CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with thirty-nine entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
 
 Kernel-CVE entries carry authoritative NVD version data in an enriched schema: `upstream_ranges` (NVD CPE affected/fixed ranges for vanilla kernels), `distro_status` (per-distribution-release fixed / not-affected / vulnerable, with exact package versions for Debian and Ubuntu), and `vendor_defer` (distributions such as RHEL / Amazon / SUSE whose back-ports can't be judged from a version string). The engine reads these to produce a **vulnerable / not-affected / defer / unknown** verdict appropriate to the running system, rather than a naive comparison.
 
@@ -281,6 +290,7 @@ Kernel-CVE entries carry authoritative NVD version data in an enriched schema: `
 | CVE-2026-53489 | containerd Checkpoint-Restore Host File Read | VERIFY | | |
 | CVE-2026-47262 | containerd Image-Triggered Runtime DoS | VERIFY | | |
 | CVE-2026-23268 | CrackArmor AppArmor Confused Deputy (anchors 11-CVE set) | 7.8 | | |
+| CVE-2026-46215 | DRM GEM change_handle UAF (render-node LPE / escape) | 7.8 | | |
 
 > **2026-07-20 sweep (containerd CRI cluster + CrackArmor).** The 2026-06 containerd CRI-plugin cluster — CVE-2026-50195 (cross-pod RCE via checkpoint image-cache poisoning), CVE-2026-53488 (image LABEL host command exec), CVE-2026-53492 (CDI annotation host-mount injection), CVE-2026-53489 (checkpoint-restore host file read), CVE-2026-47262 (image DoS) — is `component=containerd` and fixed in containerd 2.3.2 / 2.2.5 / 2.1.9 / 2.0.10 / 1.7.33; check 52 now computes a branch-aware verdict and the `manual` dispatch renders a definitive finding when a containerd binary is reachable. CrackArmor (CVE-2026-23268 anchoring the eleven-CVE Qualys AppArmor set) is a `kernel_version` entry with `introduced=4.11` and `vendor_defer` to the distro trackers, since the fixes are distro-backported. `VERIFY` markers: CVE-2026-53489 and CVE-2026-47262 CVSS, the exact containerd 1.7.x lower bound, and CrackArmor's per-CVE NVD CVSS / per-distro fixed kernel versions — confirm against the vendor advisory before relying on them for automated severity scoring. The Leaky Vessels BuildKit siblings (CVE-2024-23651/23652/23653) remain intentionally out of scope as image-build tooling; the Project Glasswing / Mythos Linux LPE is not yet encodable (still under disclosure embargo — no public CVE ID or fix commit).
 

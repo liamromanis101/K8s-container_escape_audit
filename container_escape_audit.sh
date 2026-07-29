@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# container_escape_audit.sh  —  v4.7.4
+# container_escape_audit.sh  —  v4.7.5
 # Copyright (c) 2026 Liam Romanis
 #
 # Licence: Creative Commons Attribution-NonCommercial 4.0 International
@@ -66,7 +66,7 @@ QUIET=false
 NO_REPORT=false
 DUMP_STATE=false
 CHECK_UPDATES=false
-SCRIPT_VERSION="4.7.4"
+SCRIPT_VERSION="4.7.5"
 REPORT_NAME_BASE="container_escape_report"   # default base name; overridable via --report-name
 REPORT_FILE=""                                 # left empty until after arg parsing unless --report is given explicitly
 REPORT_FILE_EXPLICIT=false                     # true only if --report set the filename verbatim
@@ -3116,6 +3116,99 @@ check_docker_authz_bypass() {
     info "No Docker daemon socket or dockerd binary reachable from this context — Docker Engine version UNKNOWN (not 'safe'). Confirm 'docker version --format {{.Server.Version}}' and AuthZ plugin config on the node directly."
   fi
 }
+
+# ---------------------------------------------------------------------------
+# Check 54 — DRM render-node exposure (CVE-2026-46215 GEM change_handle UAF)
+# CVE-2026-46215 is a use-after-free / TOCTTOU in DRM_IOCTL_GEM_CHANGE_HANDLE,
+# added in v6.18-rc1 for AMD's CRIU checkpoint/restore work. Any context that
+# can open a DRM render node (/dev/dri/renderD*) — or a card node — can reach
+# the vulnerable ioctl; on an unpatched 6.18+ kernel this is a local-root /
+# container-escape primitive. This probe reports the *reachability precondition*
+# only; the authoritative patched/unpatched verdict comes from the config-driven
+# CVE engine's kernel-version check for CVE-2026-46215. Read-only: it lists and
+# stats device nodes but never opens or ioctls them.
+# ---------------------------------------------------------------------------
+check_drm_render_node_escape() {
+  hdr "54. DRM render-node exposure (CVE-2026-46215 GEM change_handle UAF)"
+
+  # Self-contained "kernel >= 6.18" comparator, per this script's convention of
+  # probes carrying their own comparator. Returns 0 (>=6.18), 1 (<6.18), 2
+  # (version string could not be parsed -> unknown, never a silent pass).
+  _drm_kver_ge_618() {
+    local kr="${1%%-*}"                       # strip -rcN / distro suffix
+    # Separate declarations: under `set -u`, later assignments in a single
+    # `local` cannot reference earlier ones in the same statement.
+    local maj="${kr%%.*}"
+    local rest="${kr#*.}"
+    local min="${rest%%.*}"
+    [[ "$maj" =~ ^[0-9]+$ && "$min" =~ ^[0-9]+$ ]] || return 2
+    (( maj > 6 )) && return 0
+    (( maj == 6 && min >= 18 )) && return 0
+    return 1
+  }
+
+  local kver; kver=$(uname -r 2>/dev/null || echo "")
+
+  # Enumerate DRM device nodes reachable from this context (in-container view
+  # plus any /host-mounted variant seen in escape scenarios). List only.
+  local -a render_nodes=() card_nodes=()
+  local n
+  for pat in "/dev/dri/renderD"* "/host/dev/dri/renderD"*; do
+    [[ -e "$pat" ]] && render_nodes+=("$pat")
+  done
+  for pat in "/dev/dri/card"* "/host/dev/dri/card"*; do
+    [[ -e "$pat" ]] && card_nodes+=("$pat")
+  done
+
+  local n_render=${#render_nodes[@]} n_card=${#card_nodes[@]}
+  if (( n_render == 0 && n_card == 0 )); then
+    ok "No DRM device nodes (/dev/dri/renderD*, /dev/dri/card*) reachable from this context — CVE-2026-46215 escape precondition absent"
+    return
+  fi
+
+  # A node that exists but isn't readable/writable by the current user is a
+  # weaker signal than one this context can actually open.
+  local accessible=false acc_list=""
+  for n in "${render_nodes[@]}" "${card_nodes[@]}"; do
+    [[ -r "$n" || -w "$n" ]] && { accessible=true; acc_list+="${n} "; }
+  done
+
+  local kv_state; _drm_kver_ge_618 "$kver"
+  case $? in
+    0) kv_state="affected-range" ;;
+    1) kv_state="pre-6.18" ;;
+    *) kv_state="unknown" ;;
+  esac
+
+  local node_summary="renderD=${n_render} card=${n_card}${acc_list:+; accessible: ${acc_list% }}"
+
+  if [[ "$kv_state" == "pre-6.18" ]]; then
+    info "DRM render node(s) reachable (${node_summary}) but kernel ${kver} predates v6.18 — CVE-2026-46215 not applicable to this kernel"
+    add_finding "drm_render_node_present_pre618" "INFO" \
+      "DRM render node exposed, but kernel ${kver} is not in the CVE-2026-46215 range" \
+      "DRM device nodes are reachable from this context (${node_summary}), the reachability precondition for CVE-2026-46215 (DRM_IOCTL_GEM_CHANGE_HANDLE use-after-free). The running kernel ${kver} predates v6.18-rc1, where the vulnerable ioctl was introduced, so this specific CVE does not apply on this kernel." \
+      "No exposure to CVE-2026-46215 on this kernel version. Render-node exposure remains a general attack-surface consideration for other DRM/GPU driver bugs." \
+      "Not applicable for this CVE on this kernel." \
+      "If this kernel is later upgraded to 6.18+, re-evaluate: on 6.18-6.18.31 / 7.0-7.0.8 the render node becomes an escape path until patched (fixed 6.18.32 / 7.0.9 / 7.1-rc3)."
+    return
+  fi
+
+  # affected-range or unknown -> exposed, pending the CVE engine's version verdict.
+  local sev="HIGH"; [[ "$accessible" == false ]] && sev="MEDIUM"
+  local kv_clause
+  case "$kv_state" in
+    affected-range) kv_clause="running kernel ${kver} is >= v6.18, within the CVE-2026-46215 introduced range" ;;
+    unknown)        kv_clause="running kernel version '${kver:-unknown}' could not be parsed to confirm the >= v6.18 range — treat as verify-required, not safe" ;;
+  esac
+
+  warn "DRM render node(s) reachable from this context (${node_summary}); ${kv_clause}"
+  add_finding "drm_render_node_escape_surface" "$sev" \
+    "DRM render node reachable — CVE-2026-46215 container-escape precondition present" \
+    "DRM device nodes are reachable from this context (${node_summary}). Any process that can open a render node (/dev/dri/renderD*) can reach DRM_IOCTL_GEM_CHANGE_HANDLE, the ioctl affected by CVE-2026-46215 (a use-after-free / TOCTTOU on a GEM object's IDR handles, introduced in v6.18-rc1 for AMD CRIU support). ${kv_clause}. Nodes accessible to the current user: ${acc_list:-none (present but not readable/writable as this user)}." \
+    "On an unpatched 6.18+ kernel, an unprivileged process holding a render node can escalate to root on the host kernel; where that node is exposed into a container (GPU passthrough for AI/ML or media workloads), this becomes a container-to-host escape. A public PoC exists and reportedly bypasses the 2022 DirtyPipe mitigation. This probe confirms the reachability precondition only — the authoritative patched/unpatched verdict is the CVE engine's kernel-version check for CVE-2026-46215." \
+    "Definitive for the reachability precondition; the kernel-version verdict is produced separately by the config-driven CVE engine (fixed 6.18.32 / 7.0.9 / 7.1-rc3; ioctl removed in 7.1). A present-but-inaccessible node is a weaker (MEDIUM) signal." \
+    "1) Patch the host kernel to 6.18.32 / 7.0.9 / 7.1-rc3 or later. 2) Do NOT expose /dev/dri render nodes to containers that do not need GPU access; drop the device mount / GPU device-plugin binding where unnecessary. 3) For GPU workloads that do need it, prioritise patching those nodes and restrict who can schedule onto them. 4) Confirm the kernel-version verdict for CVE-2026-46215 in the CVE section of this report."
+}
 # =============================================================================
 # cve_check_engine.sh  —  Config-driven CVE check engine
 # Drop-in addition to container_escape_audit.sh
@@ -4683,6 +4776,13 @@ check_runtime_versions
 # Check 53: Docker Engine AuthZ plugin bypass (CVE-2026-34040)
 # ---------------------------------------------------------------------------
 check_docker_authz_bypass
+
+# ---------------------------------------------------------------------------
+# Check 54: DRM render-node exposure (CVE-2026-46215 GEM change_handle UAF)
+# Behavioural precondition probe; the kernel-version verdict is produced by the
+# config-driven CVE engine below (CVE-2026-46215 conf entry).
+# ---------------------------------------------------------------------------
+check_drm_render_node_escape
 
 # ---------------------------------------------------------------------------
 # Config-driven CVE checks (reads cve_checks.conf)
