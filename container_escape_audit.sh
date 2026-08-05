@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# container_escape_audit.sh  —  v4.7.5
+# container_escape_audit.sh  —  v4.7.6
 # Copyright (c) 2026 Liam Romanis
 #
 # Licence: Creative Commons Attribution-NonCommercial 4.0 International
@@ -66,7 +66,7 @@ QUIET=false
 NO_REPORT=false
 DUMP_STATE=false
 CHECK_UPDATES=false
-SCRIPT_VERSION="4.7.5"
+SCRIPT_VERSION="4.7.6"
 REPORT_NAME_BASE="container_escape_report"   # default base name; overridable via --report-name
 REPORT_FILE=""                                 # left empty until after arg parsing unless --report is given explicitly
 REPORT_FILE_EXPLICIT=false                     # true only if --report set the filename verbatim
@@ -3209,6 +3209,172 @@ check_drm_render_node_escape() {
     "Definitive for the reachability precondition; the kernel-version verdict is produced separately by the config-driven CVE engine (fixed 6.18.32 / 7.0.9 / 7.1-rc3; ioctl removed in 7.1). A present-but-inaccessible node is a weaker (MEDIUM) signal." \
     "1) Patch the host kernel to 6.18.32 / 7.0.9 / 7.1-rc3 or later. 2) Do NOT expose /dev/dri render nodes to containers that do not need GPU access; drop the device mount / GPU device-plugin binding where unnecessary. 3) For GPU workloads that do need it, prioritise patching those nodes and restrict who can schedule onto them. 4) Confirm the kernel-version verdict for CVE-2026-46215 in the CVE section of this report."
 }
+
+# ---------------------------------------------------------------------------
+# Check 55 — XFS reflink exposure (CVE-2026-64600 RefluXFS)
+# RefluXFS is a race in the XFS copy-on-write path: on a reflink-enabled XFS
+# volume, an unprivileged local user can overwrite the on-disk contents of any
+# file they can read (e.g. /etc/passwd, a setuid-root binary) and gain root.
+# Present since v4.11 (2017); needs no capability, module, or sysctl. The
+# distinguishing PRECONDITION is the filesystem: an XFS mount with reflink=1
+# (the mkfs.xfs default since 2019; default on the RHEL family, Amazon Linux,
+# Fedora Server). This probe reports whether such a filesystem is reachable
+# from the audited context; the patched/unpatched verdict is the CVE engine's
+# kernel-version check for CVE-2026-64600. Read-only: parses /proc/mounts and,
+# if available, runs the read-only `xfs_info` query — it never writes.
+# ---------------------------------------------------------------------------
+check_xfs_reflink_exposure() {
+  hdr "55. XFS reflink exposure (CVE-2026-64600 RefluXFS)"
+
+  [[ -r /proc/mounts ]] || { info "/proc/mounts not readable — cannot assess XFS reflink exposure (verify manually with: xfs_info <mount>)"; return; }
+
+  # Collect XFS mount points (device, mountpoint) from /proc/mounts.
+  local -a xfs_mps=()
+  local dev mp fstype _rest
+  while read -r dev mp fstype _rest; do
+    [[ "$fstype" == "xfs" ]] && xfs_mps+=("$mp")
+  done < /proc/mounts
+
+  if (( ${#xfs_mps[@]} == 0 )); then
+    ok "No XFS filesystems reachable from this context — CVE-2026-64600 (RefluXFS) precondition absent"
+    return
+  fi
+
+  local have_xfs_info=false
+  command -v xfs_info >/dev/null 2>&1 && have_xfs_info=true
+
+  local -a reflink_on=() reflink_unknown=()
+  local mp
+  for mp in "${xfs_mps[@]}"; do
+    if [[ "$have_xfs_info" == true ]]; then
+      # xfs_info prints a "reflink=1" / "reflink=0" token in the data section.
+      local info_out=""
+      info_out=$(xfs_info "$mp" 2>/dev/null || true)
+      if [[ -n "$info_out" ]]; then
+        if grep -q 'reflink=1' <<<"$info_out"; then
+          reflink_on+=("$mp")
+        elif grep -q 'reflink=0' <<<"$info_out"; then
+          :   # reflink explicitly off on this mount
+        else
+          reflink_unknown+=("$mp")
+        fi
+      else
+        reflink_unknown+=("$mp")
+      fi
+    else
+      reflink_unknown+=("$mp")
+    fi
+  done
+
+  local n_on=${#reflink_on[@]} n_unk=${#reflink_unknown[@]}
+
+  if (( n_on > 0 )); then
+    warn "Reflink-enabled XFS filesystem(s) reachable (${reflink_on[*]}) — CVE-2026-64600 (RefluXFS) precondition present"
+    add_finding "xfs_reflink_refluxfs" "HIGH" \
+      "Reflink-enabled XFS mount reachable — CVE-2026-64600 (RefluXFS) precondition present" \
+      "One or more XFS filesystems reachable from this context have reflink enabled (reflink=1): ${reflink_on[*]}. RefluXFS (CVE-2026-64600) is a race in the XFS copy-on-write direct-I/O path that lets an unprivileged local user redirect a write from a reflinked copy back into the original block, overwriting the on-disk contents of any file they can read — including root-owned config files and setuid-root binaries — with no capability, module, or sysctl required. The write lands below the inode path, so it preserves owner/permissions/timestamps and the setuid bit, persists across reboot, and produces no kernel log output." \
+      "Local privilege escalation to root, demonstrated by Qualys within seconds on a stock RHEL 10.2 system by stripping the root password from /etc/passwd. On containers, CI runners and multi-tenant hosts, any low-privilege foothold on a reflink-enabled XFS volume that also holds a writable directory and a high-value target becomes a direct path to host root; where that volume is shared with the host, overwriting host-side files is a container-escape primitive." \
+      "This probe confirms the filesystem precondition (XFS + reflink=1) is reachable; the authoritative patched/unpatched verdict is the CVE engine's kernel-version check for CVE-2026-64600 (introduced v4.11; fixed 6.12.96 / 6.18.39 / 7.1.4 and distro backports). Exploitation additionally needs a writable directory and a readable high-value target on the same filesystem — the common default layout." \
+      "1) Patch the kernel to a fixed build (6.12.96 / 6.18.39 / 7.1.4 or your distribution's backport — confirm against the vendor advisory). 2) There is no runtime sysctl to disable this; reflink cannot be turned off on a live filesystem. 3) Reduce exposure by not co-locating attacker-writable directories with high-value targets on the same reflink volume, and by removing unnecessary setuid-root binaries. 4) Confirm the kernel-version verdict for CVE-2026-64600 in the CVE section of this report."
+  elif (( n_unk > 0 )); then
+    info "XFS filesystem(s) reachable (${reflink_unknown[*]}) but reflink status undetermined$( [[ "$have_xfs_info" == false ]] && echo " (xfs_info not available in this context)" ) — RefluXFS (CVE-2026-64600) may apply"
+    add_finding "xfs_reflink_status_unknown" "MEDIUM" \
+      "XFS filesystem reachable, reflink status undetermined — CVE-2026-64600 (RefluXFS) may apply" \
+      "XFS filesystem(s) are reachable from this context (${reflink_unknown[*]}) but their reflink status could not be determined$( [[ "$have_xfs_info" == false ]] && echo " because xfs_info is not available here" ). RefluXFS (CVE-2026-64600) requires an XFS volume with reflink=1, which is the mkfs.xfs default since 2019 and the default on RHEL/CentOS Stream/Oracle/Rocky/AlmaLinux/CloudLinux 8-10, Amazon Linux 2023, Amazon Linux 2 images from Dec 2022, and Fedora Server 31+." \
+      "If reflink is enabled (likely on the enterprise-Linux defaults above), an unprivileged local user can overwrite readable files and gain root — see CVE-2026-64600. Undetermined here means verify-required, not safe." \
+      "Reflink status can be confirmed from the host with: xfs_info <mount> | grep reflink (reflink=1 means exposed)." \
+      "1) Run 'xfs_info <mount>' on the node to confirm reflink status. 2) If reflink=1, patch the kernel to a fixed build (6.12.96 / 6.18.39 / 7.1.4 or distro backport). 3) Confirm the kernel-version verdict for CVE-2026-64600 in the CVE section."
+  else
+    ok "XFS reachable but reflink not enabled on any mount — CVE-2026-64600 (RefluXFS) precondition absent"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Check 56 — net/sched tc-action exposure (CVE-2026-53264)
+# CVE-2026-53264 is a use-after-free race in the kernel's traffic-control action
+# layer (net/sched/act_api.c, tcf_idr_check_alloc): an RCU/lock mismatch lets a
+# lookup raise a refcount on a freed action, giving local root (CVSS 7.8). To
+# reach the vulnerable path an unprivileged attacker needs to configure tc
+# filters/actions, which requires CAP_NET_ADMIN — obtainable either directly (a
+# container holding it) or by creating an unprivileged user+network namespace.
+# The tc modules (act_gact, cls_flower) auto-load on first use. This probe
+# reports whether that reachability precondition is present; the patched/
+# unpatched verdict is the CVE engine's version check for CVE-2026-53264.
+# Read-only: reads /proc/self/status, /proc/modules and /lib/modules only.
+# ---------------------------------------------------------------------------
+check_netsched_actapi_uaf() {
+  hdr "56. net/sched tc-action exposure (CVE-2026-53264)"
+
+  # Route 1: does this context already hold CAP_NET_ADMIN (cap 12)?
+  local has_net_admin=false capeff=""
+  capeff=$(grep -m1 CapEff /proc/self/status 2>/dev/null | awk '{print $2}')
+  if [[ "$capeff" =~ ^[0-9a-fA-F]+$ ]]; then
+    (( 16#$capeff & (1 << 12) )) && has_net_admin=true
+  fi
+
+  # Route 2: can an unprivileged user create a user namespace (-> CAP_NET_ADMIN
+  # in a fresh net namespace)? check 44 already resolved this into USERNS_RESTRICTED.
+  local userns_restricted; userns_restricted=$(get_state USERNS_RESTRICTED)
+
+  # Is the tc-action subsystem usable here? act_gact / cls_flower loaded now, or
+  # present as loadable modules (they auto-load on first tc use).
+  local tc_loaded=false tc_loadable=false
+  if [[ -r /proc/modules ]] && grep -qE '^(act_gact|cls_flower|act_api) ' /proc/modules 2>/dev/null; then
+    tc_loaded=true
+  fi
+  local krel; krel=$(uname -r 2>/dev/null || echo "")
+  if [[ -n "$krel" && -d "/lib/modules/${krel}" ]]; then
+    if find "/lib/modules/${krel}" \( -name 'act_gact.ko*' -o -name 'cls_flower.ko*' \) -print -quit 2>/dev/null | grep -q .; then
+      tc_loadable=true
+    fi
+  fi
+  # act_api is usually built-in; if we cannot see modules at all, treat the
+  # subsystem as possibly-usable rather than assuming absent.
+  local tc_state="usable"
+  if [[ "$tc_loaded" == false && "$tc_loadable" == false ]]; then
+    if [[ -r /proc/modules || ( -n "$krel" && -d "/lib/modules/${krel}" ) ]]; then
+      tc_state="not-observed"    # we could look and did not find the modules
+    else
+      tc_state="unknown"         # no visibility into modules from here
+    fi
+  fi
+
+  # Determine reachability route.
+  local route=""
+  if [[ "$has_net_admin" == true ]]; then
+    route="direct CAP_NET_ADMIN"
+  elif [[ "$userns_restricted" == "false" ]]; then
+    route="unprivileged user namespaces enabled"
+  fi
+
+  if [[ -z "$route" ]]; then
+    if [[ "$userns_restricted" == "unknown" ]]; then
+      info "No direct CAP_NET_ADMIN here and unprivileged-userns status unknown — CVE-2026-53264 reachability undetermined (verify tc/userns policy on the node)"
+    else
+      ok "No route to configure tc actions (no CAP_NET_ADMIN, unprivileged user namespaces restricted) — CVE-2026-53264 tc-action path not reachable from this context"
+    fi
+    return
+  fi
+
+  if [[ "$tc_state" == "not-observed" ]]; then
+    info "tc-action route present (${route}) but act_gact/cls_flower not observed loaded or loadable here — CVE-2026-53264 lower likelihood; verify on the node"
+    add_finding "netsched_actapi_route_only" "MEDIUM" \
+      "tc-action reachability route present (${route}) for CVE-2026-53264, tc modules not observed" \
+      "A route to configure traffic-control actions exists from this context (${route}), which is the access precondition for CVE-2026-53264 (net/sched act_api use-after-free, CVSS 7.8). However, the act_gact / cls_flower modules were not observed loaded or present as loadable modules here. They frequently auto-load on first tc use, so this reduces but does not eliminate exposure." \
+      "If the modules are in fact available on the node, an unprivileged user (via ${route}) can drive the NEWTFILTER/DELFILTER race in tcf_idr_check_alloc() to gain root on the host kernel." \
+      "Module visibility from inside a container is limited; confirm on the node with 'ls /lib/modules/$(uname -r)/kernel/net/sched/'." \
+      "1) Patch the kernel to a build containing upstream commit 5057e1aca011 (or your distribution's backport). 2) If rootless containers are not required, disable unprivileged user namespaces (kernel.unprivileged_userns_clone=0 / user.max_user_namespaces=0). 3) Drop CAP_NET_ADMIN from containers that do not manage networking. 4) Confirm the kernel-version verdict for CVE-2026-53264 in the CVE section."
+    return
+  fi
+
+  warn "tc-action configuration reachable (${route}${tc_loaded:+, modules loaded}) — CVE-2026-53264 precondition present"
+  add_finding "netsched_actapi_uaf" "HIGH" \
+    "tc-action path reachable — CVE-2026-53264 (net/sched act_api UAF) precondition present" \
+    "This context can reach traffic-control action configuration via: ${route}. tc-action modules status: loaded=${tc_loaded}, loadable=${tc_loadable}. CVE-2026-53264 is a use-after-free race in net/sched/act_api.c (tcf_idr_check_alloc): when NEWTFILTER and DELFILTER run concurrently, a lookup under the RCU read lock can raise a reference count on an action object that a concurrent delete has already removed from the IDR and freed without an RCU grace period." \
+    "Local privilege escalation to root (CVSS 7.8). A public PoC from STAR Labs achieves root; it requires the ability to configure tc (held here via ${route}) plus the CONFIG_NET_ACT_GACT / CONFIG_NET_CLS_FLOWER features, which auto-load. From a container, an unprivileged user with user-namespace access — or a container holding CAP_NET_ADMIN — can trigger the race against the host kernel, making this a container-to-host escalation/escape primitive." \
+    "This probe confirms the reachability precondition; the authoritative patched/unpatched verdict is the CVE engine's kernel-version check for CVE-2026-53264. Exploitation is a timing race and may take seconds to minutes." \
+    "1) Patch the kernel to a build containing upstream commit 5057e1aca011 ('net/sched: act_api: use RCU with deferred freeing for action lifecycle') or your distribution's backport. 2) If rootless containers are not required, disable unprivileged user namespaces (kernel.unprivileged_userns_clone=0 on Debian/Ubuntu; user.max_user_namespaces=0 on RHEL/Fedora). 3) Drop CAP_NET_ADMIN from workloads that do not manage networking. 4) Confirm the kernel-version verdict for CVE-2026-53264 in the CVE section."
+}
 # =============================================================================
 # cve_check_engine.sh  —  Config-driven CVE check engine
 # Drop-in addition to container_escape_audit.sh
@@ -4783,6 +4949,15 @@ check_docker_authz_bypass
 # config-driven CVE engine below (CVE-2026-46215 conf entry).
 # ---------------------------------------------------------------------------
 check_drm_render_node_escape
+
+# ---------------------------------------------------------------------------
+# Check 55: XFS reflink exposure (CVE-2026-64600 RefluXFS)
+# Check 56: net/sched tc-action exposure (CVE-2026-53264)
+# Behavioural precondition probes; the kernel-version verdicts are produced by
+# the config-driven CVE engine below (CVE-2026-64600 / CVE-2026-53264 entries).
+# ---------------------------------------------------------------------------
+check_xfs_reflink_exposure
+check_netsched_actapi_uaf
 
 # ---------------------------------------------------------------------------
 # Config-driven CVE checks (reads cve_checks.conf)

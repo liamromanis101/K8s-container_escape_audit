@@ -1,7 +1,7 @@
 ![Logo](k8s_logo.png)
 
-![Version](https://img.shields.io/badge/version-4.7.5-blue)
-![Checks](https://img.shields.io/badge/checks-54-blue)
+![Version](https://img.shields.io/badge/version-4.7.6-blue)
+![Checks](https://img.shields.io/badge/checks-56-blue)
 ![CVEs tracked](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fliamromanis101%2FK8s-container_escape_audit%2Fmain%2F.github%2Fbadges%2Fcve-count.json)
 ![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)
 
@@ -37,7 +37,7 @@ Kubernetes Container Escape Audit focuses on exploitability:
 
 ## What it does
 
-`container_escape_audit.sh` v4.7.5 performs **54 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture (including SELinux/AppArmor enforcement), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64, DRM/GPU render nodes), container runtime version detection, Docker Engine daemon-level authorization bypass detection, and an updateable database of recent kernel and runtime CVEs. The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system.
+`container_escape_audit.sh` v4.7.6 performs **56 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture (including SELinux/AppArmor enforcement), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64, DRM/GPU render nodes, XFS reflink, net/sched tc-actions), container runtime version detection, Docker Engine daemon-level authorization bypass detection, and an updateable database of recent kernel and runtime CVEs. The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system.
 
 Each finding comes with a structured report entry:
 
@@ -60,6 +60,16 @@ One note on running as root: checks 1, 2, and 27 (privileged mode, dangerous cap
 Releases are published on GitHub with **SLSA Build Level 3 provenance**. Each release carries a signed `multiple.intoto.jsonl` attestation covering both `container_escape_audit.sh` and `cve_checks.conf`, so you can cryptographically confirm that the files you're about to run as root were built by this repository's release workflow and have not been tampered with. See [Verifying the download](#verifying-the-download) below. Because this tool is intended to run with elevated privileges during assessments, verifying provenance before each use is strongly recommended.
 
 ## Latest updates
+
+### v4.7.6 — RefluXFS (CVE-2026-64600) + net/sched act_api UAF (CVE-2026-53264) + checks 55-56
+
+Adds two fresh, container-relevant local-root LPEs disclosed in the last couple of weeks. CVE database **39 → 41 entries**; check count **54 → 56**.
+
+- **New: CVE-2026-64600 — RefluXFS.** A race in the XFS copy-on-write direct-I/O path (Qualys TRU, disclosed 22 July 2026, found under Anthropic's Project Glasswing): on a reflink-enabled XFS volume, an unprivileged local user can overwrite the on-disk contents of any file they can *read* — /etc/passwd, a setuid-root binary — and gain root. The write lands below the inode path, so it preserves owner/permissions/timestamps and the setuid bit, survives reboot, and produces no kernel log. Present since v4.11 (2017); fixed **6.12.96 / 6.18.39 / 7.1.4** and distro backports. Same overwrite-to-root class as DirtyClone and Copy Fail, which are already tracked. Encoded as `kernel_version` with `vendor_defer` to the enterprise-Linux family (where reflink is the default).
+- **New check 55 — `check_xfs_reflink_exposure`.** RefluXFS's distinguishing precondition is the *filesystem*, not a capability, so check 55 parses `/proc/mounts` for XFS mounts and uses the read-only `xfs_info` query to determine reflink status: HIGH when a `reflink=1` mount is reachable, MEDIUM when XFS is present but reflink status can't be determined from the audited context (e.g. no `xfs_info` in-container), and clear when no XFS or reflink-off. The patched/unpatched verdict is deferred to the CVE engine.
+- **New: CVE-2026-53264 — net/sched act_api use-after-free.** An RCU/lock mismatch in `tcf_idr_check_alloc()` (net/sched/act_api.c): a NEWTFILTER lookup can raise a refcount on a tc-action object that a concurrent DELFILTER has already freed without an RCU grace period, giving local root (CVSS 7.8, public STAR Labs PoC from TyphoonPwn 2026). Reaching the path needs the ability to configure tc — CAP_NET_ADMIN, obtainable directly or via an unprivileged user+network namespace — which is a classic container escalation vector. Fixed upstream by commit `5057e1aca011`; encoded as `kernel_version` with `vendor_defer` (stable version numbers not yet published).
+- **New check 56 — `check_netsched_actapi_uaf`.** Probes the reachability precondition: whether this context holds CAP_NET_ADMIN directly (parsing `CapEff`) *or* can obtain it via unprivileged user namespaces (consulting the `USERNS_RESTRICTED` state that check 44 already resolves), combined with `act_gact`/`cls_flower` module availability. HIGH when a route plus modules are present, MEDIUM when a route exists but the modules aren't observed, and clear when neither route is available.
+- **Conservative version data, by design.** Both entries use `vendor_defer`, so on a distro kernel they resolve to *defer: consult advisory* (or *unknown/verify* where the distro isn't in the defer list) rather than asserting a verdict from upstream version numbers that don't map to distro packages — and on a true vanilla kernel the `upstream_ranges` path still gives a precise vulnerable/fixed answer. `VERIFY` items: CVE-2026-64600's CVSS and 7.0.x stable status; CVE-2026-53264's introducing version and stable fixed versions. Not yet encoded: CVE-2026-64300 (kernel/events/core.c), from the same net/sched research.
 
 ### v4.7.5 — DRM render-node escape (CVE-2026-46215) + new check 54
 
@@ -224,7 +234,7 @@ These checks read sysctl values from `/proc/sys` and compare them against the re
 | 46 | esp4 / esp6 / rxrpc modules | not loaded / blacklisted | Dirty Frag (CVE-2026-43284/43500), Fragnesia (CVE-2026-46300), DirtyClone (CVE-2026-43503) |
 | 47 | Dangerous loaded modules audit | — | 15 modules checked incl. algif_aead, ksmbd, rds, rds_tcp, nf_tables, dccp, sctp, bluetooth |
 
-### Runtime escape-surface probes (new checks 48-54)
+### Runtime escape-surface probes (new checks 48-56)
 
 Read-only reachability probes for container-escape and LPE attack surfaces flagged by the CVE monitor's gap analysis. Each tests whether a subsystem is reachable from the current context (syscall, socket, or socket-file presence) without attempting to trigger any vulnerability. They complement the version/module/socket detection done by the CVE engine.
 
@@ -237,6 +247,8 @@ Read-only reachability probes for container-escape and LPE attack surfaces flagg
 | 52 | Container runtime version probe (runc / containerd / cri-o, best-effort read-only) | CRITICAL/MEDIUM/INFO | CVE-2019-5736, CVE-2024-21626 (runc escapes) |
 | 53 | Docker Engine daemon version + AuthZ plugin configuration probe (socket API, `dockerd` binary fallback) | CRITICAL/MEDIUM/INFO | CVE-2026-34040 (Docker Engine AuthZ bypass) |
 | 54 | DRM render-node reachability (`/dev/dri/renderD*` / `card*`, read-only; ≥6.18 kernel gate) | HIGH/MEDIUM/INFO | CVE-2026-46215 (GEM `change_handle` UAF) |
+| 55 | XFS reflink reachability (`/proc/mounts` + read-only `xfs_info`; reflink=1 detection) | HIGH/MEDIUM/INFO | CVE-2026-64600 (RefluXFS) |
+| 56 | net/sched tc-action reachability (CAP_NET_ADMIN direct or via unprivileged userns; `act_gact`/`cls_flower` availability) | HIGH/MEDIUM/INFO | CVE-2026-53264 (act_api UAF) |
 
 > Check 51 is architecture-aware: on x86_64 it reports "not applicable"; on arm64 it distinguishes a KVM host (`/dev/kvm` present) from a guest vantage point (GICv3/ITS present, no `/dev/kvm`) and adjusts severity accordingly.
 
@@ -246,7 +258,7 @@ Read-only reachability probes for container-escape and LPE attack surfaces flagg
 
 ### Config-driven CVE checks
 
-CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with thirty-nine entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
+CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with forty-one entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
 
 Kernel-CVE entries carry authoritative NVD version data in an enriched schema: `upstream_ranges` (NVD CPE affected/fixed ranges for vanilla kernels), `distro_status` (per-distribution-release fixed / not-affected / vulnerable, with exact package versions for Debian and Ubuntu), and `vendor_defer` (distributions such as RHEL / Amazon / SUSE whose back-ports can't be judged from a version string). The engine reads these to produce a **vulnerable / not-affected / defer / unknown** verdict appropriate to the running system, rather than a naive comparison.
 
@@ -291,6 +303,8 @@ Kernel-CVE entries carry authoritative NVD version data in an enriched schema: `
 | CVE-2026-47262 | containerd Image-Triggered Runtime DoS | VERIFY | | |
 | CVE-2026-23268 | CrackArmor AppArmor Confused Deputy (anchors 11-CVE set) | 7.8 | | |
 | CVE-2026-46215 | DRM GEM change_handle UAF (render-node LPE / escape) | 7.8 | | |
+| CVE-2026-64600 | RefluXFS — XFS reflink CoW overwrite (LPE / escape) | VERIFY | | |
+| CVE-2026-53264 | net/sched act_api use-after-free (tc-action LPE) | 7.8 | | |
 
 > **2026-07-20 sweep (containerd CRI cluster + CrackArmor).** The 2026-06 containerd CRI-plugin cluster — CVE-2026-50195 (cross-pod RCE via checkpoint image-cache poisoning), CVE-2026-53488 (image LABEL host command exec), CVE-2026-53492 (CDI annotation host-mount injection), CVE-2026-53489 (checkpoint-restore host file read), CVE-2026-47262 (image DoS) — is `component=containerd` and fixed in containerd 2.3.2 / 2.2.5 / 2.1.9 / 2.0.10 / 1.7.33; check 52 now computes a branch-aware verdict and the `manual` dispatch renders a definitive finding when a containerd binary is reachable. CrackArmor (CVE-2026-23268 anchoring the eleven-CVE Qualys AppArmor set) is a `kernel_version` entry with `introduced=4.11` and `vendor_defer` to the distro trackers, since the fixes are distro-backported. `VERIFY` markers: CVE-2026-53489 and CVE-2026-47262 CVSS, the exact containerd 1.7.x lower bound, and CrackArmor's per-CVE NVD CVSS / per-distro fixed kernel versions — confirm against the vendor advisory before relying on them for automated severity scoring. The Leaky Vessels BuildKit siblings (CVE-2024-23651/23652/23653) remain intentionally out of scope as image-build tooling; the Project Glasswing / Mythos Linux LPE is not yet encodable (still under disclosure embargo — no public CVE ID or fix commit).
 
