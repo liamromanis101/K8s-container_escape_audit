@@ -4,8 +4,7 @@
 ![Checks](https://img.shields.io/badge/checks-56-blue)
 ![CVEs tracked](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fliamromanis101%2FK8s-container_escape_audit%2Fmain%2F.github%2Fbadges%2Fcve-count.json)
 ![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)
-
-<iframe src="https://github.com/sponsors/liamromanis101/button" title="Sponsor liamromanis101" height="32" width="114" style="border: 0; border-radius: 6px;"></iframe>
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/liamromanis101?label=Sponsor&logo=GitHub&color=db61a2)](https://github.com/sponsors/liamromanis101)
 
 # K8s_container-escape-audit
 
