@@ -5,6 +5,8 @@
 ![CVEs tracked](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fliamromanis101%2FK8s-container_escape_audit%2Fmain%2F.github%2Fbadges%2Fcve-count.json)
 ![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)
 
+<iframe src="https://github.com/sponsors/liamromanis101/button" title="Sponsor liamromanis101" height="32" width="114" style="border: 0; border-radius: 6px;"></iframe>
+
 # K8s_container-escape-audit
 
 Identify exploitable Kubernetes and Docker container escape paths before attackers do..
@@ -26,6 +28,17 @@ It is suitable for:
 - Kubernetes Administrators responsible for securing production clusters.
 - Cloud Security Teams assessing container workloads across AWS, Azure and hybrid environments.
 - Red Teams and Penetration Testers performing authorised security assessments.
+
+### Commercial use
+
+This tool is free for personal use, internal security assessments, open-source projects, and non-profit work. If you are using it as part of a commercial engagement — for example as a>
+
+We are happy to discuss sponsorship arrangements for commercial users. Sponsorship helps fund continued development, CVE database maintenance, and new check coverage. If you or your o>
+
+**GitHub Sponsors:** [github.com/sponsors/liamromanis101](https://github.com/sponsors/liamromanis101)
+
+Sponsorship does not grant exclusivity or any change to the open licence for non-commercial users.
+
 
 ## What makes this different?
 
@@ -1710,16 +1723,6 @@ To add or update a CVE, edit `cve_checks.conf` only — no script changes needed
 For authorised security testing only. Running this against systems without explicit written permission from the system owner may be illegal in your jurisdiction. No liability is accepted for misuse.
 
 Copyright (c) 2026 Liam Romanis. Licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) — free for non-commercial use with attribution. See [LICENSE](LICENSE) for full terms.
-
-### Commercial use
-
-This tool is free for personal use, internal security assessments, open-source projects, and non-profit work. If you are using it as part of a commercial engagement — for example as a consultant billing a client, or as a component of a paid product or service — commercial use terms apply under CC BY-NC 4.0.
-
-We are happy to discuss sponsorship arrangements for commercial users. Sponsorship helps fund continued development, CVE database maintenance, and new check coverage. If you or your organisation would like to support the project in exchange for commercial use rights, please reach out:
-
-**GitHub Sponsors:** [github.com/sponsors/liamromanis101](https://github.com/sponsors/liamromanis101)
-
-Sponsorship does not grant exclusivity or any change to the open licence for non-commercial users.
 
 ## References
 
