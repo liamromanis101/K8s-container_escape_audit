@@ -49,7 +49,7 @@ Kubernetes Container Escape Audit focuses on exploitability:
 
 ## What it does
 
-`container_escape_audit.sh` v4.7.6 performs **56 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture (including SELinux/AppArmor enforcement), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64, DRM/GPU render nodes, XFS reflink, net/sched tc-actions), container runtime version detection, Docker Engine daemon-level authorization bypass detection, and an updateable database of recent kernel and runtime CVEs. The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system.
+`container_escape_audit.sh` v4.7.7 performs **59 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture, MAC confinement depth (AppArmor enforce/complain mode and kernel mediation, SELinux domain and MCS separation, active LSM stack composition), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64, DRM/GPU render nodes, XFS reflink, net/sched tc-actions), container runtime version detection, Docker Engine daemon-level authorization bypass detection, and an updateable database of recent kernel and runtime CVEs. The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system.
 
 Each finding comes with a structured report entry:
 
@@ -72,6 +72,15 @@ One note on running as root: checks 1, 2, and 27 (privileged mode, dangerous cap
 Releases are published on GitHub with **SLSA Build Level 3 provenance**. Each release carries a signed `multiple.intoto.jsonl` attestation covering both `container_escape_audit.sh` and `cve_checks.conf`, so you can cryptographically confirm that the files you're about to run as root were built by this repository's release workflow and have not been tampered with. See [Verifying the download](#verifying-the-download) below. Because this tool is intended to run with elevated privileges during assessments, verifying provenance before each use is strongly recommended.
 
 ## Latest updates
+
+### v4.7.7 — MAC confinement depth (AppArmor mode/mediation, SELinux domain/MCS, LSM stack) + checks 57-59
+
+Deepens the LSM coverage. Until now check 11 answered a single binary question — *is AppArmor/SELinux on?* — collapsing several materially different states into one "applied/OK". These three checks answer the follow-up that actually determines whether the MAC is confining the container: *on in what mode, confining me to what domain, with which escape-relevant relaxations, and is a MAC LSM even in the active kernel stack?* No new CVE-database entries were required — the checks are posture probes (like the check 36-47 hardening set), and the CVE-2025-52881 LSM-bypass cross-reference reuses the existing runc entry (check 26) via a new `RUNC_LSM_BYPASS` state flag. Check count **56 → 59**; CVE database unchanged at 41 entries. All three are strictly read-only.
+
+- **New check 57 — `check_apparmor_confinement_depth`.** Splits the AppArmor label into name + mode and distinguishes **enforce / complain / unconfined** — complain mode (violations logged, not denied) is the sneaky one that reads as "applied" while providing no access control, so it is raised HIGH. Flags **unconfined + CAP_SYS_ADMIN** as the HIGH precondition pairing behind several CRITICAL escape vectors elsewhere in the report; distinguishes the runtime-**default** profile (`docker-default`, `cri-containerd.apparmor.d`) from a bespoke one (INFO vs OK); and inspects `/sys/kernel/security/apparmor/features` for **missing kernel mediation** (mount/ptrace/signal/network) — a profile's mount-deny rules are inert on a kernel without mount mediation. Publishes `APPARMOR_MODE`.
+- **New check 58 — `check_selinux_domain_mcs`.** Reads the process context from `/proc/self/attr/current` and classifies the **domain**: `unconfined_t`/`spc_t` are effectively unconfined despite `getenforce` reporting Enforcing (HIGH — false assurance), while `container_t` is properly confined. For a confined domain it then checks **MCS categories**: a container domain with no `cN,cM` pair has host confinement but **no inter-container isolation** (MEDIUM lateral-movement path on multi-tenant nodes). Also inspects the handful of **escape-relevant SELinux booleans** (`container_manage_cgroup`, `virt_use_execmem`, …) that can loosen `container_t` without changing the domain. Publishes `SELINUX_DOMAIN` and `SELINUX_MCS`.
+- **New check 59 — `check_lsm_stack`.** Reads `/sys/kernel/security/lsm` (the LSMs actually active, in order) and flags the **installed-but-inactive** gap: MAC userspace/config present (`getenforce`/`apparmor_parser`, or a configured mode) but no MAC LSM in the active stack — the "looks protected, isn't" state, usually caused by `lsm=`/`security=` on the kernel command line omitting it. Notes `lockdown`, `bpf` and `yama` when present. Publishes `LSM_STACK` and `LSM_MAC_ACTIVE`.
+- **New state flag — `RUNC_LSM_BYPASS`.** Check 26 (runc masked-path) now publishes whether the detected runc is vulnerable to CVE-2025-52881. Checks 57 and 58 consume it: an otherwise-enforcing AppArmor profile or SELinux domain is downgraded to "present but bypassable" while a vulnerable runc is in play, so an enforce-mode result is never over-trusted.
 
 ### v4.7.6 — RefluXFS (CVE-2026-64600) + net/sched act_api UAF (CVE-2026-53264) + checks 55-56
 
@@ -267,6 +276,22 @@ Read-only reachability probes for container-escape and LPE attack surfaces flagg
 > Check 52 reads any reachable runc / containerd / cri-o binary and runs `<binary> --version` (never executing untrusted output, never writing). Because a container usually cannot see the host runtime binary, it uses a three-state verdict: a reachable version is compared directly; if none is reachable but the process is unmapped in-container root, it reports the runc-escape preconditions as *potentially exposed*; otherwise the version is *unknown* — never silently *safe*. Its runc verdict is also cached and consulted directly by the CVE-database `manual` entries for CVE-2019-5736 and CVE-2024-21626 (see [Config-driven CVE checks](#config-driven-cve-checks)), so a reachable binary produces a definitive per-CVE finding rather than a static advisory.
 
 > Check 53 targets the Docker **daemon** rather than a runtime binary. It prefers querying the daemon socket directly (`/version` + `/info` over `--unix-socket`) because that's the only vantage point from which the AuthZ plugin configuration — the precondition for CVE-2026-34040 to matter — is observable at all; a vanilla Docker install with no AuthZ plugin is not affected by this specific CVE even if the version is old. When the socket isn't reachable, it falls back to a `dockerd` binary at a host-mounted path (mirroring check 52's technique) but is explicit that AuthZ-plugin status can't be confirmed that way, and marks the finding verify-required rather than assuming safety either way. Unlike check 52's runc verdict, check 53's result is not yet cross-referenced by a `cve_checks.conf` entry — see [v4.7.3 changelog](#v473--docker-engine-daemon-level-check-cve-2026-34040).
+
+### MAC confinement depth (new checks 57-59)
+
+These extend the binary "is it on?" answer of check 11 with the mode-, domain-, and stack-level detail that determines whether AppArmor/SELinux is actually confining the container. All three are strictly read-only. They publish their findings to the system-state registry (`APPARMOR_MODE`, `SELINUX_DOMAIN`, `SELINUX_MCS`, `LSM_STACK`, `LSM_MAC_ACTIVE`) so cross-references stay inspectable via `--dump-state`.
+
+| # | Check | Severity |
+|---|---|---|
+| 57 | AppArmor confinement depth — enforce vs **complain** vs unconfined; unconfined + CAP_SYS_ADMIN pairing; runtime-default vs bespoke profile; missing kernel mediation (mount/ptrace/signal/network) | HIGH/MEDIUM/INFO |
+| 58 | SELinux domain & MCS — `unconfined_t`/`spc_t` vs `container_t`; missing MCS categories (no inter-container isolation); escape-relevant booleans (`container_manage_cgroup`, `virt_use_execmem`, …) | HIGH/MEDIUM/INFO |
+| 59 | Active LSM stack composition — reads `/sys/kernel/security/lsm`; flags MAC userspace present but **no MAC LSM in the active stack** (installed-but-inactive); notes lockdown/bpf/yama | HIGH/INFO |
+
+> **Complain mode (check 57)** is the highest-value addition: an AppArmor profile in complain mode logs policy violations but *allows* them, so to an operator checking only whether a profile is "applied" it looks protected while providing no access control at all. Check 11 treated any non-`unconfined` label as OK and so reported complain-mode profiles as fine.
+
+> **Domain vs mode (check 58):** two systems both reporting `Enforcing` can be worlds apart — `container_t` with a unique category pair is properly confined, whereas `spc_t` (the signature of `--privileged` / `label=disable`) or `unconfined_t` is effectively unconfined. Check 58 reads the *domain*, not just the mode.
+
+> **CVE-2025-52881 cross-reference:** when check 26 finds a vulnerable runc, checks 57 and 58 downgrade an otherwise-enforcing profile/domain to "present but bypassable" (via the `RUNC_LSM_BYPASS` state flag), so an enforce-mode result is never over-trusted while the runtime CVE is unpatched.
 
 ### Config-driven CVE checks
 
@@ -805,6 +830,44 @@ securityContext:
     type: RuntimeDefault
 ```
 
+#### Check 57 -- AppArmor confinement depth (HIGH/MEDIUM/INFO)
+
+Check 11 answers "is a profile applied?"; check 57 answers "is it actually confining?". The three states it separates:
+
+```bash
+# What check 57 reads (read-only)
+cat /proc/self/attr/current            # e.g. "myprof (complain)"  <-- audit-only, NOT enforcing
+ls /sys/kernel/security/apparmor/features   # mount/ptrace/signal/network mediation compiled in?
+```
+
+A profile in `(complain)` mode logs every violation but blocks nothing — the attacker performs the "denied" action anyway. A kernel missing `mount` mediation makes a profile's mount-deny rules inert, re-opening mount-based escapes (check 12) even under an enforcing profile. `unconfined` + `CAP_SYS_ADMIN` together are the precondition for several CRITICAL vectors in this report.
+
+Remediation: put profiles in enforce mode (`aa-enforce`), use a kernel with full mediation, and for sensitive workloads load a bespoke enforce-mode profile via `securityContext.appArmorProfile` rather than relying on the runtime default. If check 26 flags a vulnerable runc, patch it — CVE-2025-52881 bypasses the profile regardless of how it's written.
+
+#### Check 58 -- SELinux domain & MCS separation (HIGH/MEDIUM/INFO)
+
+`getenforce` reporting `Enforcing` is not sufficient — the *domain* decides how much is confined:
+
+```bash
+# What check 58 reads (read-only)
+cat /proc/self/attr/current    # system_u:system_r:container_t:s0:c123,c456
+                               #                     ^type      ^MCS categories
+```
+
+`spc_t` (super-privileged container, the signature of `--privileged` / `--security-opt label=disable`) and `unconfined_t` are effectively unconfined despite enforcing mode. A `container_t` process with **no** `cN,cM` category pair keeps host confinement but loses inter-container isolation — a compromised container can reach peers on the same node. A single enabled boolean (`container_manage_cgroup`) can re-open the release_agent path (check 12).
+
+Remediation: run under `container_t` with engine-assigned per-container MCS labels (the default when SELinux labelling is enabled); remove `--privileged`/`label=disable`; disable unnecessary booleans with `setsebool -P <name> off`.
+
+#### Check 59 -- Active LSM stack composition (HIGH/INFO)
+
+```bash
+cat /sys/kernel/security/lsm    # capability,lockdown,yama,apparmor,bpf
+```
+
+If MAC userspace is installed (`getenforce`/`apparmor_parser` present, or a mode is configured) but **no** MAC LSM appears in this list, no mandatory access control is enforced at all — every MAC-based mitigation in this report is void. This usually means `lsm=`/`security=` on the kernel command line omitted the module, or it was compiled out.
+
+Remediation: add the MAC module to the kernel command line (`lsm=...,apparmor` or `security=selinux selinux=1`), ensure it's built into the kernel, reboot, and confirm it appears in `/sys/kernel/security/lsm`.
+
 #### Check 27 -- User namespace UID mapping (HIGH)
 
 Without user namespace remapping, UID 0 inside the container is UID 0 on the host. Any mount escape, socket access, or capability exploit yields host root directly -- no UID boundary to cross.
@@ -949,6 +1012,20 @@ sh -c "echo \$\$ > /tmp/cgrp/x/cgroup.procs"
 
 Remediation: Migrate to cgroup v2. Block `mount` syscalls via seccomp.
 
+#### Check 19 -- cgroup v2 writability (MEDIUM)
+
+cgroup v2 has no `release_agent`, so it can't be abused the way check 12 abuses v1. But a writable cgroup v2 tree is still a lever: writable `cgroup.subtree_control`, `cgroup.procs`, or the delegation files let an attacker move processes between cgroups and manipulate resource controllers. Combined with a writable `cgroup.freezer` or memory controller, this enables denial-of-service against host or sibling workloads; combined with a privileged mount of the host cgroupfs it can assist an escape by controlling which cgroup a spawned process lands in.
+
+```bash
+# Writable subtree_control on a delegated/host cgroup — move a process and
+# manipulate controllers it shouldn't reach
+cat /sys/fs/cgroup/cgroup.controllers
+echo "+memory +pids" > /sys/fs/cgroup/<delegated>/cgroup.subtree_control
+echo $$ > /sys/fs/cgroup/<target>/cgroup.procs
+```
+
+Remediation: Mount the cgroup2 filesystem read-only in containers. Do not delegate the host cgroup tree into workloads. Remove `CAP_SYS_ADMIN`. This is a defence-in-depth / DoS finding rather than a direct escape unless paired with a host cgroupfs mount (check 4).
+
 #### Check 14 -- Kernel CVEs (HIGH)
 
 | CVE | Kernels affected | Impact |
@@ -1012,11 +1089,11 @@ Remediation: Mount `/proc` with `hidepid=2`. Set `hostPID: false`.
 <details>
 <summary><h3>Recent CVEs</h3></summary>
 
-#### Check 24 -- Copy Fail (CVE-2026-31431) (CRITICAL)
+#### Copy Fail (CVE-2026-31431) (CRITICAL) — CVE-engine detection
 
 Disclosed April 29 2026. A logic bug in the Linux kernel's `algif_aead` cryptographic module allows an unprivileged user to perform controlled 4-byte writes into the page cache of any readable executable via `AF_ALG` and `splice()`. By corrupting the in-memory copy of a setuid binary, an attacker escalates to root. Affects every Linux distribution shipping a kernel built since 2017. A ~732-byte Python PoC achieves root on Ubuntu 24.04, Amazon Linux 2023, RHEL 10.1, and SUSE 16. No capabilities required. On the CISA KEV list with confirmed active exploitation.
 
-The script checks three things: whether an `AF_ALG` socket can be created, whether the `authencesn(hmac(sha512),cbc(aes))` AEAD algorithm can be bound, and whether `splice(2)` and `pipe2(2)` are seccomp-blocked.
+This is not a numbered `hdr` check — Copy Fail is detected by the config-driven CVE engine (`cve_checks.conf`), like Dirty Frag, DirtyPipe, and DirtyCOW. The engine tests three things: whether an `AF_ALG` socket can be created, whether the `authencesn(hmac(sha512),cbc(aes))` AEAD algorithm can be bound, and whether `splice(2)` and `pipe2(2)` are seccomp-blocked.
 
 Remediation:
 - Apply kernel patches from your distribution (released from late April 2026)
@@ -1386,6 +1463,64 @@ Remediation:
 - Migrate workloads to cgroup v2, which has no `release_agent`
 - Mount cgroupfs read-only inside containers; drop `CAP_SYS_ADMIN` from application containers
 - Apply seccomp to block `mount(2)`/`unshare(2)`/`clone(2)` with namespace flags; enforce Pod Security Admission at `restricted`
+
+#### Check 48 -- io_uring exposure (CVE-2026-43121 and the io_uring LPE class) (HIGH)
+
+io_uring's shared submission/completion rings and registered buffers are a recurring local-privilege-escalation surface; CVE-2026-43121 is an out-of-bounds access in the zero-copy receive (`zcrx`) path. The check probes whether `io_uring_setup(2)` is reachable and reads the `io_uring_disabled` sysctl state — reachability from a container means an unprivileged process has the syscall surface needed to drive this class of bug against the host kernel.
+
+```bash
+# Reachability probe (read-only): can the syscall be issued at all?
+# (the script attempts io_uring_setup and checks /proc/sys/kernel/io_uring_disabled)
+```
+
+Remediation: Set `kernel.io_uring_disabled=2` to disable io_uring for unprivileged users (or `1`/`0` per your workload need). Block `io_uring_setup(2)`/`io_uring_enter(2)`/`io_uring_register(2)` via a seccomp profile where the workload doesn't use io_uring. Keep the kernel patched.
+
+#### Check 49 -- kTLS / sockmap ULP exposure (TLS ULP use-after-free class) (MEDIUM)
+
+Attaching the kernel-TLS ULP (`setsockopt(TCP_ULP, "tls")`) and sockmap manipulation have produced a "reverse order" use-after-free class (e.g. `tls_sk_proto_close()` UAF) with no assigned CVE at time of writing. The check tests whether the TLS ULP can be attached from this context, confirming the attack surface is present.
+
+Remediation: Where the workload doesn't need kTLS, block the ULP attach via seccomp on `setsockopt(2)` for `TCP_ULP`, or restrict with an LSM/BPF policy. Keep the kernel patched for the sockmap/ULP UAF fixes.
+
+#### Check 50 -- Kata Containers agent socket exposure (CVE-2026-41326 CopyFile) (HIGH/MEDIUM)
+
+Kata runs each container in a lightweight VM with an in-guest agent reached over a vsock/unix socket. CVE-2026-41326 is a symlink-subversion flaw in the agent's `CopyFile` handling that lets a crafted copy operation write outside the intended path. The check looks for a reachable Kata agent socket / shared directory from the container vantage.
+
+Remediation: Update the Kata agent/runtime to a patched release. Restrict access to the agent socket and shared-directory paths; do not expose them to workload containers.
+
+#### Check 51 -- KVM/arm64 vGIC-ITS guest-to-host exposure (CVE-2026-46316 ITScape) (HIGH/INFO)
+
+An arm64-specific KVM flaw in the virtual GIC Interrupt Translation Service (ITS) emulation allows a malicious guest to reach host memory. This check is **architecture-aware**: on x86_64 it reports not-applicable; on arm64 it distinguishes a KVM host (`/dev/kvm` present) from a guest vantage (GICv3/ITS present, no `/dev/kvm`) and scores accordingly.
+
+Remediation: Patch the host kernel's KVM/arm64 ITS emulation. This is a hypervisor-boundary issue — relevant to nested-virt and Kata/Firecracker-style isolation on arm64, not classic namespace containers.
+
+#### Check 52 -- Container runtime versions (CVE-2019-5736, CVE-2024-21626 runc escapes) (CRITICAL/MEDIUM/INFO)
+
+Reads any reachable runc / containerd / cri-o binary version (`<binary> --version`, never executing untrusted output) to flag the well-known runc escapes: CVE-2019-5736 (overwrite of the host `runc` binary via `/proc/self/exe`) and CVE-2024-21626 (the `/sys/fs/cgroup` working-directory fd leak, "Leaky Vessels"). Uses a three-state verdict — a reachable version is compared directly; if none is reachable but the process is in-container root, it reports the runc-escape preconditions as *potentially exposed*; otherwise *unknown*, never silently *safe*. The verdict is cross-consumed by the `cve_checks.conf` entries for those two CVEs.
+
+```bash
+# CVE-2019-5736 concept: a malicious container overwrites the host runc binary
+# via /proc/self/exe during exec, gaining host code execution on next runc use.
+```
+
+Remediation: Keep runc ≥ 1.1.12 (and rebuild/re-pull anything bundling it — Docker, containerd, CRI-O); apply managed-Kubernetes node updates. Run containers as non-root and enable user namespaces to blunt both CVEs.
+
+#### Check 54 -- DRM render-node exposure (CVE-2026-46215 GEM change_handle UAF) (HIGH/MEDIUM/INFO)
+
+GPU render nodes (`/dev/dri/renderD*`, `card*`) exposed into a container are a kernel attack surface; CVE-2026-46215 is a use-after-free in the DRM GEM `change_handle` path (kernels ≥ 6.18). The check reports render-node reachability and gates on kernel version.
+
+Remediation: Do not expose `/dev/dri/*` to containers that don't need GPU access. Where GPU access is required, patch the host kernel and constrain the device with an appropriate device cgroup / seccomp policy.
+
+#### Check 55 -- XFS reflink exposure (CVE-2026-64600 RefluXFS) (HIGH/MEDIUM/INFO)
+
+A race in the XFS copy-on-write direct-I/O path: on a reflink-enabled XFS volume an unprivileged local user can overwrite the on-disk contents of any file they can **read** — `/etc/passwd`, a setuid-root binary — and gain root. The write lands below the inode path, preserving owner/permissions/timestamps and the setuid bit, surviving reboot with no kernel log. The check parses `/proc/mounts` for XFS mounts and uses read-only `xfs_info` to detect `reflink=1`; where the volume is shared with the host, overwriting host-side files is a container-escape primitive.
+
+Remediation: Patch the kernel to a fixed build (6.12.96 / 6.18.39 / 7.1.4 or distro backport). There is no runtime toggle — reflink can't be disabled on a live filesystem. Avoid co-locating attacker-writable directories with high-value targets on the same reflink volume; remove unnecessary setuid-root binaries.
+
+#### Check 56 -- net/sched tc-action exposure (CVE-2026-53264 act_api UAF) (HIGH/MEDIUM/INFO)
+
+A use-after-free race in `tcf_idr_check_alloc()` (net/sched/act_api.c): concurrent NEWTFILTER/DELFILTER lets a lookup raise a refcount on a freed tc-action, giving local root (CVSS 7.8, public PoC). Reaching it needs the ability to configure tc — `CAP_NET_ADMIN`, held directly or obtained via an unprivileged user+network namespace — which is a classic container escalation vector. The check reports whether that route plus the `act_gact`/`cls_flower` modules are available.
+
+Remediation: Patch the kernel (upstream commit `5057e1aca011` or distro backport). Disable unprivileged user namespaces where rootless containers aren't required (`kernel.unprivileged_userns_clone=0` / `user.max_user_namespaces=0`). Drop `CAP_NET_ADMIN` from workloads that don't manage networking.
 
 </details>
 

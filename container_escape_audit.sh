@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# container_escape_audit.sh  —  v4.7.6
+# container_escape_audit.sh  —  v4.7.7
 # Copyright (c) 2026 Liam Romanis
 #
 # Licence: Creative Commons Attribution-NonCommercial 4.0 International
@@ -66,7 +66,7 @@ QUIET=false
 NO_REPORT=false
 DUMP_STATE=false
 CHECK_UPDATES=false
-SCRIPT_VERSION="4.7.6"
+SCRIPT_VERSION="4.7.7"
 REPORT_NAME_BASE="container_escape_report"   # default base name; overridable via --report-name
 REPORT_FILE=""                                 # left empty until after arg parsing unless --report is given explicitly
 REPORT_FILE_EXPLICIT=false                     # true only if --report set the filename verbatim
@@ -501,7 +501,7 @@ emit_json() {
   local first=true
   echo "{"
   echo "  \"tool\": \"container_escape_audit\","
-  echo "  \"version\": \"4.4\","
+  echo "  \"version\": \"${SCRIPT_VERSION}\","
   echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
   echo "  \"host\": \"$(hostname 2>/dev/null || echo 'unknown')\","
   echo "  \"kernel\": \"$(uname -r 2>/dev/null || echo 'unknown')\","
@@ -1519,6 +1519,12 @@ check_runc_masked_path() {
       vulnerable=true
     fi
   fi
+
+  # Publish the LSM-bypass precondition (CVE-2025-52881) so the MAC-confinement
+  # checks (57/58) can downgrade trust in an otherwise enforcing profile: a
+  # vulnerable runc lets a container-spawning attacker bypass AppArmor/SELinux
+  # labels regardless of how strong the loaded policy looks.
+  set_state RUNC_LSM_BYPASS "$vulnerable"
 
   if [[ "$vulnerable" == true ]]; then
     crit "VULNERABLE: runc $runc_version (CVE-2025-31133 / CVE-2025-52565 / CVE-2025-52881)"
@@ -3375,6 +3381,323 @@ check_netsched_actapi_uaf() {
     "This probe confirms the reachability precondition; the authoritative patched/unpatched verdict is the CVE engine's kernel-version check for CVE-2026-53264. Exploitation is a timing race and may take seconds to minutes." \
     "1) Patch the kernel to a build containing upstream commit 5057e1aca011 ('net/sched: act_api: use RCU with deferred freeing for action lifecycle') or your distribution's backport. 2) If rootless containers are not required, disable unprivileged user namespaces (kernel.unprivileged_userns_clone=0 on Debian/Ubuntu; user.max_user_namespaces=0 on RHEL/Fedora). 3) Drop CAP_NET_ADMIN from workloads that do not manage networking. 4) Confirm the kernel-version verdict for CVE-2026-53264 in the CVE section."
 }
+
+# ===========================================================================
+# Check 57 — AppArmor confinement depth (mode, profile identity, mediation)
+# ---------------------------------------------------------------------------
+# Check 11 already answers "is AppArmor applied?" by treating any non-empty,
+# non-"unconfined" label as OK. That collapses three materially different
+# states into one:
+#   * enforce   — rule violations are DENIED
+#   * complain  — rule violations are only LOGGED (audit-only; no protection)
+#   * unconfined — no profile at all
+# It also cannot tell the runtime DEFAULT profile (docker-default /
+# cri-containerd.apparmor.d) from a tightened bespoke one, and it does not
+# check whether the kernel actually compiled in mount/ptrace/signal mediation
+# (older/vendor kernels ship AppArmor WITHOUT mount mediation, silently
+# defeating profile rules that assume it). This check fills those gaps.
+#
+# Read-only: reads /proc/self/attr/{current,apparmor/current} and
+# /sys/kernel/security/apparmor/* only. Consumes APPARMOR_STATE, CAP_SYS_ADMIN
+# and RUNC_LSM_BYPASS from the state registry. Publishes APPARMOR_MODE.
+# ===========================================================================
+check_apparmor_confinement_depth() {
+  hdr "57. AppArmor confinement depth (mode / profile / mediation)"
+
+  local aa_state; aa_state=$(get_state APPARMOR_STATE)
+  # /proc/self/attr/current is shared with SELinux; only interpret it as an
+  # AppArmor label when AppArmor is the LSM actually present/enabled here.
+  if [[ "$aa_state" != "enabled" && ! -d /sys/kernel/security/apparmor ]]; then
+    info "AppArmor not the active LSM in this context — profile-depth analysis skipped (see check 58 for SELinux, check 59 for the LSM stack)"
+    set_state APPARMOR_MODE "n/a"
+    return
+  fi
+
+  # --- Read the label and split "name (mode)" ------------------------------
+  local aa_raw="" aa_name="" aa_mode=""
+  if [[ -r /proc/self/attr/apparmor/current ]]; then
+    aa_raw=$(cat /proc/self/attr/apparmor/current 2>/dev/null || echo "")
+  elif [[ -r /proc/self/attr/current ]]; then
+    aa_raw=$(cat /proc/self/attr/current 2>/dev/null || echo "")
+  fi
+  # Expected forms: "unconfined", "docker-default (enforce)", "prof (complain)"
+  if [[ "$aa_raw" =~ ^(.*)\ \((enforce|complain|kill|unconfined)\)$ ]]; then
+    aa_name="${BASH_REMATCH[1]}"; aa_mode="${BASH_REMATCH[2]}"
+  else
+    aa_name="$aa_raw"; aa_mode=""
+  fi
+
+  local runc_bypass; runc_bypass=$(get_state RUNC_LSM_BYPASS)
+  local bypass_note=""
+  [[ "$runc_bypass" == "true" ]] && bypass_note=" NOTE: a vulnerable runc was detected (CVE-2025-52881, check 26), which bypasses AppArmor labels during container setup — treat any enforce-mode profile below as bypassable until runc is patched."
+
+  # --- Classify the mode ----------------------------------------------------
+  if [[ -z "$aa_raw" || "$aa_name" == "unconfined" || "$aa_mode" == "unconfined" ]]; then
+    # Unconfined is already reported by check 11; escalate only when the
+    # container is ALSO privileged, because that pairing is what most of the
+    # mount/proc-based escape checks in this report actually rely on.
+    local priv; priv=$(get_state CAP_SYS_ADMIN)
+    if [[ "$priv" == "true" ]]; then
+      warn "AppArmor unconfined AND CAP_SYS_ADMIN held — mount/proc escape paths are unmediated"
+      add_finding "apparmor_unconfined_privileged" "HIGH" \
+        "AppArmor unconfined while CAP_SYS_ADMIN is held" \
+        "This context has no AppArmor profile (label: '${aa_raw:-empty}') and simultaneously holds CAP_SYS_ADMIN. The default docker/containerd AppArmor profile is the control that blocks mount(2), writes under /proc/sys, and remount tricks even when CAP_SYS_ADMIN is present; with it absent, those path-based restrictions do not exist.${bypass_note}" \
+        "The combination directly enables the cgroup release_agent escape (check 12), core_pattern write (check 5), and /proc/sys tampering — CAP_SYS_ADMIN supplies the capability and unconfined AppArmor removes the MAC backstop that would otherwise deny the filesystem operations." \
+        "High: this is the precondition pairing for several CRITICAL escape vectors elsewhere in this report, not a standalone issue." \
+        "Apply an enforce-mode AppArmor profile via securityContext.appArmorProfile (or the runtime default) AND drop CAP_SYS_ADMIN. Either control alone narrows the path; both together close it."
+      set_state APPARMOR_MODE "unconfined"
+    else
+      info "AppArmor unconfined (no CAP_SYS_ADMIN) — already recorded by check 11"
+      set_state APPARMOR_MODE "unconfined"
+    fi
+
+  elif [[ "$aa_mode" == "complain" ]]; then
+    warn "AppArmor profile '$aa_name' is in COMPLAIN mode — violations are logged, not denied"
+    add_finding "apparmor_complain_mode" "HIGH" \
+      "AppArmor profile '$aa_name' is in complain (audit-only) mode" \
+      "The loaded AppArmor profile '$aa_name' is in complain mode: the kernel logs policy violations to the audit log but ALLOWS them to proceed. To an operator checking only whether a profile is 'applied', this looks protected; in practice it provides no access control at all, only telemetry.${bypass_note}" \
+      "Every file, mount, capability and network restriction the profile appears to define is inert. An attacker performing an action the profile would 'deny' succeeds anyway, while generating audit noise that may be mistaken for blocked attempts. This defeats the AppArmor-based mitigations other findings in this report assume." \
+      "High: the protection is understood to be present by operators but is not enforcing." \
+      "Put the profile into enforce mode: 'aa-enforce /etc/apparmor.d/<profile>' or 'apparmor_parser -r' without the complain flag on the host. In Kubernetes ensure the profile is not loaded in complain mode on the node. Re-run this audit to confirm '(enforce)'."
+    set_state APPARMOR_MODE "complain"
+
+  elif [[ "$aa_mode" == "enforce" || -z "$aa_mode" ]]; then
+    # Enforcing. Distinguish runtime-default from bespoke, and surface the
+    # bypass note if runc is vulnerable.
+    local is_default=false
+    case "$aa_name" in
+      docker-default|cri-containerd.apparmor.d|crio-default|lxc-container-default*) is_default=true ;;
+    esac
+    if [[ "$runc_bypass" == "true" ]]; then
+      warn "AppArmor profile '$aa_name' is enforcing, but a vulnerable runc can bypass it (CVE-2025-52881)"
+      add_finding "apparmor_enforce_runc_bypassable" "MEDIUM" \
+        "AppArmor enforcing ('$aa_name') but bypassable via vulnerable runc (CVE-2025-52881)" \
+        "The AppArmor profile '$aa_name' is in enforce mode, which is the desired state. However, check 26 detected a runc version vulnerable to CVE-2025-52881, which bypasses AppArmor and SELinux labelling during the container mount phase. The profile is therefore not a reliable backstop until runc is patched." \
+        "An attacker who can spawn containers can sidestep this profile's rules regardless of how tightly it is written, reaching the core_pattern / sysrq-trigger primitives the profile would otherwise deny." \
+        "Medium: the profile is correct but its guarantee is currently void due to the runtime CVE." \
+        "Patch runc to >= 1.2.8 / 1.3.3 / 1.4.0-rc.3 (see check 26). The profile itself needs no change once the runtime is fixed."
+      set_state APPARMOR_MODE "enforce-bypassable"
+    elif [[ "$is_default" == true ]]; then
+      info "AppArmor enforcing with runtime-default profile: $aa_name"
+      add_finding "apparmor_runtime_default_profile" "INFO" \
+        "AppArmor enforcing with the runtime-default profile ('$aa_name')" \
+        "The container is confined by the container runtime's built-in default AppArmor profile ('$aa_name') in enforce mode. This is a reasonable baseline that blocks the most common path-based escapes (writes to /proc/sys, raw mount). It is NOT a workload-tailored profile, so it permits everything the runtime authors judged broadly safe rather than only what this specific workload needs." \
+        "Low. The default profile is effective against generic escapes but does not constrain application-specific abuse (e.g. a workload that legitimately has broad file access). Defence-in-depth only." \
+        "Informational — recorded for context." \
+        "For sensitive workloads, load a bespoke enforce-mode profile that allowlists only the paths, capabilities and mounts the workload requires, rather than relying on the runtime default."
+      set_state APPARMOR_MODE "enforce-default"
+    else
+      ok "AppArmor enforcing with custom profile: $aa_name"
+      set_state APPARMOR_MODE "enforce-custom"
+    fi
+  fi
+
+  # --- Mediation features compiled into the kernel --------------------------
+  # If mount mediation is absent, profile mount rules are meaningless — this is
+  # a common gap on older/vendor kernels and directly weakens mount-based
+  # escape defences even when a profile is loaded and enforcing.
+  local feat_dir="/sys/kernel/security/apparmor/features"
+  if [[ -d "$feat_dir" ]]; then
+    local missing=()
+    [[ -e "$feat_dir/mount"   ]] || missing+=("mount")
+    [[ -e "$feat_dir/ptrace"  ]] || missing+=("ptrace")
+    [[ -e "$feat_dir/signal"  ]] || missing+=("signal")
+    [[ -e "$feat_dir/network" || -e "$feat_dir/network_v8" ]] || missing+=("network")
+    if (( ${#missing[@]} > 0 )); then
+      warn "AppArmor mediation NOT compiled in for: ${missing[*]} — profile rules for these are inert"
+      add_finding "apparmor_missing_mediation" "MEDIUM" \
+        "AppArmor kernel mediation missing for: ${missing[*]}" \
+        "The AppArmor features directory ($feat_dir) shows this kernel does not mediate: ${missing[*]}. Any rule in a loaded profile that targets an unmediated class is silently ignored by the kernel — for example, without 'mount' mediation, a profile's deny-mount rules do nothing." \
+        "If 'mount' is among the missing classes, mount-based escape vectors (cgroup release_agent in check 12, remount of /proc/sys) are not constrained by AppArmor even under an enforcing profile. Missing 'ptrace'/'signal' mediation weakens cross-process isolation between containers sharing a profile." \
+        "Medium: it hollows out an otherwise-enforcing profile for the affected classes." \
+        "Use a kernel built with full AppArmor mediation (mainstream distro kernels since ~4.x include mount mediation). Verify with 'ls $feat_dir'. Where mediation cannot be added, compensate with seccomp (block mount(2)) and a dropped capability set."
+    else
+      ok "AppArmor kernel mediation present: mount, ptrace, signal, network"
+    fi
+  fi
+}
+
+# ===========================================================================
+# Check 58 — SELinux process domain & MCS separation
+# ---------------------------------------------------------------------------
+# Check 11 reports the SELinux MODE (enforcing/permissive/disabled) but not the
+# DOMAIN the current process runs in, nor whether MCS categories isolate this
+# container from its neighbours. Two enforcing systems can be worlds apart:
+#   * container_t with a unique category pair (c123,c456) — properly confined
+#   * spc_t / unconfined_t, or no categories — effectively unconfined, or no
+#     inter-container separation
+# This check reads the process context and the container-relevant booleans.
+#
+# Read-only: reads /proc/self/attr/current, /sys/fs/selinux/booleans/* and (if
+# present) getsebool. Consumes SELINUX_MODE and RUNC_LSM_BYPASS. Publishes
+# SELINUX_DOMAIN and SELINUX_MCS.
+# ===========================================================================
+check_selinux_domain_mcs() {
+  hdr "58. SELinux domain & MCS separation"
+
+  local se_mode; se_mode=$(get_state SELINUX_MODE)
+  if [[ "$se_mode" == "none" || "$se_mode" == "unknown" ]]; then
+    info "SELinux not present in this context — domain/MCS analysis skipped (see check 59 for the LSM stack)"
+    set_state SELINUX_DOMAIN "n/a"; set_state SELINUX_MCS "n/a"
+    return
+  fi
+
+  # --- Read the process security context ------------------------------------
+  # Format: user_u:role_r:type_t:s0[:c123,c456]
+  local ctx="" se_user se_role se_type se_range
+  [[ -r /proc/self/attr/current ]] && ctx=$(tr -d '\000' < /proc/self/attr/current 2>/dev/null)
+  if [[ -z "$ctx" || "$ctx" != *:*:*:* ]]; then
+    info "SELinux ${se_mode}, but process context unreadable/unexpected ('${ctx:-empty}') — cannot classify domain"
+    set_state SELINUX_DOMAIN "unknown"; set_state SELINUX_MCS "unknown"
+    return
+  fi
+  se_user="${ctx%%:*}"
+  se_role="$(echo "$ctx" | cut -d: -f2)"
+  se_type="$(echo "$ctx" | cut -d: -f3)"
+  se_range="$(echo "$ctx" | cut -d: -f4-)"
+
+  local runc_bypass; runc_bypass=$(get_state RUNC_LSM_BYPASS)
+  local bypass_note=""
+  [[ "$runc_bypass" == "true" ]] && bypass_note=" NOTE: a vulnerable runc was detected (CVE-2025-52881, check 26) which bypasses SELinux labelling during container setup — treat the confinement below as bypassable until runc is patched."
+
+  set_state SELINUX_DOMAIN "$se_type"
+
+  # --- Classify the domain --------------------------------------------------
+  case "$se_type" in
+    unconfined_t|unconfined_service_t)
+      warn "SELinux domain is $se_type — effectively unconfined despite enforcing mode"
+      add_finding "selinux_unconfined_domain" "HIGH" \
+        "SELinux process runs in the unconfined domain ($se_type)" \
+        "SELinux is ${se_mode}, but this process runs in '$se_type'. The unconfined domain is written to permit essentially all operations; being in it means the enforcing policy imposes little to no restriction on this container, even though 'getenforce' reports Enforcing.${bypass_note}" \
+        "SELinux-based mitigations that assume a confined container domain (blocking host file access, restricting mounts, defeating the runc maskedPaths bypass via labelling) are not in effect for an unconfined process. The 'Enforcing' status is misleading here." \
+        "High: gives false assurance — the mode says protected, the domain says otherwise." \
+        "Run containers under the container domain (container_t / container_engine_t) rather than unconfined_t. On the container engine, ensure SELinux labelling is enabled (Docker: no --security-opt label=disable; CRI-O/podman: default). Investigate why this workload landed in the unconfined domain."
+      ;;
+    spc_t)
+      warn "SELinux domain is spc_t (super-privileged container) — container SELinux confinement disabled"
+      add_finding "selinux_spc_t" "HIGH" \
+        "SELinux domain is spc_t (super-privileged container)" \
+        "This process runs in 'spc_t', the super-privileged container domain assigned when a container is started with SELinux separation turned off (e.g. --privileged, or --security-opt label=disable). spc_t is largely unconfined by design.${bypass_note}" \
+        "The container has host-level SELinux access. Combined with any mount or capability finding elsewhere in this report, there is no SELinux label boundary left to cross to reach host resources." \
+        "High: spc_t is the SELinux signature of a container run without label separation." \
+        "Remove --privileged / --security-opt label=disable. Let the engine assign container_t with a unique MCS pair. If the workload genuinely needs extra host access, grant specific SELinux policy rather than dropping to spc_t wholesale."
+      ;;
+    container_t|container_engine_t|svirt_lxc_net_t)
+      # Properly confined domain — now check MCS categories for inter-container
+      # isolation.
+      if [[ "$se_range" != *:c* ]]; then
+        warn "SELinux domain $se_type but NO MCS categories ($se_range) — no inter-container isolation"
+        add_finding "selinux_no_mcs_categories" "MEDIUM" \
+          "SELinux container domain without MCS categories ($se_type, range '$se_range')" \
+          "The process is correctly in the container domain '$se_type', but its MCS range is '$se_range' with no category pair (cN,cM). MCS categories are what SELinux uses to isolate one container from another on the same host: each container normally gets a unique pair so it cannot access another's files or processes even though both share the container_t type.${bypass_note}" \
+          "Without unique categories, the type-level rules still apply (host confinement holds) but container-to-container separation is lost: a compromised container may read or signal peer containers labelled with the same (or no) category. In multi-tenant nodes this is a lateral-movement path." \
+          "Medium: host confinement intact, peer isolation absent." \
+          "Ensure the container engine assigns per-container MCS labels (the default for Docker/podman/CRI-O with SELinux enabled). Avoid pinning a fixed --security-opt label=level:s0 across containers. Verify neighbours have distinct category pairs."
+      else
+        ok "SELinux enforcing, container domain $se_type with MCS categories (${se_range})"
+        set_state SELINUX_MCS "$se_range"
+      fi
+      ;;
+    *)
+      if [[ "$se_mode" == "enforcing" ]]; then
+        info "SELinux enforcing, domain $se_type (non-standard for containers) — verify this is intended"
+      else
+        info "SELinux ${se_mode}, domain $se_type"
+      fi
+      ;;
+  esac
+  [[ "$se_range" == *:c* ]] && set_state SELINUX_MCS "$se_range" || set_state SELINUX_MCS "${se_range:-none}"
+
+  # --- Container-relevant SELinux booleans ----------------------------------
+  # A single enabled boolean can widen what container_t may do. Only inspect the
+  # handful that matter for escape rather than dumping all booleans.
+  if [[ "$se_mode" != "disabled" ]]; then
+    local -a hot_bools=(container_manage_cgroup virt_use_execmem virt_sandbox_use_all_caps virt_use_nfs virt_use_samba)
+    local b val on=()
+    for b in "${hot_bools[@]}"; do
+      val=""
+      if [[ -r "/sys/fs/selinux/booleans/$b" ]]; then
+        # file contains "current pending"; take the current value
+        val=$(awk '{print $1}' "/sys/fs/selinux/booleans/$b" 2>/dev/null)
+      elif command -v getsebool &>/dev/null; then
+        val=$(getsebool "$b" 2>/dev/null | awk '{print $3}')
+        [[ "$val" == "on" ]] && val=1; [[ "$val" == "off" ]] && val=0
+      fi
+      [[ "$val" == "1" ]] && on+=("$b")
+    done
+    if (( ${#on[@]} > 0 )); then
+      warn "Escape-relevant SELinux booleans enabled: ${on[*]}"
+      add_finding "selinux_hot_booleans" "MEDIUM" \
+        "Escape-relevant SELinux booleans are enabled: ${on[*]}" \
+        "One or more SELinux booleans that widen container permissions are enabled: ${on[*]}. For example, container_manage_cgroup lets a container write the cgroup filesystem (feeding the release_agent escape), and virt_use_execmem permits writable+executable memory. Booleans override the base policy without changing the domain, so an otherwise-confined container_t can be materially loosened by a single toggle." \
+        "Depending on which are set, this can re-open mount/cgroup/exec-mem paths that the container policy would normally deny, increasing the exploitability of other findings (notably check 12 when container_manage_cgroup is on)." \
+        "Medium: policy is enforcing but selectively relaxed." \
+        "Review each enabled boolean with 'getsebool <name>' and disable those not required: 'setsebool -P <name> off'. Prefer granting narrow custom policy over broad booleans."
+    else
+      ok "No escape-relevant SELinux booleans enabled (checked: ${hot_bools[*]})"
+    fi
+  fi
+}
+
+# ===========================================================================
+# Check 59 — Active LSM stack composition
+# ---------------------------------------------------------------------------
+# /sys/kernel/security/lsm lists the LSMs actually active in the kernel, in
+# order (e.g. "capability,lockdown,yama,apparmor,bpf"). This disambiguates a
+# surprisingly common situation: the MAC USERSPACE is installed (getenforce or
+# apparmor_parser present) but the MAC LSM is not in the active stack — so no
+# mandatory access control is actually enforced. It also reveals lockdown and
+# the BPF LSM. Cheap read, high clarifying value.
+#
+# Read-only: reads /sys/kernel/security/lsm only. Consumes SELINUX_MODE and
+# APPARMOR_STATE. Publishes LSM_STACK and LSM_MAC_ACTIVE.
+# ===========================================================================
+check_lsm_stack() {
+  hdr "59. Active LSM stack composition"
+
+  local lsm_file="/sys/kernel/security/lsm"
+  if [[ ! -r "$lsm_file" ]]; then
+    info "$lsm_file not readable in this context — cannot enumerate the active LSM stack"
+    set_state LSM_STACK "unknown"; set_state LSM_MAC_ACTIVE "unknown"
+    return
+  fi
+
+  local stack; stack=$(cat "$lsm_file" 2>/dev/null)
+  set_state LSM_STACK "$stack"
+  info "Active LSMs (in order): $stack"
+
+  # Is a MAC LSM actually in the active stack?
+  local mac_active=false
+  [[ ",$stack," == *",selinux,"* || ",$stack," == *",apparmor,"* || ",$stack," == *",smack,"* || ",$stack," == *",tomoyo,"* ]] && mac_active=true
+  set_state LSM_MAC_ACTIVE "$mac_active"
+
+  # Userspace present but MAC LSM not active = installed-but-inactive gap.
+  local se_mode; se_mode=$(get_state SELINUX_MODE)
+  local aa_state; aa_state=$(get_state APPARMOR_STATE)
+  local userspace_present=false
+  { command -v getenforce &>/dev/null || command -v apparmor_parser &>/dev/null || [[ "$se_mode" != "none" || "$aa_state" != "unknown" ]]; } && userspace_present=true
+
+  if [[ "$mac_active" == false ]]; then
+    if [[ "$userspace_present" == true ]]; then
+      warn "No MAC LSM in the active stack, yet MAC userspace/config is present — installed but NOT enforcing"
+      add_finding "lsm_mac_installed_inactive" "HIGH" \
+        "MAC tooling present but no MAC LSM active in the kernel stack" \
+        "The active LSM stack is '$stack', which contains no mandatory-access-control module (no selinux/apparmor/smack/tomoyo). Yet MAC userspace or configuration is present on this system (getenforce/apparmor_parser installed, or a configured mode was observed). This is the classic 'looks protected, isn't' state: tools and config exist, but the kernel is not loading any MAC LSM — typically because 'security=' / 'lsm=' on the kernel command line omits it, or the LSM was compiled out." \
+        "No mandatory access control is enforced at all, regardless of profile files, SELinux policy packages, or per-pod appArmorProfile settings. Every MAC-based mitigation referenced elsewhere in this report is void." \
+        "High: MAC is assumed present by operators and by other controls, but is absent from the kernel." \
+        "Add the MAC module to the kernel command line (e.g. 'lsm=...,apparmor' or 'security=selinux' plus 'selinux=1'), ensure the module is built into the kernel, and reboot. Verify 'cat $lsm_file' lists the intended MAC LSM afterwards."
+    else
+      info "No MAC LSM active and no MAC userspace present (stack: $stack) — consistent with a MAC-less host (common on minimal Debian/Ubuntu/Alpine)"
+    fi
+  else
+    ok "MAC LSM present in the active stack (stack: $stack)"
+  fi
+
+  # Informational: note lockdown and the BPF LSM if present.
+  [[ ",$stack," == *",lockdown,"* ]] && info "Kernel lockdown LSM active — restricts some root-to-kernel paths (/dev/mem, kprobes, module loading)"
+  [[ ",$stack," == *",bpf,"* ]] && info "BPF LSM active — programmable policy hooks may be in use"
+  [[ ",$stack," == *",yama,"* ]] && info "Yama LSM active — ptrace scope restrictions available (see check 10)"
+}
 # =============================================================================
 # cve_check_engine.sh  —  Config-driven CVE check engine
 # Drop-in addition to container_escape_audit.sh
@@ -4958,6 +5281,16 @@ check_drm_render_node_escape
 # ---------------------------------------------------------------------------
 check_xfs_reflink_exposure
 check_netsched_actapi_uaf
+
+# ---------------------------------------------------------------------------
+# Checks 57-59: MAC confinement depth (AppArmor mode/mediation, SELinux
+# domain/MCS, active LSM stack). These extend the binary "is it on?" answer of
+# check 11 with the mode-, domain-, and stack-level detail that determines
+# whether the MAC is actually confining this container.
+# ---------------------------------------------------------------------------
+check_apparmor_confinement_depth
+check_selinux_domain_mcs
+check_lsm_stack
 
 # ---------------------------------------------------------------------------
 # Config-driven CVE checks (reads cve_checks.conf)
