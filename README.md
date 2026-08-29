@@ -1,8 +1,8 @@
 ![Logo](k8s_logo.png)
 
-![Version](https://img.shields.io/badge/version-4.7.6-blue)
-![Checks](https://img.shields.io/badge/checks-56-blue)
-![CVEs tracked](https://img.shields.io/badge/CVEs%20tracked-41-blue)
+![Version](https://img.shields.io/badge/version-4.7.9-blue)
+![Checks](https://img.shields.io/badge/checks-60-blue)
+![CVEs tracked](https://img.shields.io/badge/CVEs%20tracked-51-blue)
 ![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/liamromanis101?label=Sponsor&logo=GitHub&color=db61a2)](https://github.com/sponsors/liamromanis101)
 
