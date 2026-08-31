@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# container_escape_audit.sh  —  v4.7.8
+# container_escape_audit.sh  —  v4.7.9
 # Copyright (c) 2026 Liam Romanis
 #
 # Licence: Creative Commons Attribution-NonCommercial 4.0 International
@@ -66,7 +66,7 @@ QUIET=false
 NO_REPORT=false
 DUMP_STATE=false
 CHECK_UPDATES=false
-SCRIPT_VERSION="4.7.8"
+SCRIPT_VERSION="4.7.9"
 REPORT_NAME_BASE="container_escape_report"   # default base name; overridable via --report-name
 REPORT_FILE=""                                 # left empty until after arg parsing unless --report is given explicitly
 REPORT_FILE_EXPLICIT=false                     # true only if --report set the filename verbatim
@@ -3698,6 +3698,109 @@ check_lsm_stack() {
   [[ ",$stack," == *",bpf,"* ]] && info "BPF LSM active — programmable policy hooks may be in use"
   [[ ",$stack," == *",yama,"* ]] && info "Yama LSM active — ptrace scope restrictions available (see check 10)"
 }
+
+# ---------------------------------------------------------------------------
+# Check 60 — KVM/x86 shadow-MMU guest-to-host / LPE exposure
+#            (CVE-2026-64561 Zapscape, CVE-2026-53359 Januscape)
+# Parallels check 51 (arm64 ITScape) for the x86 side. Both Zapscape and
+# Januscape are use-after-frees in KVM/x86's shadow-MMU code, already tracked by
+# the CVE engine as kernel_version entries. This adds the missing BEHAVIOURAL
+# reachability signal the arm64 check already provides:
+#   - The classic path is guest(L1)->host, needing nested virt exposed to an
+#     untrusted guest.
+#   - BUT on RHEL / AlmaLinux / Rocky / CloudLinux families /dev/kvm is
+#     world-writable (0666), so ANY local user — including a process inside a
+#     container that has /dev/kvm exposed — can create a throwaway VM and drive
+#     the shadow-MMU bug against the host kernel: a direct local-root LPE and a
+#     container-escape primitive, not merely a nested-virt curiosity.
+# READ-ONLY: uname, stat/-w on /dev/kvm, /proc/modules, and
+# /sys/module/kvm_*/parameters/nested. No /dev/kvm open(), no KVM ioctls, no VM
+# is created.
+# ---------------------------------------------------------------------------
+check_kvm_x86_shadow_mmu_exposure() {
+  hdr "60. KVM/x86 shadow-MMU exposure (CVE-2026-64561 Zapscape / CVE-2026-53359 Januscape)"
+
+  local arch
+  arch=$(uname -m 2>/dev/null || echo "unknown")
+  if [[ "$arch" != "x86_64" && "$arch" != "amd64" ]]; then
+    ok "Host architecture is ${arch} — CVE-2026-64561 / CVE-2026-53359 (x86-only) not applicable (see check 51 for arm64 ITScape)"
+    return
+  fi
+
+  # /dev/kvm reachability + writability from THIS context (read-only checks).
+  if [[ ! -e /dev/kvm ]]; then
+    ok "x86 context without /dev/kvm reachable — KVM shadow-MMU escape path not exposed here"
+    return
+  fi
+
+  # Permission string and world-writability, read-only.
+  local kvm_perms kvm_mode world_writable=false writable_by_me=false
+  kvm_perms=$(stat -c '%A %a %U:%G' /dev/kvm 2>/dev/null || echo "unknown")
+  kvm_mode=$(stat -c '%a' /dev/kvm 2>/dev/null || echo "")
+  # World-writable if the last octal digit has the write bit (2).
+  if [[ -n "$kvm_mode" && "${kvm_mode: -1}" =~ [2367] ]]; then world_writable=true; fi
+  [[ -w /dev/kvm ]] && writable_by_me=true
+
+  # Which vendor backend + is nested virt enabled (the classic guest->host path).
+  local vendor="unknown" nested="unknown"
+  if grep -q '^kvm_intel ' /proc/modules 2>/dev/null; then
+    vendor="Intel (kvm_intel)"
+    nested=$(cat /sys/module/kvm_intel/parameters/nested 2>/dev/null || echo "unknown")
+  elif grep -q '^kvm_amd ' /proc/modules 2>/dev/null; then
+    vendor="AMD (kvm_amd)"
+    nested=$(cat /sys/module/kvm_amd/parameters/nested 2>/dev/null || echo "unknown")
+  fi
+  local nested_note=""
+  case "$nested" in
+    Y|1) nested_note="nested virtualization ENABLED (${vendor}) — guest->host path is reachable" ;;
+    N|0) nested_note="nested virtualization disabled (${vendor}) — guest->host path needs it enabled, but the /dev/kvm LPE path does not" ;;
+    *)   nested_note="nested-virt state unknown (${vendor})" ;;
+  esac
+
+  # Are we in a container? Direct read-only heuristic (no state key is published
+  # for this by the tool). Standard markers only.
+  local in_container="unknown"
+  if [[ -e /.dockerenv || -e /run/.containerenv ]] || \
+     grep -qaE '(docker|kubepods|containerd|libpod|lxc)' /proc/1/cgroup 2>/dev/null; then
+    in_container="true"
+  fi
+
+  if [[ "$writable_by_me" == true ]]; then
+    # The strongest signal: this very context can write /dev/kvm, so it can
+    # create a VM and drive the shadow-MMU UAF. On a container this is the
+    # escape precondition; on a host it is the local-root LPE precondition.
+    warn "/dev/kvm is WRITABLE from this context (${kvm_perms}) — KVM shadow-MMU LPE/escape precondition present"
+    add_finding "kvm_x86_devkvm_writable" "HIGH" \
+      "/dev/kvm writable from this context — reachable KVM/x86 shadow-MMU escape surface (Zapscape/Januscape)" \
+      "This x86_64 context can WRITE /dev/kvm (${kvm_perms}). /dev/kvm is the interface for creating a VM, which is the entry point to KVM's shadow-MMU code targeted by CVE-2026-64561 (Zapscape) and CVE-2026-53359 (Januscape). ${nested_note}.$( [[ "$world_writable" == true ]] && echo ' /dev/kvm is world-writable (0666) — the default on RHEL / AlmaLinux / Rocky / CloudLinux families, where any local user can reach this surface.') $( [[ "$in_container" == "true" ]] && echo 'This context appears to be a container, so /dev/kvm has been exposed into the container — a device that should almost never be present in an application container.')" \
+      "An attacker who can write /dev/kvm can create a throwaway guest and drive the shadow-MMU use-after-free without needing to already be inside a nested guest. On a container with /dev/kvm exposed this is a container-to-host escape; on a shared host (RHEL-family 0666) it is a local unprivileged-to-root LPE. Both Zapscape and Januscape then yield host code execution at kernel/root privilege." \
+      "This probe confirms the reachability precondition (writable /dev/kvm), not the patch level — combine with the CVE engine's kernel-version verdict for CVE-2026-64561 and CVE-2026-53359. Public PoCs exist for both." \
+      "1) Do NOT expose /dev/kvm to application containers — remove the device mount. 2) On hosts, restrict /dev/kvm to a trusted 'kvm' group instead of 0666 (e.g. a udev rule setting mode 0660 group kvm) so unprivileged users cannot open it. 3) Patch the host kernel for both CVEs: Zapscape commit 2abd5287f083, Januscape commit 81ccda30b4e8 (plus companion CVE-2026-46113 commit 0cb2af2ea66a) — the 2026-08-03 / 2026-07-04 stable batches or vendor backports. 4) Where nested virt is not required, disable it (kvm_intel/kvm_amd nested=0)."
+  elif [[ "$world_writable" == true ]]; then
+    # World-writable on the host but not writable by us (e.g. we lack the raw
+    # perms in this namespace) — still the RHEL-family LPE precondition for any
+    # local user on the host.
+    warn "/dev/kvm is world-writable (${kvm_perms}) — RHEL-family LPE precondition for any local user"
+    add_finding "kvm_x86_devkvm_world_writable" "HIGH" \
+      "/dev/kvm world-writable (0666) — any local user can reach the KVM/x86 shadow-MMU surface (Zapscape/Januscape)" \
+      "/dev/kvm on this x86_64 host is world-writable (${kvm_perms}) — the default configuration on RHEL / AlmaLinux / Rocky / CloudLinux families. Any local user can open it to create a VM and reach the shadow-MMU code affected by CVE-2026-64561 (Zapscape) and CVE-2026-53359 (Januscape). ${nested_note}." \
+      "On these distributions the KVM/x86 shadow-MMU UAFs are exploitable as a straightforward local privilege escalation to root by any unprivileged user, independent of whether nested virtualization is exposed to guests — the world-writable device removes the 'must already be in a guest' precondition." \
+      "Reachability precondition only; confirm patch status via the CVE engine's kernel-version result for both CVEs." \
+      "1) Restrict /dev/kvm to a trusted 'kvm' group (udev rule, mode 0660) rather than 0666. 2) Patch the host kernel for Zapscape (commit 2abd5287f083) and Januscape (commit 81ccda30b4e8 + companion CVE-2026-46113 commit 0cb2af2ea66a). 3) Disable nested virt where unneeded."
+  elif [[ "$nested" == "Y" || "$nested" == "1" ]]; then
+    # Not writable by us and not world-writable, but nested virt is on: the
+    # classic guest->host escape path for tenants who legitimately run VMs.
+    info "x86 KVM host with nested virtualization enabled (${vendor}) — classic Zapscape/Januscape guest->host path present"
+    add_finding "kvm_x86_nested_enabled" "MEDIUM" \
+      "x86 KVM host exposes nested virtualization — Zapscape/Januscape guest-to-host path present" \
+      "This x86_64 host has /dev/kvm present (${kvm_perms}) and nested virtualization enabled (${vendor}). CVE-2026-64561 (Zapscape) and CVE-2026-53359 (Januscape) are shadow-MMU use-after-frees a malicious L1 guest with kernel (root) privilege can use to execute code on the host." \
+      "A tenant with root in their own nested guest can escape to the host and compromise every co-located VM. Most relevant to multi-tenant x86 clouds and VM-isolated container runtimes (Kata, Firecracker-style microVMs) that expose nested virt to untrusted guests." \
+      "Platform-exposure signal, not a patch check; combine with the CVE engine's kernel-version verdict for both CVEs." \
+      "1) Patch the host kernel (Zapscape commit 2abd5287f083; Januscape commit 81ccda30b4e8 + CVE-2026-46113 commit 0cb2af2ea66a). 2) Until patched, disable nested virt for untrusted tenants (kvm_intel/kvm_amd nested=0). 3) Restrict /dev/kvm to trusted users."
+  else
+    ok "x86 /dev/kvm present (${kvm_perms}) but not writable here and not world-writable, nested virt not enabled — KVM shadow-MMU escape surface not reachable from this context"
+  fi
+}
 # =============================================================================
 # cve_check_engine.sh  —  Config-driven CVE check engine
 # Drop-in addition to container_escape_audit.sh
@@ -5291,6 +5394,15 @@ check_netsched_actapi_uaf
 check_apparmor_confinement_depth
 check_selinux_domain_mcs
 check_lsm_stack
+
+# ---------------------------------------------------------------------------
+# Check 60: KVM/x86 shadow-MMU exposure — behavioural reachability signal for
+# the x86 KVM escapes (Zapscape CVE-2026-64561, Januscape CVE-2026-53359),
+# parallel to check 51's arm64 ITScape probe. Flags writable/world-writable
+# /dev/kvm (the RHEL-family 0666 LPE path and container /dev/kvm exposure) and
+# nested-virt exposure.
+# ---------------------------------------------------------------------------
+check_kvm_x86_shadow_mmu_exposure
 
 # ---------------------------------------------------------------------------
 # Config-driven CVE checks (reads cve_checks.conf)
