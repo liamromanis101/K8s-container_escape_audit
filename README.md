@@ -1,8 +1,8 @@
 ![Logo](k8s_logo.png)
 
-![Version](https://img.shields.io/badge/version-4.7.9-blue)
-![Checks](https://img.shields.io/badge/checks-60-blue)
-![CVEs tracked](https://img.shields.io/badge/CVEs%20tracked-51-blue)
+![Version](https://img.shields.io/badge/version-4.7.6-blue)
+![Checks](https://img.shields.io/badge/checks-56-blue)
+![CVEs tracked](https://img.shields.io/badge/CVEs%20tracked-41-blue)
 ![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/liamromanis101?label=Sponsor&logo=GitHub&color=db61a2)](https://github.com/sponsors/liamromanis101)
 
@@ -49,7 +49,7 @@ Kubernetes Container Escape Audit focuses on exploitability:
 
 ## What it does
 
-`container_escape_audit.sh` v4.7.9 performs **60 checks** plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture, MAC confinement depth (AppArmor enforce/complain mode and kernel mediation, SELinux domain and MCS separation, active LSM stack composition), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64, KVM/x86 shadow-MMU via `/dev/kvm` reachability, DRM/GPU render nodes, XFS reflink, net/sched tc-actions), container runtime version detection, Docker Engine daemon-level authorization bypass detection, and an updateable database of **51 kernel and runtime CVEs** — container-relevant escapes and privilege-escalations backdated to 2024, with landmark escapes earlier (DirtyCOW 2016 through the 2026 disclosures). The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system.
+`container_escape_audit.sh` v4.8.0 performs **60 checks** (plus check 61, an opt-in unauthenticated-service network probe enabled with `--network`) plus a config-driven CVE engine, covering: privileged configuration, dangerous capabilities, namespace isolation, filesystem mounts, kernel exposure, Kubernetes misconfigurations, cloud metadata access, kernel hardening posture, MAC confinement depth (AppArmor enforce/complain mode and kernel mediation, SELinux domain and MCS separation, active LSM stack composition), container-runtime escape surfaces (io_uring, kTLS/sockmap, Kata, KVM/arm64, KVM/x86 shadow-MMU via `/dev/kvm` reachability, DRM/GPU render nodes, XFS reflink, net/sched tc-actions), container runtime version detection, Docker Engine daemon-level authorization bypass detection, optional opt-in detection of unauthenticated network services (Redis, etcd, Memcached, Docker API, Elasticsearch, MongoDB) reachable from the Pod, and an updateable database of **51 kernel and runtime CVEs** — container-relevant escapes and privilege-escalations backdated to 2024, with landmark escapes earlier (DirtyCOW 2016 through the 2026 disclosures). The CVE engine performs **distro- and flavour-aware version checking**: it reads authoritative NVD version ranges and per-distribution fixed versions to return an accurate *vulnerable / not-affected / defer-to-vendor / unknown* verdict, rather than a naive kernel-version comparison. All checks are strictly read-only — the script makes no changes to the system. The one capability that reaches beyond the local system is the opt-in `--network` probe, which makes outbound connections but is still non-destructive (connect-and-identify only).
 
 Each finding comes with a structured report entry:
 
@@ -72,6 +72,15 @@ One note on running as root: checks 1, 2, and 27 (privileged mode, dangerous cap
 Releases are published on GitHub with **SLSA Build Level 3 provenance**. Each release carries a signed `multiple.intoto.jsonl` attestation covering both `container_escape_audit.sh` and `cve_checks.conf`, so you can cryptographically confirm that the files you're about to run as root were built by this repository's release workflow and have not been tampered with. See [Verifying the download](#verifying-the-download) below. Because this tool is intended to run with elevated privileges during assessments, verifying provenance before each use is strongly recommended.
 
 ## Latest updates
+
+### v4.8.0 — `--network`: opt-in unauthenticated network-service detection (check 61)
+
+Adds an **opt-in** active-probing capability for unauthenticated network services reachable from the Pod — the first capability in the tool that makes outbound connections, so it is gated behind `--network` and **off by default**. Everything else remains strictly read-only local introspection. Check count **60 → 61** (the new check runs only with `--network`). No new required dependencies (`curl` is used where present; raw `/dev/tcp` otherwise; `timeout` bounds every probe).
+
+- **New check 61 — `check_network_unauth_services` (`--network`).** Detects unauthenticated **Redis, etcd, Memcached, Docker Engine API, Elasticsearch, and MongoDB** reachable from the Pod's network position. It is **connect-and-identify only**: it opens a TCP connection, sends a single read-only protocol command (`INFO server`, `version`, `GET /version`, `/health`), reads the banner, and closes. It performs **no writes, no `CONFIG SET`, no auth brute-forcing, no keyspace access, and no exploitation** — it stops at "reachable and unauthenticated," which is the finding; weaponisation (e.g. Redis→RCE via `CONFIG SET dir`) is left to the operator within scope.
+- **Severity reflects real impact.** etcd and the Docker API → **CRITICAL** (all cluster secrets / root-on-host respectively); Redis and Elasticsearch → **HIGH**; Memcached → **MEDIUM**; MongoDB → **LOW** (reachability only — the wire protocol is not spoken, so auth is not verified, and the finding says so and escalates on manual confirmation).
+- **Scoped, not a scanner.** Targets are limited to `127.0.0.1`, the node/default-gateway IP, and the `*_SERVICE_HOST` / `*_SERVICE_PORT` endpoints Kubernetes injects into the Pod's own environment. It does **not** sweep arbitrary CIDRs — that would be scanning the client's network and needs separate authorisation. Every probe is bounded by a short `timeout` so it cannot hang, and the check prints an explicit "ACTIVE PROBING ENABLED — confirm targets are in scope" notice.
+- **Not duplicated.** Cloud metadata (IMDS, check 15), kubelet, and the service-account-token RBAC probe already run in the default battery; `--network` deliberately covers only the unauthenticated *data-service* gap, not those.
 
 ### CVE database — 2024/2025 backfill & io_uring correction (2026-08-28) — 43 → 51 entries
 
@@ -330,6 +339,21 @@ The x86 counterpart to check 51's arm64 ITScape probe. The two x86 KVM shadow-MM
 
 > **Why writability, not just presence.** These bugs are reached by creating a VM through `/dev/kvm`. On RHEL / AlmaLinux / Rocky / CloudLinux families `/dev/kvm` is world-writable (0666), so any local user — or a process in a container that has `/dev/kvm` exposed — can reach the shadow-MMU code and drive the use-after-free *without already being inside a nested guest*. That makes these a direct unprivileged-to-root LPE on those distros and a container-to-host escape wherever `/dev/kvm` is reachable, not the nested-virt-only issue the CVE entries originally described. Check 60 grades: writable-here → HIGH (escape/LPE precondition, flagged harder inside a container); world-writable 0666 → HIGH (any-local-user LPE precondition); present + nested virt enabled → MEDIUM (classic guest→host path); locked-down + nested-off → OK. It confirms reachability only — the authoritative patched/unpatched verdict comes from the CVE engine's kernel-version result for both CVEs.
 
+### Unauthenticated network services (check 61, `--network`)
+
+The only check that reaches beyond the local system, and the only one that is **off by default** — it runs solely when `--network` is passed. It detects unauthenticated data services reachable from the Pod's own network position and is **connect-and-identify only**: TCP connect, one read-only protocol command, read the banner, close. No writes, no `CONFIG SET`, no auth brute-forcing, no keyspace access, no exploitation — the finding is "reachable and unauthenticated," and weaponisation is left to the operator within scope. It does not duplicate cloud metadata (check 15), kubelet, or the SA-token RBAC probe, which already run in the default battery; it covers only the unauthenticated *data-service* gap.
+
+| Service | Port(s) | Read-only probe | If unauthenticated |
+|---|---|---|---|
+| Redis | 6379 / 6380 | `INFO server` | **HIGH** — RCE-on-host primitive (`CONFIG SET dir` → cron/SSH-key/module write) |
+| etcd | 2379 | `GET /version`, `/health` | **CRITICAL** — reads all Kubernetes secrets and control-plane state |
+| Docker Engine API | 2375 / 2376 | `GET /version` | **CRITICAL** — root-equivalent on the Docker host (mount host `/`, run privileged) |
+| Elasticsearch | 9200 | `GET /` | **HIGH** — bulk data disclosure/tampering (often logs, PII, secrets) |
+| Memcached | 11211 | `version` | **MEDIUM** — data disclosure/poisoning; UDP amplification source |
+| MongoDB | 27017 | TCP connect only | **LOW** — reachability only (wire protocol not spoken; auth not verified) — escalate on manual check |
+
+> **Scope discipline.** Targets are limited to `127.0.0.1`, the node/default-gateway IP, and the `*_SERVICE_HOST` / `*_SERVICE_PORT` endpoints Kubernetes injects into the Pod's own environment — services the Pod is already wired to or adjacent to. It **does not sweep arbitrary networks**; a broader in-cluster sweep would be scanning the client's network and needs separate authorisation. Every probe is bounded by a short `timeout` so it cannot hang, and the check prints an explicit *"ACTIVE PROBING ENABLED — confirm targets are in scope"* notice before probing. Because it makes outbound connections, only run `--network` when the targets are within your engagement scope.
+
 ### Config-driven CVE checks
 
 CVE checks are loaded from `cve_checks.conf` and run by the embedded engine. The database ships with forty-one entries and can be updated independently of the script. See [CVE engine](#cve-engine) below.
@@ -486,6 +510,17 @@ The provenance file is named `multiple.intoto.jsonl` because each release attest
 --no-report        Skip writing the report file
 --cve-conf <file>  Path to CVE database file
                    Default: cve_checks.conf in the same directory as the script
+--network          Opt-in ACTIVE probing (check 61) for UNAUTHENTICATED network
+                   services reachable from this Pod: Redis, etcd, Memcached,
+                   Docker Engine API, Elasticsearch, MongoDB. Connect-and-identify
+                   ONLY — sends one read-only command (INFO / version / GET
+                   /version) and closes; no writes, no CONFIG changes, no auth
+                   brute-forcing, no exploitation. Off unless this flag is given.
+                   Scoped to 127.0.0.1, the node/default-gateway IP, and the
+                   Kubernetes service endpoints injected into this Pod's own
+                   environment — it does NOT sweep arbitrary networks. Because it
+                   makes outbound connections, only use it when the targets are
+                   within your engagement scope.
 --check-updates    Check the GitHub repo for a newer script release and a
                    newer CVE database, print the result, and EXIT — this is
                    a standalone mode; it does not also run the full audit.

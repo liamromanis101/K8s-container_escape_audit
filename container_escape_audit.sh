@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# container_escape_audit.sh  —  v4.7.9
+# container_escape_audit.sh  —  v4.8.0
 # Copyright (c) 2026 Liam Romanis
 #
 # Licence: Creative Commons Attribution-NonCommercial 4.0 International
@@ -37,6 +37,10 @@
 #   --no-report       Skip writing the report file entirely
 #   --cve-conf <file> Path to CVE check config file
 #                     (default: same directory as this script / cve_checks.conf)
+#   --network         Opt-in ACTIVE probing for unauthenticated network services
+#                     (Redis, etcd, Memcached, Docker API, Elasticsearch, Mongo)
+#                     reachable from this Pod. Connect-and-identify only — no
+#                     writes or exploitation. Requires the targets to be in scope.
 #   --check-updates   Check github.com/liamromanis101/K8s-container_escape_audit
 #                     for a newer script release (release.txt) and a newer CVE
 #                     database (cve_release.txt vs. this cve_checks.conf's own
@@ -66,12 +70,13 @@ QUIET=false
 NO_REPORT=false
 DUMP_STATE=false
 CHECK_UPDATES=false
-SCRIPT_VERSION="4.7.9"
+SCRIPT_VERSION="4.8.0"
 REPORT_NAME_BASE="container_escape_report"   # default base name; overridable via --report-name
 REPORT_FILE=""                                 # left empty until after arg parsing unless --report is given explicitly
 REPORT_FILE_EXPLICIT=false                     # true only if --report set the filename verbatim
 CVE_CONF_ENV="${CVE_CONF:-}"                   # capture env var BEFORE the next line clears it
 CVE_CONF=""
+NETWORK_PROBE=false                            # --network: opt-in unauthenticated-service probing (active)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -82,6 +87,7 @@ while [[ $# -gt 0 ]]; do
     --report-name)   shift; REPORT_NAME_BASE="$1" ;;
     --cve-conf)      shift; CVE_CONF="$1" ;;
     --dump-state)    DUMP_STATE=true ;;
+    --network)       NETWORK_PROBE=true ;;
     --check-updates) CHECK_UPDATES=true ;;
     *) echo "Unknown option: $1" >&2 ;;
   esac
@@ -3801,6 +3807,190 @@ check_kvm_x86_shadow_mmu_exposure() {
     ok "x86 /dev/kvm present (${kvm_perms}) but not writable here and not world-writable, nested virt not enabled — KVM shadow-MMU escape surface not reachable from this context"
   fi
 }
+
+# ===========================================================================
+# --network: unauthenticated network-service detection (opt-in, connect-only)
+# ---------------------------------------------------------------------------
+# Runs ONLY when --network is passed. Everything here is connect-and-identify:
+# it opens a TCP connection, sends a single read-only protocol command (PING /
+# INFO / version / GET /version), reads the banner, and closes. It performs NO
+# writes, NO CONFIG changes, NO auth brute-forcing, NO keyspace access — it
+# stops at "reachable and unauthenticated", which is the finding. Actually
+# exploiting an open Redis/etcd/Docker API is left to the operator, in scope.
+#
+# Scope discipline: it probes only targets the Pod is already wired to or
+# adjacent to — 127.0.0.1, the node/default-gateway IP, and the Kubernetes
+# service endpoints injected into the Pod's own environment (*_SERVICE_HOST /
+# *_SERVICE_PORT). It does NOT sweep arbitrary CIDRs (that would be scanning the
+# client's network and needs separate authorisation). IMDS (check 15), kubelet
+# and SA-token RBAC are already covered by their own checks and not repeated.
+# ===========================================================================
+
+# Low-level: TCP connect within a timeout. Host/port passed as positional args
+# to the inner shell (never string-interpolated) to avoid any injection.
+_net_connect() {
+  local host="$1" port="$2" t="${3:-2}"
+  timeout "$t" bash -c 'exec 3<>/dev/tcp/"$0"/"$1"' "$host" "$port" 2>/dev/null
+}
+
+# Low-level: send a payload, read the response, bounded by a timeout.
+_net_raw() {
+  local host="$1" port="$2" payload="$3" t="${4:-2}"
+  timeout "$t" bash -c '
+    exec 3<>/dev/tcp/"$0"/"$1" 2>/dev/null || exit 1
+    printf "%b" "$2" >&3
+    cat <&3 2>/dev/null
+  ' "$host" "$port" "$payload" 2>/dev/null
+}
+
+# Low-level: HTTP(S) GET (curl), read-only, short timeouts, -k for self-signed.
+_net_http() {
+  local url="$1" t="${2:-3}"
+  command -v curl >/dev/null 2>&1 || return 2
+  curl -sk --max-time "$t" --connect-timeout 2 "$url" 2>/dev/null
+}
+
+# --- per-service identifiers (all read-only) --------------------------------
+# Each echoes a verdict token or nothing.
+_probe_redis() {   # INFO is refused pre-auth when requirepass is set → clean auth test
+  local r; r=$(_net_raw "$1" "$2" 'INFO server\r\n' 2)
+  if   [[ "$r" == *"redis_version"* ]]; then echo "UNAUTH"
+  elif [[ "$r" == *"NOAUTH"* || "$r" == *"authentication required"* ]]; then echo "AUTH"
+  fi
+}
+_probe_memcached() {   # memcached has no native auth; a version reply == open
+  local r; r=$(_net_raw "$1" "$2" 'version\r\n' 2)
+  [[ "$r" == VERSION\ * ]] && echo "UNAUTH"
+}
+_probe_etcd() {   # v2 & v3 both answer /version and /health over HTTP
+  local v; v=$(_net_http "http://$1:$2/version" 3)
+  [[ "$v" == *"etcdserver"* || "$v" == *"etcdcluster"* ]] && echo "UNAUTH"
+}
+_probe_docker() {   # 2375 plaintext (or 2376 TLS via https) daemon API
+  local v; v=$(_net_http "http://$1:$2/version" 3)
+  [[ "$v" == *'"ApiVersion"'* || "$v" == *'"GoVersion"'* ]] && { echo "UNAUTH"; return; }
+  v=$(_net_http "https://$1:$2/version" 3)
+  [[ "$v" == *'"ApiVersion"'* ]] && echo "UNAUTH-TLS"
+}
+_probe_elasticsearch() {
+  local v; v=$(_net_http "http://$1:$2/" 3)
+  [[ "$v" == *'"cluster_name"'* || "$v" == *"You Know, for Search"* ]] && echo "UNAUTH"
+}
+_probe_mongo() {   # modern Mongo needs the new wire protocol; connect-detect + verify note
+  _net_connect "$1" "$2" 2 && echo "OPEN"
+}
+
+# Emit a finding for a positively-identified unauthenticated service.
+_net_finding() {
+  local svc="$1" host="$2" port="$3" verdict="$4"
+  case "$svc:$verdict" in
+    redis:UNAUTH)
+      crit "Unauthenticated Redis at ${host}:${port} — INFO returned without AUTH"
+      add_finding "net_redis_unauth_${host}_${port}" "HIGH" \
+        "Unauthenticated Redis reachable at ${host}:${port}" \
+        "A Redis instance at ${host}:${port} answered INFO with no authentication (returned redis_version). Reachable from this Pod's network position." \
+        "Open Redis is a well-known RCE primitive: an attacker can use CONFIG SET dir + dbfilename to write a cron entry, an SSH authorized_keys file, or a webshell to the Redis host's filesystem, or load a malicious module — gaining code execution on the Redis host and a lateral pivot inside the cluster." \
+        "High — reachable, unauthenticated, and a direct RCE-on-the-Redis-host primitive." \
+        "Require authentication (requirepass / ACLs), bind Redis to the minimum necessary interfaces, apply a NetworkPolicy so only intended Pods can reach it, and disable/rename dangerous commands (CONFIG, MODULE, SLAVEOF). This tool stops at detection — exploitation (write-to-disk) is left to the operator within scope." ;;
+    redis:AUTH)
+      info "Redis reachable at ${host}:${port} but requires authentication (lower risk)" ;;
+    memcached:UNAUTH)
+      warn "Unauthenticated Memcached at ${host}:${port} — version returned without auth"
+      add_finding "net_memcached_unauth_${host}_${port}" "MEDIUM" \
+        "Unauthenticated Memcached reachable at ${host}:${port}" \
+        "A Memcached instance at ${host}:${port} returned its version banner with no authentication (Memcached has no native auth in its classic text protocol)." \
+        "Any Pod that can reach it can read and overwrite all cached data (potential session/token theft or cache poisoning) and, if reachable off-cluster, it is a UDP reflection/amplification source." \
+        "Medium — data disclosure/poisoning and amplification exposure." \
+        "Restrict Memcached with a NetworkPolicy to intended clients only, bind to localhost where it is a sidecar, disable the UDP listener (-U 0), and prefer the SASL-authenticated binary protocol if supported." ;;
+    etcd:UNAUTH)
+      crit "Unauthenticated etcd at ${host}:${port} — /version answered without auth"
+      add_finding "net_etcd_unauth_${host}_${port}" "CRITICAL" \
+        "Unauthenticated etcd reachable at ${host}:${port}" \
+        "An etcd endpoint at ${host}:${port} answered /version with no client authentication. etcd is the backing store for the entire Kubernetes cluster state." \
+        "Unauthenticated etcd access means read (and potentially write) of every Kubernetes object, INCLUDING ALL SECRETS in the cluster (service-account tokens, TLS keys, registry creds) — an effective full cluster compromise, and a path to impersonating any workload or the control plane." \
+        "Critical — direct disclosure of all cluster secrets and control-plane state." \
+        "Enable etcd client cert authentication and TLS (--client-cert-auth, --trusted-ca-file), never expose etcd beyond the control-plane nodes, and apply a NetworkPolicy/firewall so no workload Pod can reach 2379/2380. Rotate all secrets if exposure is confirmed." ;;
+    docker:UNAUTH|docker:UNAUTH-TLS)
+      crit "Unauthenticated Docker daemon API at ${host}:${port} — /version answered without auth"
+      add_finding "net_docker_api_unauth_${host}_${port}" "CRITICAL" \
+        "Unauthenticated Docker Engine API reachable at ${host}:${port}" \
+        "The Docker daemon REST API at ${host}:${port} answered /version with no authentication$( [[ "$verdict" == UNAUTH-TLS ]] && echo ' (over TLS, but no client-cert enforcement)')." \
+        "The Docker API is root-equivalent on its host: an attacker can create a container that bind-mounts the host root filesystem and chroots into it, or runs --privileged, achieving immediate code execution as root on the Docker host — a full container-to-host / node compromise." \
+        "Critical — remote, unauthenticated, root-on-host." \
+        "Never expose the Docker daemon on a network socket without mutual TLS (2376 + --tlsverify); prefer the local unix socket with restricted permissions. Apply a NetworkPolicy/firewall so workload Pods cannot reach 2375/2376. If this is reachable from a Pod, treat the node as compromised until proven otherwise." ;;
+    elasticsearch:UNAUTH)
+      warn "Unauthenticated Elasticsearch at ${host}:${port} — cluster info returned without auth"
+      add_finding "net_es_unauth_${host}_${port}" "HIGH" \
+        "Unauthenticated Elasticsearch reachable at ${host}:${port}" \
+        "An Elasticsearch/OpenSearch node at ${host}:${port} returned cluster information with no authentication." \
+        "Any Pod that can reach it can read and modify all indexed data (frequently logs, PII, and application secrets), and depending on version/config may reach scripting or snapshot features usable for further compromise." \
+        "High — bulk data disclosure and tampering." \
+        "Enable the security plugin / authentication (X-Pack security or OpenSearch security), bind to internal interfaces only, and apply a NetworkPolicy limiting access to intended clients." ;;
+    mongo:OPEN)
+      info "MongoDB port reachable at ${host}:${port} — auth NOT verified by this tool"
+      add_finding "net_mongo_open_${host}_${port}" "LOW" \
+        "MongoDB port reachable at ${host}:${port} (authentication not verified)" \
+        "A MongoDB port at ${host}:${port} accepted a TCP connection. This tool does not implement the MongoDB wire protocol, so it reports reachability only — it did NOT confirm whether authentication is required." \
+        "If the instance permits unauthenticated access (a common misconfiguration), any Pod that can reach it can read and modify all databases. Reachability from a workload Pod is itself a segmentation concern." \
+        "Low as reported (reachability only) — escalates to HIGH if manual verification finds no auth." \
+        "Manually verify with an in-scope client (e.g. mongosh --eval 'db.adminCommand({connectionStatus:1})'); enable authentication (--auth) and SCRAM users, bind to internal interfaces, and apply a NetworkPolicy. This tool intentionally stops at reachability rather than speaking the wire protocol." ;;
+  esac
+}
+
+check_network_unauth_services() {
+  [[ "${NETWORK_PROBE:-false}" == true ]] || return
+  hdr "61. Unauthenticated network services (--network active probe)"
+  info "ACTIVE PROBING ENABLED (--network): connect-and-identify only — no writes, no exploitation. Confirm all targets are within your engagement scope."
+
+  if ! command -v timeout >/dev/null 2>&1; then
+    warn "'timeout' not available — skipping network probes to avoid hangs"
+    return
+  fi
+
+  # --- build the target host list (scoped, non-sweeping) --------------------
+  local -a hosts=("127.0.0.1")
+  local gw; gw=$(ip route 2>/dev/null | awk '/^default/{print $3; exit}')
+  [[ -z "$gw" ]] && gw=$(awk '$2=="00000000"{printf "%d.%d.%d.%d","0x"substr($3,7,2),"0x"substr($3,5,2),"0x"substr($3,3,2),"0x"substr($3,1,2); exit}' /proc/net/route 2>/dev/null)
+  [[ -n "$gw" && "$gw" != "127.0.0.1" ]] && hosts+=("$gw")
+
+  info "Probing hosts: ${hosts[*]} (localhost + node/default-gateway) plus injected service endpoints"
+
+  # Standard data-service ports to try on localhost + gateway.
+  # svc:port pairs
+  local -a svcports=("redis:6379" "redis:6380" "memcached:11211" "etcd:2379" "docker:2375" "docker:2376" "elasticsearch:9200" "mongo:27017")
+
+  local h sp svc port verdict
+  for h in "${hosts[@]}"; do
+    for sp in "${svcports[@]}"; do
+      svc="${sp%%:*}"; port="${sp##*:}"
+      _net_connect "$h" "$port" 1 || continue   # skip closed ports fast
+      verdict="$(_probe_${svc} "$h" "$port")"
+      [[ -n "$verdict" ]] && _net_finding "$svc" "$h" "$port" "$verdict"
+    done
+  done
+
+  # --- injected Kubernetes service endpoints (Pod is already wired to these) -
+  # Parse NAME_SERVICE_HOST / NAME_SERVICE_PORT pairs from the environment.
+  local var name shost sport
+  while IFS='=' read -r var val; do
+    [[ "$var" == *_SERVICE_HOST ]] || continue
+    name="${var%_SERVICE_HOST}"
+    shost="$val"
+    local portvar="${name}_SERVICE_PORT"
+    sport="${!portvar:-}"
+    [[ -z "$shost" || -z "$sport" ]] && continue
+    [[ "$name" == "KUBERNETES" ]] && continue   # API server handled by RBAC/anon checks elsewhere
+    _net_connect "$shost" "$sport" 1 || continue
+    # generic identify: try each protocol probe against the endpoint
+    for svc in redis memcached etcd docker elasticsearch; do
+      verdict="$(_probe_${svc} "$shost" "$sport")"
+      [[ -n "$verdict" ]] && { _net_finding "$svc" "$shost" "$sport" "$verdict"; break; }
+    done
+  done < <(env 2>/dev/null)
+
+  ok "Network service probe complete (connect-and-identify only; no services were modified)"
+}
+
 # =============================================================================
 # cve_check_engine.sh  —  Config-driven CVE check engine
 # Drop-in addition to container_escape_audit.sh
@@ -5403,6 +5593,12 @@ check_lsm_stack
 # nested-virt exposure.
 # ---------------------------------------------------------------------------
 check_kvm_x86_shadow_mmu_exposure
+
+# ---------------------------------------------------------------------------
+# Check 61: unauthenticated network-service detection — ONLY runs with --network
+# (opt-in active probing; connect-and-identify only, no exploitation).
+# ---------------------------------------------------------------------------
+check_network_unauth_services
 
 # ---------------------------------------------------------------------------
 # Config-driven CVE checks (reads cve_checks.conf)
