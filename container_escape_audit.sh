@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# container_escape_audit.sh  —  v4.8.1
+# container_escape_audit.sh  —  v4.8.2
 # Copyright (c) 2026 Liam Romanis
 #
 # Licence: Creative Commons Attribution-NonCommercial 4.0 International
@@ -70,7 +70,7 @@ QUIET=false
 NO_REPORT=false
 DUMP_STATE=false
 CHECK_UPDATES=false
-SCRIPT_VERSION="4.8.1"
+SCRIPT_VERSION="4.8.2"
 REPORT_NAME_BASE="container_escape_report"   # default base name; overridable via --report-name
 REPORT_FILE=""                                 # left empty until after arg parsing unless --report is given explicitly
 REPORT_FILE_EXPLICIT=false                     # true only if --report set the filename verbatim
@@ -1683,39 +1683,80 @@ check_k8s_rbac_escalation() {
   [[ -n "$token" ]] || return
   command -v curl &>/dev/null || { info "curl not available — RBAC API check skipped"; return; }
 
+  # --- API reachability pre-flight (bounds total time if the API is unreachable) ---
+  local preflight
+  preflight=$(curl -s --max-time 4 --cacert "$ca_cert" -H "Authorization: Bearer $token" \
+    "$api_server/version" 2>/dev/null || echo "")
+  if [[ -z "$preflight" ]]; then
+    info "Kubernetes API server not reachable from this pod — RBAC escalation probes skipped"
+    return
+  fi
+
+  local ns; ns=$(cat "$sa_dir/namespace" 2>/dev/null || echo "default")
+
+  # Each probe is a read-only SelfSubjectAccessReview ("am I allowed to…"): it asks
+  # the API server to evaluate RBAC and performs NO action. resourceAttributes:
+  # group / verb / resource / subresource / namespace.
   local -A checks
-  checks["create_pods"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"namespace":"kube-system","verb":"create","resource":"pods"}}}'
+  # -- node-escape / workload creation (privileged hostPath pod -> root on node) --
+  checks["create_pods_kubesystem"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"namespace":"kube-system","verb":"create","resource":"pods"}}}'
+  checks["create_pods_ownns"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"namespace":"'"$ns"'","verb":"create","resource":"pods"}}}'
+  checks["create_daemonsets"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"group":"apps","namespace":"kube-system","verb":"create","resource":"daemonsets"}}}'
+  checks["create_deployments"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"group":"apps","verb":"create","resource":"deployments"}}}'
+  checks["patch_deployments"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"group":"apps","verb":"patch","resource":"deployments"}}}'
+  checks["create_statefulsets"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"group":"apps","verb":"create","resource":"statefulsets"}}}'
+  checks["create_replicasets"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"group":"apps","verb":"create","resource":"replicasets"}}}'
+  checks["create_jobs"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"group":"batch","verb":"create","resource":"jobs"}}}'
+  checks["create_cronjobs"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"group":"batch","verb":"create","resource":"cronjobs"}}}'
+  checks["create_replicationcontrollers"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"create","resource":"replicationcontrollers"}}}'
+  # -- RBAC self-grant / privilege escalation --
+  checks["bind_clusterrolebindings"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"group":"rbac.authorization.k8s.io","verb":"bind","resource":"clusterrolebindings"}}}'
+  checks["create_clusterrolebindings"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"group":"rbac.authorization.k8s.io","verb":"create","resource":"clusterrolebindings"}}}'
+  checks["create_rolebindings"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"group":"rbac.authorization.k8s.io","verb":"create","resource":"rolebindings"}}}'
+  checks["escalate_clusterroles"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"group":"rbac.authorization.k8s.io","verb":"escalate","resource":"clusterroles"}}}'
+  checks["escalate_roles"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"group":"rbac.authorization.k8s.io","verb":"escalate","resource":"roles"}}}'
+  # -- identity assumption --
+  checks["impersonate_users"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"impersonate","resource":"users"}}}'
+  checks["impersonate_groups"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"impersonate","resource":"groups"}}}'
+  checks["impersonate_serviceaccounts"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"impersonate","resource":"serviceaccounts"}}}'
+  # -- secret / credential harvesting --
   checks["get_secrets"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"get","resource":"secrets"}}}'
   checks["list_secrets_all"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"list","resource":"secrets"}}}'
-  checks["exec_pods"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"create","resource":"pods/exec"}}}'
-  checks["bind_clusterrole"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"bind","resource":"clusterrolebindings"}}}'
-  checks["create_daemonsets"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"namespace":"kube-system","verb":"create","resource":"daemonsets"}}}'
-  checks["impersonate_users"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"impersonate","resource":"users"}}}'
-  checks["attach_pods"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"create","resource":"pods/attach"}}}'
+  checks["get_configmaps"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"get","resource":"configmaps"}}}'
+  # -- lateral movement into other workloads / node API --
+  checks["exec_pods"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"create","resource":"pods","subresource":"exec"}}}'
+  checks["attach_pods"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"create","resource":"pods","subresource":"attach"}}}'
+  checks["portforward_pods"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"create","resource":"pods","subresource":"portforward"}}}'
+  checks["get_pods_log"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"get","resource":"pods","subresource":"log"}}}'
+  checks["nodes_proxy"]='{"kind":"SelfSubjectAccessReview","apiVersion":"authorization.k8s.io/v1","spec":{"resourceAttributes":{"verb":"get","resource":"nodes","subresource":"proxy"}}}'
 
   local escalation_paths=()
+  local check_name
   for check_name in "${!checks[@]}"; do
     local result
-    result=$(curl -s --max-time 5 --cacert "$ca_cert" \
+    result=$(curl -s --max-time 4 --cacert "$ca_cert" \
       -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
       -X POST -d "${checks[$check_name]}" \
       "$api_server/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" 2>/dev/null || echo "")
-    echo "$result" | grep -q '"allowed":true' && {
-      escalation_paths+=("$check_name"); warn "RBAC escalation path: $check_name is ALLOWED"
+    echo "$result" | grep -qE '"allowed":[[:space:]]*true' && {
+      escalation_paths+=("$check_name"); warn "RBAC escalation path ALLOWED: $check_name"
     }
   done
 
   if [[ ${#escalation_paths[@]} -gt 0 ]]; then
     local paths_str="${escalation_paths[*]}"
+    # CRITICAL if any path grants node-escape, cluster-admin self-grant, identity
+    # assumption, secret harvesting, or the kubelet API; else HIGH (lateral/info only).
     local severity="HIGH"
-    echo "$paths_str" | grep -q "create_pods\|list_secrets_all\|bind_clusterrole\|create_daemonsets\|impersonate_users" && severity="CRITICAL"
+    echo " $paths_str " | grep -qE ' (create_pods_kubesystem|create_pods_ownns|create_daemonsets|create_deployments|patch_deployments|create_statefulsets|create_replicasets|create_jobs|create_cronjobs|create_replicationcontrollers|bind_clusterrolebindings|create_clusterrolebindings|escalate_clusterroles|escalate_roles|impersonate_users|impersonate_groups|impersonate_serviceaccounts|get_secrets|list_secrets_all|nodes_proxy) ' && severity="CRITICAL"
     crit "Kubernetes RBAC escalation paths identified: ${paths_str}"
     add_finding "k8s_rbac_escalation" "$severity" \
       "Kubernetes RBAC escalation paths available: ${paths_str}" \
-      "Active RBAC checks against $api_server confirm this service account has: ${paths_str}." \
-      "create_pods in kube-system: can deploy a privileged pod to escape any namespace boundary. list_secrets (cluster-wide): can enumerate all secrets. exec_pods: can execute commands in other pods. bind_clusterrole: can grant cluster-admin to any service account. create_daemonsets: can run on every node. impersonate_users: can assume the identity of any user, group, or service account (including cluster-admin) on every request — a direct, often-overlooked path to full cluster control. attach_pods: can attach to running pods' process streams, equivalent to exec for stealing data or running commands in other workloads." \
-      "Low-moderate complexity. Requires only kubectl or curl with the service account token. Tools such as peirates and rbac-police automate Kubernetes privilege escalation." \
-      "Conduct a full RBAC audit. Remove all permissions not strictly required. Implement OPA/Gatekeeper or Kyverno admission controllers to enforce least-privilege service account policies."
+      "Active read-only SelfSubjectAccessReview probes against $api_server confirm this pod's service account is ALLOWED: ${paths_str}. (Each probe asks the API 'am I allowed to…' and performs no action.)" \
+      "Workload creation (create_pods_*, create_deployments/statefulsets/replicasets/daemonsets/jobs/cronjobs/replicationcontrollers, patch_deployments) lets an attacker schedule a privileged hostPath pod and gain root on a node — on EVERY node for daemonsets — BUT this is gated on admission control: if Pod Security Admission is enforced at 'restricted' (or Kyverno/Gatekeeper blocks privileged/hostPath/hostPID), the privileged-pod step is prevented and the impact drops toward the workload's own SA rather than node root. RBAC self-grant (bind_/create_clusterrolebindings, create_rolebindings, escalate_roles/clusterroles) lets the SA grant itself cluster-admin — 'escalate' is the specific guardrail verb that bypasses the usual 'cannot grant more than you hold' restriction. Identity assumption (impersonate_users/groups/serviceaccounts) lets the SA act as any identity on every request — impersonating the system:masters GROUP is an instant, often-overlooked cluster-admin. Secret/credential harvesting (get_/list_secrets, get_configmaps) exposes other SAs' tokens, registry creds and TLS keys, frequently chaining to admin. Lateral movement (exec_pods/attach_pods/portforward_pods/get_pods_log) reaches other workloads' processes and data; nodes_proxy reaches the kubelet API on every node — another node-compromise route." \
+      "Low-moderate complexity — only kubectl or curl with the mounted token is required. Tools such as peirates, rbac-police and kubectl-who-can automate these paths. Node-escape via workload creation additionally requires admission control to be absent or permissive." \
+      "Conduct a full RBAC audit and remove every permission not strictly required — especially escalate, bind/create on *rolebindings, impersonate (all of users/groups/serviceaccounts), cluster-wide secret get/list, and workload create in shared namespaces. Enforce Pod Security Admission at 'restricted' and/or Kyverno/Gatekeeper to block privileged/hostPath/hostPID pods so that 'create pods' is not equivalent to node-root. Set automountServiceAccountToken: false on pods that do not call the API." \
+      "SelfSubjectAccessReview probes allowed: ${paths_str}"
   else
     ok "No high-value RBAC escalation paths identified via API check"
   fi
