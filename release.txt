@@ -34,4 +34,17 @@ Validation
   - Plain sandbox (no agent) → "No kernel live-patching agent detected";
     CVE engine runs once; no regression in finding count.
 
-Read-only throughout. CVE database unchanged at 53 entries.
+New CVEs (53 -> 55 entries)
+  - CVE-2026-43501 "Route of Root" — IPv6 RPL segment-routing-header
+    corruption (net/ipv6/exthdrs.c); LPE + container escape via core_pattern.
+    Successor to Route of Death (CVE-2023-2156). Vulnerable 5.7 -> 7.1-rc1,
+    fixed 7.1 (commit 9e6bf146b559). Public Google kernelCTF exploit. HIGH
+    (no official CVSS yet).
+  - CVE-2025-39964 AF_ALG concurrent-write race — container escape to host
+    root demonstrated in kernelCTF; distinct from Copy Fail (CVE-2026-31431)
+    despite the shared AF_ALG subsystem. Present since 2.6.38; fixed commit
+    1b34cbbf4f01. CVSS disputed (Red Hat 7.3 / cve.org 7.8 / NVD 5.5);
+    encoded at 7.3. No upstream_ranges (vanilla fix version unconfirmed), so
+    unconfirmed kernels route to defer/unknown, never a silent not-affected.
+
+Read-only throughout. CVE database 53 -> 55 entries.
