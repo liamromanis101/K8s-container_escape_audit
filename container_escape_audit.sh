@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# container_escape_audit.sh  —  v4.8.2
+# container_escape_audit.sh  —  v4.8.4
 # Copyright (c) 2026 Liam Romanis
 #
 # Licence: Creative Commons Attribution-NonCommercial 4.0 International
@@ -70,7 +70,7 @@ QUIET=false
 NO_REPORT=false
 DUMP_STATE=false
 CHECK_UPDATES=false
-SCRIPT_VERSION="4.8.2"
+SCRIPT_VERSION="4.8.4"
 REPORT_NAME_BASE="container_escape_report"   # default base name; overridable via --report-name
 REPORT_FILE=""                                 # left empty until after arg parsing unless --report is given explicitly
 REPORT_FILE_EXPLICIT=false                     # true only if --report set the filename verbatim
@@ -294,6 +294,7 @@ CVE_EVIDENCE=()
 EUS=$'\x1e'   # unit separator between outcome/label/detail within one entry
 EROW=$'\x1d'  # row separator between evidence entries when packed into a field
 KVER_VERDICT=""   # set by _kernel_in_affected_range: fixed|not-affected|vulnerable|defer|unknown
+LIVE_PATCH_SUFFIX=""   # set by check_live_patching: appended to version-based CVE verdicts when a live-patch agent is present
 
 _ev_reset() { CVE_EVIDENCE=(); }
 
@@ -4293,6 +4294,19 @@ detect_running_system() {
     else
       RUN_DISTRO_ID="$(_normalize_distro_id "$RUN_DISTRO_ID")"
     fi
+    # Family alias from ID_LIKE, so derivatives match family-level vendor_defer
+    # rows: RHEL rebuilds (CloudLinux, AlmaLinux, Rocky, Oracle, CentOS Stream)
+    # -> rhel; Ubuntu/Debian derivatives -> debian; SUSE derivatives -> suse. A
+    # direct ID match still wins; this is only a fallback. (CloudLinux also needs
+    # the live-patch check, since KernelCare patches CVEs without a version bump.)
+    if [[ -z "$RUN_DISTRO_ID_ALIAS" ]]; then
+      local _idlike; _idlike="$(awk -F= '/^ID_LIKE=/{gsub(/"/,"",$2); print $2; exit}' /etc/os-release 2>/dev/null)"
+      case " ${RUN_DISTRO_ID} ${_idlike} " in
+        *" rhel "*|*" centos "*|*" fedora "*) [[ "$RUN_DISTRO_ID" != "rhel" && "$RUN_DISTRO_ID" != "fedora" ]] && RUN_DISTRO_ID_ALIAS="rhel" ;;
+        *" debian "*|*" ubuntu "*) [[ "$RUN_DISTRO_ID" != "debian" && "$RUN_DISTRO_ID" != "ubuntu" ]] && RUN_DISTRO_ID_ALIAS="debian" ;;
+        *" suse "*|*" sles "*|*" opensuse "*) [[ "$RUN_DISTRO_ID" != "suse" ]] && RUN_DISTRO_ID_ALIAS="suse" ;;
+      esac
+    fi
     RUN_DISTRO_REL="$(awk -F= '/^VERSION_ID=/{gsub(/"/,"",$2); print $2; exit}' /etc/os-release 2>/dev/null)"
     if [[ "$RUN_DISTRO_ID" == "debian" ]]; then
       local cn; cn="$(awk -F= '/^VERSION_CODENAME=/{gsub(/"/,"",$2); print $2; exit}' /etc/os-release 2>/dev/null)"
@@ -4389,14 +4403,12 @@ cve_kernel_verdict() {
     done
   fi
 
-  if [[ -n "$vd" ]]; then
-    local tok
-    for tok in $vd; do
-      local IFS='|'; local -a f=($tok); unset IFS
-      local d="${f[0]}" adv="${f[1]:-vendor advisory}"
-      [[ "$d" == "$RUN_DISTRO_ID" || ( -n "$RUN_DISTRO_ID_ALIAS" && "$d" == "$RUN_DISTRO_ID_ALIAS" ) ]] && { echo "defer|${d}: consult ${adv} — backport status not derivable from version string"; return; }
-    done
-  fi
+  # NOTE: vendor_defer is evaluated LATER (in the heuristic fallback below),
+  # AFTER the vanilla version checks and the cross-series "definitely past the
+  # fix" promotion. This ordering ensures a DEFINITIVE not-affected verdict
+  # (running a newer full mainline series, which is cumulative) wins over
+  # "defer to vendor" — deferring a kernel we can already prove is patched would
+  # turn a clean pass into needless "verify" noise.
 
   if [[ "$RUN_KFLAVOUR" == "vanilla" && -n "$ur" ]]; then
     # NVD per-series ranges are the most authoritative upstream signal; use
@@ -4511,6 +4523,17 @@ cve_kernel_verdict() {
   if [[ -n "$promote_verdict" ]]; then
     echo "${promote_verdict}|${RUN_DISTRO_ID}/${RUN_DISTRO_REL} flavour=${RUN_KFLAVOUR} (running ${RUN_KVER_RAW}) has no distro-specific tracking data, but ${promote_evidence} — treated as ${promote_verdict} on that basis rather than left unknown. If this distro backports fixes highly unusually (e.g. deliberately reverting an upstream commit), that would be exceptional and should be independently verified; this is not blanket confirmation of every CVE at once, only this one."
   else
+    # Could not definitively clear from the version string. If a vendor-tracker
+    # row matches the running distro, defer to it (actionable — names the exact
+    # advisory to check); otherwise fall through to unknown.
+    if [[ -n "$vd" ]]; then
+      local tok
+      for tok in $vd; do
+        local IFS='|'; local -a f=($tok); unset IFS
+        local d="${f[0]}" adv="${f[1]:-vendor advisory}"
+        [[ "$d" == "$RUN_DISTRO_ID" || ( -n "$RUN_DISTRO_ID_ALIAS" && "$d" == "$RUN_DISTRO_ID_ALIAS" ) ]] && { echo "defer|${d}: consult ${adv} — backport status not derivable from version string"; return; }
+      done
+    fi
     echo "unknown|no matching fixed-version data for ${RUN_DISTRO_ID}/${RUN_DISTRO_REL} flavour=${RUN_KFLAVOUR} (running ${RUN_KVER_RAW}); cannot assert patched — verify against vendor tracker.${heuristic} Distributions routinely backport fixes without changing the upstream version string, so this heuristic can be wrong in either direction — it is supporting context only, never a substitute for the vendor advisory."
   fi
 }
@@ -4997,7 +5020,7 @@ _run_single_cve_check() {
         # defer/unknown so we don't overstate confidence either way.
         case "$KVER_VERDICT" in
           defer)
-            warn "${cve} (${name}): running on a vendor-tracked distro — version string cannot confirm patch status; consult the vendor advisory"
+            warn "${cve} (${name}): running on a vendor-tracked distro — version string cannot confirm patch status; consult the vendor advisory${LIVE_PATCH_SUFFIX}"
             _ev_print_stdout
             add_finding "cve_${_cve_id_slug}" "MEDIUM" \
               "${name} (${cve}) — patch status must be confirmed via vendor advisory" \
@@ -5007,7 +5030,7 @@ _run_single_cve_check() {
               "$(_ev_pack)"
             ;;
           unknown)
-            warn "${cve} (${name}): no fixed-version data matched this system — patch status UNKNOWN (not assumed safe)"
+            warn "${cve} (${name}): no fixed-version data matched this system — patch status UNKNOWN (not assumed safe)${LIVE_PATCH_SUFFIX}"
             _ev_print_stdout
             add_finding "cve_${_cve_id_slug}" "MEDIUM" \
               "${name} (${cve}) — patch status unknown for this system" \
@@ -5023,7 +5046,7 @@ _run_single_cve_check() {
               VERIFY|verify) _fx_tag=" [fixed version UNCONFIRMED — flagged conservatively]" ;;
               none)          [[ -z "${CVE_FIELD[distro_status]:-}${CVE_FIELD[upstream_fixed]:-}" ]] && _fx_tag=" [no fixed version recorded]" ;;
             esac
-            warn "${cve} (${name}): kernel ${kver} appears in the affected version range${_fx_tag}"
+            warn "${cve} (${name}): kernel ${kver} appears in the affected version range${_fx_tag}${LIVE_PATCH_SUFFIX}"
             _ev_print_stdout
             _emit_cve_finding "kernel ${kver} in affected range (verdict: ${KVER_VERDICT:-affected}; introduced: ${CVE_FIELD[introduced]:-unknown})"
             ;;
@@ -5107,7 +5130,14 @@ _run_single_cve_check() {
       local overall_sev="INFO"
 
       # 1 — kernel version
-      _kernel_in_affected_range && kver_affected=true
+      # Only a CONFIRMED in-range verdict (vulnerable) sets kver_affected=true
+      # (the full-severity "affected" path). defer/unknown are inconclusive for a
+      # distro kernel whose backports can't be derived from the version string;
+      # leave kver_affected=false so they route to the MEDIUM "verify against
+      # vendor" branch below — matching the kernel_version path — rather than
+      # being over-reported as confirmed-affected at the CVE's full severity.
+      _kernel_in_affected_range
+      [[ "$KVER_VERDICT" == "vulnerable" ]] && kver_affected=true
 
       # 2 — module check
       # NB: call the helpers directly (not via $(...)) so the evidence they
@@ -5207,6 +5237,7 @@ _run_single_cve_check() {
         defer)      kver_clause="kernel ${kver} version could not be cleared (deferred to vendor advisory) — treated conservatively as affected" ;;
         *)          kver_clause="kernel ${kver} version unknown for this distro/release — no matching distro_status/vendor_defer row; treated conservatively as affected, NOT a confirmed range hit" ;;
       esac
+      kver_clause="${kver_clause}${LIVE_PATCH_SUFFIX}"
 
       if [[ "$kver_affected" == true ]]; then
         local _cfx="${CVE_FIELD[fixed_versions]:-none}"
@@ -5646,6 +5677,45 @@ check_network_unauth_services
 # ---------------------------------------------------------------------------
 # CVE_CONF was already resolved earlier (CLI flag > environment variable >
 # script directory), right after argument parsing — see there.
+# ---------------------------------------------------------------------------
+# Check 62: kernel live-patching status (read-only). Live-patch agents apply CVE
+# fixes to the RUNNING kernel in memory WITHOUT changing uname -r, so version-
+# based CVE detection cannot see them. Runs BEFORE run_cve_checks so the caveat
+# (LIVE_PATCH_SUFFIX) is appended to version-based verdicts.
+# ---------------------------------------------------------------------------
+check_live_patching() {
+  hdr "62. Kernel live-patching status"
+  local agents=() effective=""
+  if [[ -d /sys/kernel/livepatch ]]; then
+    local lp; lp=$(ls -1 /sys/kernel/livepatch/ 2>/dev/null | tr "\n" "," | sed "s/,$//")
+    [[ -n "$lp" ]] && agents+=("kernel livepatch framework (loaded: ${lp})")
+  fi
+  if command -v kcarectl >/dev/null 2>&1; then
+    agents+=("KernelCare")
+    effective="$(kcarectl --uname 2>/dev/null | head -1)"
+  fi
+  command -v canonical-livepatch >/dev/null 2>&1 && agents+=("Canonical Livepatch (Ubuntu Pro)")
+  command -v kpatch >/dev/null 2>&1 && agents+=("kpatch")
+  { command -v uptrack-uname >/dev/null 2>&1 || command -v uptrack-show >/dev/null 2>&1; } && agents+=("Oracle Ksplice")
+  if (( ${#agents[@]} > 0 )); then
+    set_state LIVE_PATCHED true
+    set_state LIVE_PATCH_TOOL "${agents[0]}"
+    [[ -n "$effective" ]] && set_state LIVE_PATCH_EFFECTIVE_UNAME "$effective"
+    LIVE_PATCH_SUFFIX=" | NOTE: live-patching active (${agents[0]}) — version-based verdict; a live patch may already fix this without a version change — confirm via the live-patch tool, not uname."
+    warn "Kernel live-patching present: ${agents[*]} — version-based CVE verdicts below may be STALE (a live patch can fix a CVE without changing uname -r)$( [[ -n "$effective" ]] && echo "; effective level: ${effective}" )"
+    add_finding "kernel_live_patching" "INFO" \
+      "Kernel live-patching active: ${agents[*]}" \
+      "A kernel live-patching mechanism was detected (${agents[*]})$( [[ -n "$effective" ]] && echo "; effective patched-kernel level: ${effective}" ). Live patches apply CVE fixes to the running kernel in memory WITHOUT changing uname -r." \
+      "Version-based CVE detection cannot see live-applied fixes: a CVE flagged vulnerable/verify from the kernel version may already be closed by a live patch, and an agent being present does not by itself guarantee any specific CVE is covered. On a live-patched host the version string is NOT authoritative. Especially relevant on CloudLinux (KernelCare is the norm) and Ubuntu Pro nodes." \
+      "Informational — changes how to read every version-based CVE finding in this report." \
+      "Confirm each flagged CVE against the live-patch tool, not the kernel version: KernelCare kcarectl --patch-info / --uname; Canonical Livepatch canonical-livepatch status; kpatch kpatch list; Ksplice uptrack-show. Treat the agent coverage list as the source of truth."
+  else
+    ok "No kernel live-patching agent detected — version-based CVE verdicts reflect the booted kernel"
+  fi
+}
+
+check_live_patching
+
 run_cve_checks "$CVE_CONF"
 
 # ---------------------------------------------------------------------------

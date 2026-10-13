@@ -1,1 +1,37 @@
-4.8.2
+container_escape_audit.sh — v4.8.4
+
+Kubernetes node-OS coverage + kernel live-patching awareness
+-------------------------------------------------------------
+
+This release makes the distro-aware CVE verdict logic correct on the Linux
+distributions commonly used as Kubernetes nodes, and teaches the tool that a
+kernel's version string is not the whole story when a live-patching agent is
+running.
+
+New — check 62 `check_live_patching` (kernel live-patching status)
+  Detects KernelCare/kcarectl, Canonical Livepatch, kpatch, Ksplice/uptrack,
+  and native /sys/kernel/livepatch. These patch CVEs WITHOUT changing
+  `uname -r`, so a version-based verdict can be stale. When an agent is
+  present the check records the effective patch level (e.g. `kcarectl
+  --uname`) and appends a note to every version-based CVE verdict:
+  "live-patching active — confirm via the live-patch tool, not uname."
+  Strictly read-only (queries agent status only).
+
+Improved — ID_LIKE family aliasing (CloudLinux, Rocky, Alma, Oracle, …)
+  detect_running_system() now derives a vendor alias from ID_LIKE when a
+  distro has no explicit alias: RHEL-family IDs (cloudlinux, rocky, alma,
+  oracle, …) alias to `rhel`; Debian-family to `debian`; SUSE-family to
+  `suse`. This means a node OS the CVE database has no direct row for still
+  matches the correct `vendor_defer` tracker and returns a `defer` verdict
+  ("consult the vendor advisory") rather than an unhelpful "unknown".
+
+Validation
+  - CloudLinux 8 (ID_LIKE=rhel) on 4.18.0-553.el8 → recent container-escape
+    CVEs (incl. actively-exploited CVE-2026-80521) correctly DEFER to the
+    vendor advisory instead of reporting "unknown".
+  - KernelCare simulated in PATH → check 62 reports the agent and effective
+    level; stale-verdict note appended to version-based CVE findings.
+  - Plain sandbox (no agent) → "No kernel live-patching agent detected";
+    CVE engine runs once; no regression in finding count.
+
+Read-only throughout. CVE database unchanged at 53 entries.
