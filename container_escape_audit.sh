@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# container_escape_audit.sh  —  v4.8.4
+# container_escape_audit.sh  —  v4.8.5
 # Copyright (c) 2026 Liam Romanis
 #
 # Licence: Creative Commons Attribution-NonCommercial 4.0 International
@@ -70,7 +70,7 @@ QUIET=false
 NO_REPORT=false
 DUMP_STATE=false
 CHECK_UPDATES=false
-SCRIPT_VERSION="4.8.4"
+SCRIPT_VERSION="4.8.5"
 REPORT_NAME_BASE="container_escape_report"   # default base name; overridable via --report-name
 REPORT_FILE=""                                 # left empty until after arg parsing unless --report is given explicitly
 REPORT_FILE_EXPLICIT=false                     # true only if --report set the filename verbatim
@@ -5715,6 +5715,272 @@ check_live_patching() {
 }
 
 check_live_patching
+
+
+# ---------------------------------------------------------------------------
+# Check 63 — OpenSSH *sshole password-authentication bypass (CVE-2026-123158)
+# ---------------------------------------------------------------------------
+# Ported (read-only, detection-only) from the author's MaSSHole checker
+# (github.com/liamromanis101/MaSSHole, MIT) --local mode. On musl libc,
+# OpenSSH's own password check (used when sshd runs WITHOUT PAM) accepts an
+# oversized password (257-1024 bytes) for accounts whose /etc/shadow field is
+# "*" (no password). Highly relevant to Kubernetes: a large share of container
+# images are Alpine/musl, and a node or sidecar running openssh-server (not
+# PAM, PasswordAuthentication on) with a "*" account is remotely authable.
+# Fixed in OpenSSH 10.6p2 and Alpine package backports. Exploited in the wild.
+# This check NEVER sends a password and NEVER attempts the bypass.
+sshole_ver_num() {   # "10.3p1" -> 100301 ; "9.9p2" -> 90902
+  echo "$1" | awk -F'[.p]' '{ printf "%d\n", $1*10000 + $2*100 + ($3==""?0:$3) }'
+}
+sshole_ver_status() {   # VERSION -> patched | unpatched | ambiguous
+  local n; n=$(sshole_ver_num "$1")
+  case "$1" in
+    *p*) if [[ "$n" -ge "$(sshole_ver_num 10.6p2)" ]]; then echo patched; else echo unpatched; fi ;;
+    *)   if   [[ "$n" -ge 100700 ]]; then echo patched
+         elif [[ "$n" -ge 100600 ]]; then echo ambiguous
+         else echo unpatched; fi ;;
+  esac
+}
+sshole_alpine_fixed() {   # branch -> fixed openssh apk version
+  case "$1" in
+    edge) echo "10.6_p2-r0" ;; 3.24) echo "10.3_p1-r2" ;; 3.23) echo "10.2_p1-r1" ;;
+    3.22) echo "10.0_p1-r11" ;; 3.21) echo "9.9_p2-r1" ;; 3.20) echo "9.7_p1-r6" ;;
+    *) echo "" ;;
+  esac
+}
+sshole_apk_ver() {   # installed apk package version from the apk db
+  local db=/lib/apk/db/installed
+  [[ -r "$db" ]] || return 1
+  awk -v p="$1" '/^P:/{name=substr($0,3)} /^V:/{if(name==p){print substr($0,3);exit}} /^$/{name=""}' "$db"
+}
+
+check_sshole() {
+  hdr "63. OpenSSH *sshole password-auth bypass (CVE-2026-123158)"
+  local PROBE_ADDR="192.0.2.1" PROBE_HOST="k8s-audit.invalid" FIXED_UPSTREAM="10.6p2"
+  local IS_ROOT=no; [[ "$(id -u)" == 0 ]] && IS_ROOT=yes
+  [[ "$IS_ROOT" == yes ]] || warn "Not root: /etc/shadow and 'sshd -T' checks will be incomplete (run as root for a full verdict)."
+
+  # --- 1. sshd present -----------------------------------------------------
+  local SSHD="" SSHD_VER="" pid exe
+  for pid in $(pidof sshd sshd.pam 2>/dev/null); do
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null); exe=${exe% (deleted)}
+    [[ -n "$exe" && -x "$exe" ]] && { SSHD=$exe; break; }
+  done
+  [[ -z "$SSHD" ]] && SSHD=$(command -v sshd 2>/dev/null)
+  local c
+  for c in /usr/sbin/sshd /usr/sbin/sshd.pam /usr/local/sbin/sshd /sbin/sshd; do
+    [[ -z "$SSHD" && -x "$c" ]] && SSHD=$c
+  done
+  if [[ -z "$SSHD" ]]; then
+    if [[ -x /usr/sbin/dropbear ]] || command -v dropbear >/dev/null 2>&1; then
+      info "Dropbear is present (not affected); no OpenSSH sshd found."
+    fi
+    ok "NOT AFFECTED — no OpenSSH sshd installed here."
+    set_state SSHOLE_STATUS not-affected-no-sshd
+    return 0
+  fi
+  SSHD_VER=$("$SSHD" -V 2>&1 | sed -n 's/.*OpenSSH_\([0-9][0-9]*\.[0-9][0-9]*\(p[0-9][0-9]*\)\{0,1\}\).*/\1/p' | head -n1)
+  [[ -z "$SSHD_VER" ]] && SSHD_VER=$(ssh -V 2>&1 | sed -n 's/.*OpenSSH_\([0-9][0-9]*\.[0-9][0-9]*\(p[0-9][0-9]*\)\{0,1\}\).*/\1/p' | head -n1)
+  info "sshd binary: $SSHD"
+  info "OpenSSH version: ${SSHD_VER:-unknown}"
+
+  # --- 2. C library --------------------------------------------------------
+  local MUSL=unknown
+  if ldd "$SSHD" 2>&1 | grep -qi musl || ls /lib/ld-musl-*.so.1 >/dev/null 2>&1; then
+    MUSL=yes; warn "sshd is linked against musl libc (precondition met)."
+  elif ldd --version 2>&1 | grep -qiE 'glibc|gnu libc|gnu c library'; then
+    MUSL=no
+    ok "NOT AFFECTED — glibc system (the bug is musl-only)."
+    set_state SSHOLE_STATUS not-affected-glibc
+    return 0
+  else
+    warn "Could not determine C library; continuing as if musl."
+  fi
+  set_state SSHOLE_MUSL "$MUSL"
+
+  # --- 3. patch level ------------------------------------------------------
+  local PATCHED=unknown ALPINE_BRANCH="" PKGVER="" PKG="" FIXED=""
+  if [[ -r /etc/alpine-release ]]; then
+    local rel; rel=$(cat /etc/alpine-release)
+    case "$rel" in
+      *_alpha*|*_beta*) ALPINE_BRANCH=edge ;;
+      *) ALPINE_BRANCH=$(echo "$rel" | cut -d. -f1,2) ;;
+    esac
+    grep -qs '/edge/' /etc/apk/repositories && ALPINE_BRANCH=edge
+    info "Alpine release $rel (branch: $ALPINE_BRANCH)"
+    local p v
+    for p in openssh-server openssh-server-pam; do
+      v=$(sshole_apk_ver "$p"); [[ -n "$v" ]] && { PKG=$p; PKGVER=$v; info "Installed: $p-$v"; }
+    done
+    [[ -z "$PKGVER" ]] && warn "sshd is not from an Alpine package (custom build?)."
+    FIXED=$(sshole_alpine_fixed "$ALPINE_BRANCH")
+    if [[ -n "$PKGVER" && -n "$FIXED" ]] && command -v apk >/dev/null 2>&1; then
+      local cmp; cmp=$(apk version -t "$PKGVER" "$FIXED" 2>/dev/null)
+      if [[ "$cmp" == "<" ]]; then PATCHED=no; warn "$PKG $PKGVER is older than fixed $FIXED."
+      else PATCHED=yes; ok "$PKG $PKGVER >= fixed $FIXED."; fi
+    elif [[ -n "$PKGVER" ]]; then
+      warn "No fixed-version entry for branch '$ALPINE_BRANCH' (3.16-3.19 were also patched — check the Alpine secdb)."
+    fi
+  fi
+  if [[ "$PATCHED" == unknown && -n "$SSHD_VER" ]]; then
+    local vs; vs=$(sshole_ver_status "$SSHD_VER")
+    if [[ "$vs" == patched ]]; then PATCHED=yes; ok "OpenSSH $SSHD_VER >= $FIXED_UPSTREAM."
+    elif [[ "$vs" == ambiguous ]]; then
+      warn "OpenSSH $SSHD_VER: banner lacks the p1/p2 suffix; cannot tell 10.6p1 (vulnerable) from 10.6p2 (fixed)."
+    elif [[ -z "$ALPINE_BRANCH" || -z "${PKGVER:-}" ]]; then
+      PATCHED=no; warn "OpenSSH $SSHD_VER < $FIXED_UPSTREAM (not from a distro package; no backport assumed)."
+    fi
+  fi
+  set_state SSHOLE_PATCHED "$PATCHED"
+  # running daemon started before an upgrade?
+  local STALE=no
+  for pid in $(pidof sshd sshd.pam 2>/dev/null); do
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null); case "$exe" in *"(deleted)"*) STALE=yes ;; esac
+  done
+  [[ "$STALE" == yes ]] && warn "A running sshd uses a deleted/replaced binary: restart sshd to load the fix."
+
+  # --- 4. PAM and effective configuration ----------------------------------
+  local CFG PA PRL UP PAM_SAFE
+  CFG=$("$SSHD" -T 2>/dev/null)
+  if [[ -z "$CFG" ]]; then
+    warn "'sshd -T' failed (need root / readable host keys); falling back to config grep."
+    PA=$(cat /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk 'tolower($1)=="passwordauthentication"{print tolower($2);exit}'); PA=${PA:-yes}
+    PRL=$(cat /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk 'tolower($1)=="permitrootlogin"{print tolower($2);exit}'); PRL=${PRL:-prohibit-password}
+    UP=$(cat /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk 'tolower($1)=="usepam"{print tolower($2);exit}'); UP=${UP:-no}
+  else
+    PA=$(echo "$CFG"  | awk '$1=="passwordauthentication"{print $2}')
+    PRL=$(echo "$CFG" | awk '$1=="permitrootlogin"{print $2}')
+    UP=$(echo "$CFG"  | awk '$1=="usepam"{print $2}')
+    [[ -z "$UP" ]] && { UP=no; info "sshd built without PAM support."; }
+  fi
+  if [[ "$UP" == yes ]]; then ok "UsePAM yes: passwords checked via PAM — not affected."; PAM_SAFE=yes
+  else warn "UsePAM no / no PAM: sshd checks passwords itself via crypt() (precondition met)."; PAM_SAFE=no; fi
+  if [[ "$PA" == yes ]]; then warn "PasswordAuthentication yes (global) (precondition met)."
+  else ok "PasswordAuthentication $PA (global)."; fi
+  info "PermitRootLogin $PRL"
+  set_state SSHOLE_USEPAM "$UP"; set_state SSHOLE_PASSWORDAUTH "$PA"
+
+  # --- 5. accounts ---------------------------------------------------------
+  local SHORT="" HASHES=0 REACHABLE=""
+  if [[ -r /etc/shadow ]]; then
+    HASHES=$(awk -F: '$2 ~ /^\$[56]\$/ {n++} END {print n+0}' /etc/shadow)
+    if [[ "$HASHES" -gt 0 ]]; then warn "$HASHES account(s) have SHA-256/512 password hashes (a reported precondition)."
+    else ok "No SHA-256/512 password hashes present (reported precondition not met)."; fi
+    SHORT=$(awk -F: 'length($2) > 0 && length($2) < 4 {print $1 ":" $2}' /etc/shadow)
+    if [[ -z "$SHORT" ]]; then
+      ok "No accounts with a '*' (or other <4 char) password field."
+    else
+      local entry u f sh_ upa uprl reach tag ucfg
+      for entry in $SHORT; do
+        u=${entry%%:*}; f=${entry#*:}
+        sh_=$(awk -F: -v u="$u" '$1==u{print $7}' /etc/passwd)
+        upa=$PA; uprl=$PRL
+        if [[ -n "$CFG" ]]; then
+          ucfg=$("$SSHD" -T -C "user=$u,host=$PROBE_HOST,addr=$PROBE_ADDR" 2>/dev/null)
+          if [[ -n "$ucfg" ]]; then
+            upa=$(echo "$ucfg"  | awk '$1=="passwordauthentication"{print $2}')
+            uprl=$(echo "$ucfg" | awk '$1=="permitrootlogin"{print $2}')
+          fi
+        fi
+        reach=yes; [[ "$upa" == yes ]] || reach=no
+        [[ "$u" == root && "$uprl" != yes ]] && reach=no
+        case "$f" in "*") tag="'*'" ;; *) tag="'$f' (locked/short)" ;; esac
+        if [[ "$reach" == yes && "$f" == "*" ]]; then
+          crit "$u: shadow field $tag, shell=$sh_, password auth allowed -> EXPOSED"
+          REACHABLE="$REACHABLE $u"
+          case "$sh_" in */nologin|*/false) warn "  $u has a non-login shell, but auth still succeeds (e.g. port forwarding).";; esac
+        else
+          local extra=""; [[ "$u" == root ]] && extra=", permitrootlogin=$uprl"
+          info "$u: shadow field $tag, shell=$sh_, passwordauth=$upa$extra (not exposed)"
+        fi
+      done
+      info "Match blocks evaluated for an arbitrary remote address ($PROBE_ADDR); address-specific Match rules may differ for real clients."
+    fi
+  else
+    warn "/etc/shadow not readable; cannot check account conditions (run as root for a full verdict)."
+  fi
+  REACHABLE="${REACHABLE# }"
+  [[ -n "$REACHABLE" ]] && set_state SSHOLE_EXPOSED_ACCOUNTS "$REACHABLE"
+
+  # --- 6. indicators of compromise (logs) ----------------------------------
+  local IOC=no hits users pat f
+  if [[ -n "$SHORT" ]]; then
+    users=$(for e in $SHORT; do printf '%s|' "${e%%:*}"; done); users=${users%|}
+    pat="Accepted password for ($users) from"
+    hits=$(
+      for f in /var/log/messages* /var/log/auth.log* /var/log/secure* /var/log/sshd*; do
+        [[ -f "$f" ]] || continue
+        case "$f" in *.gz) zcat "$f" 2>/dev/null ;; *) cat "$f" 2>/dev/null ;; esac | grep -E "$pat" | sed "s|^|$f: |"
+      done
+      command -v logread >/dev/null 2>&1 && logread 2>/dev/null | grep -E "$pat" | sed 's|^|logread: |'
+      command -v journalctl >/dev/null 2>&1 && journalctl -q --no-pager 2>/dev/null | grep -E "$pat" | sed 's|^|journal: |'
+    )
+    if [[ -n "$hits" ]]; then
+      IOC=yes
+      crit "Password logins to accounts that have NO password were found (advisory: treat host as compromised):"
+      echo "$hits" | head -n 20 | sed 's/^/      /'
+    fi
+  fi
+
+  # --- verdict + finding ---------------------------------------------------
+  if [[ "$IOC" == yes ]]; then
+    set_state SSHOLE_STATUS compromised
+    add_finding "cve_2026_123158_sshole_ioc" "CRITICAL" \
+      "*sshole (CVE-2026-123158): indicators of compromise — password logins to password-less account(s)" \
+      "On musl OpenSSH without PAM, accounts whose /etc/shadow field is '*' accept an oversized (257-1024 byte) password. Log entries show 'Accepted password' for such account(s): ${REACHABLE:-see evidence}." \
+      "Confirmed remote authentication (and command execution as that account; root if the account is privileged) via the *sshole bypass. CVE-2026-123158, CVSS 8.1, exploited in the wild since disclosure (2026-11). A compromised container or node breaks all workload isolation on it." \
+      "Attacker connects to the exposed OpenSSH service and submits a 257-1024 byte password for a known '*' account; musl crypt returns '*', which matches the stored field, so auth succeeds without valid credentials. This check does not attempt it." \
+      "Treat this host/container as compromised: isolate, investigate, and rebuild from a trusted image. Then upgrade OpenSSH to the fixed version (apk upgrade openssh; OpenSSH >= 10.6p2) and restart sshd. Rotate any credentials/keys reachable from it." \
+      "Log hits:\n$(echo "$hits" | head -n 20)"
+    crit "VERDICT: INDICATORS OF COMPROMISE — patch, then investigate/rebuild."
+    return 0
+  fi
+  if [[ "$PAM_SAFE" == yes ]]; then ok "VERDICT: NOT AFFECTED (PAM in use)."; set_state SSHOLE_STATUS not-affected-pam; return 0; fi
+  if [[ "$PATCHED" == yes ]]; then
+    if [[ "$STALE" == yes ]]; then
+      warn "VERDICT: PATCHED ON DISK, but a running sshd uses the old binary — restart sshd."
+      add_finding "cve_2026_123158_sshole_restart" "MEDIUM" \
+        "*sshole (CVE-2026-123158): fixed on disk but running sshd not restarted" \
+        "OpenSSH is patched on disk (>= fixed version) but a running sshd process is still using the previous (deleted) binary." \
+        "Until sshd is restarted, the running daemon remains exploitable via the *sshole password-auth bypass." \
+        "Same as the main finding — the live process predates the fix." \
+        "Restart sshd to load the patched binary (e.g. rc-service sshd restart / systemctl restart ssh)." \
+        "Running sshd binary shows '(deleted)' in /proc/<pid>/exe."
+      set_state SSHOLE_STATUS patched-needs-restart
+      return 0
+    fi
+    ok "VERDICT: PATCHED."; set_state SSHOLE_STATUS patched; return 0
+  fi
+  if [[ -n "$REACHABLE" && "$HASHES" -gt 0 && "$PATCHED" == no ]]; then
+    set_state SSHOLE_STATUS vulnerable
+    add_finding "cve_2026_123158_sshole" "HIGH" \
+      "*sshole (CVE-2026-123158): OpenSSH on musl is remotely authable — exposed account(s):${REACHABLE:+ }$REACHABLE" \
+      "sshd is musl-linked, runs without PAM, has PasswordAuthentication enabled, OpenSSH is older than the fixed version ($FIXED_UPSTREAM / distro backport), SHA-256/512 hashes are present, and account(s) with a '*' shadow field are reachable via password auth:${REACHABLE:+ }$REACHABLE." \
+      "CVE-2026-123158 (*sshole), CVSS 8.1, exploited in the wild. A remote, unauthenticated attacker can log in as the exposed account (root if privileged) by sending an oversized password. Common on Alpine/musl container images and nodes running openssh-server — a direct foothold that collapses container isolation if the host or a privileged container is affected." \
+      "Attacker submits a 257-1024 byte password for a known '*' account; musl crypt returns '*', matching the stored field, so authentication succeeds with no valid credentials. This check never attempts it." \
+      "Upgrade OpenSSH to the fixed version (apk upgrade openssh; OpenSSH >= 10.6p2 / Alpine branch backport) and restart sshd. Immediate mitigation: set 'PasswordAuthentication no' (or 'UsePAM yes' where PAM is available) and reload sshd. Prefer key-only auth. Rebuild affected container images from a patched base." \
+      "musl=$MUSL; UsePAM=$UP; PasswordAuthentication=$PA; OpenSSH=${SSHD_VER:-unknown}; patched=$PATCHED; sha_hashes=$HASHES; exposed=$REACHABLE"
+    crit "VERDICT: VULNERABLE — exposed account(s):$REACHABLE"
+    return 0
+  fi
+  if [[ "$PATCHED" == no ]]; then
+    set_state SSHOLE_STATUS unpatched-conditions-unmet
+    add_finding "cve_2026_123158_sshole_unpatched" "MEDIUM" \
+      "*sshole (CVE-2026-123158): OpenSSH on musl is unpatched (not all exploit conditions currently met)" \
+      "sshd is musl-linked and OpenSSH is older than the fixed version, but not every exploit precondition is currently satisfied (e.g. no reachable '*' account, no SHA hashes, or PasswordAuthentication off at audit time)." \
+      "The host is one configuration change away from exploitable (a new '*' account, a config reload). CVE-2026-123158, CVSS 8.1, exploited in the wild." \
+      "See the main *sshole finding — same bypass; the preconditions can be met by routine configuration drift." \
+      "Upgrade OpenSSH to the fixed version (>= 10.6p2 / Alpine backport) and restart sshd regardless; prefer key-only auth and UsePAM yes." \
+      "musl=$MUSL; UsePAM=$UP; PasswordAuthentication=$PA; OpenSSH=${SSHD_VER:-unknown}; patched=$PATCHED; sha_hashes=$HASHES"
+    warn "VERDICT: UNPATCHED, but not all exploit conditions currently met — upgrade anyway."
+    return 0
+  fi
+  set_state SSHOLE_STATUS indeterminate
+  warn "VERDICT: INDETERMINATE — patch level unknown; review the findings above (run as root for a full verdict)."
+  return 0
+}
+
+check_sshole
 
 run_cve_checks "$CVE_CONF"
 
