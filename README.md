@@ -2,7 +2,7 @@
 
 ![Version](https://img.shields.io/badge/version-4.8.5-blue)
 ![Checks](https://img.shields.io/badge/checks-63-blue)
-![CVEs tracked](https://img.shields.io/badge/CVEs%20tracked-57-blue)
+![CVEs tracked](https://img.shields.io/badge/CVEs%20tracked-63-blue)
 ![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/liamromanis101?label=Sponsor&logo=GitHub&color=db61a2)](https://github.com/sponsors/liamromanis101)
 
